@@ -89,3 +89,5 @@ dmypy.json
 
 # pyenv
 .python-version
+
+README.md
