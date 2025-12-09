@@ -144,7 +144,7 @@ async def start_login_process(client: Client, message: Message, user_id: int):
     else:
         await message.reply_text(
             "🔐 **Login**\n\n"
-            "Follow video tutorial [disini](https://my.telegram.org). Korang perlukan **API ID** dan **API HASH** dari my.telegram.org.\n\n"
+            "Follow video tutorial [disini](https://t.me/telokschannel/14). Korang perlukan **API ID** dan **API HASH** dari my.telegram.org.\n\n"
             "1️⃣ Paste **API ID** dan click Send.\n\n"
             "👇 Tekan butang untuk cancel:",
             reply_markup=get_cancel_keyboard()
