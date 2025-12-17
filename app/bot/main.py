@@ -875,7 +875,8 @@ async def process_media_group(client: Client, user_client: Client, messages: lis
             single_media = InputSingleMedia(
                 media=media,
                 random_id=random.randint(0, 2**63 - 1),
-                message=""  # No caption
+                message="",  # No caption
+                entities=[]  # Required empty list for entities
             )
             uploaded_media.append(single_media)
         
