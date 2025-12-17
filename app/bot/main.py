@@ -535,12 +535,12 @@ async def link_handler(client: Client, message: Message):
             # Process as media group - upload all files and send as album to both backup and user
             from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
             
-            uploaded_media = []  # List of (InputMedia for backup, InputMedia for user, file_size)
+            uploaded_media = []  # List of (file_id, media_type, file_size, metadata)
             
             for idx, msg_to_process in enumerate(messages_to_process, 1):
                 await status_msg.edit(f"⬇️ Memuat naik {idx}/{total_files}...")
                 
-                # Upload each file and get InputMedia objects
+                # Upload each file and get file_id
                 result = await upload_single_media_for_group(
                     client, user_client, msg_to_process, idx, total_files
                 )
@@ -552,9 +552,30 @@ async def link_handler(client: Client, message: Message):
                 await status_msg.edit("❌ Gagal memproses media/file.")
                 return
             
+            # Build InputMedia list using file_ids
+            backup_media_list = []
+            for file_id, media_type, file_size, metadata in uploaded_media:
+                if media_type == "photo":
+                    backup_media_list.append(InputMediaPhoto(file_id))
+                elif media_type == "video":
+                    backup_media_list.append(InputMediaVideo(
+                        file_id,
+                        duration=metadata.get("duration", 0),
+                        width=metadata.get("width", 0),
+                        height=metadata.get("height", 0)
+                    ))
+                elif media_type == "audio":
+                    backup_media_list.append(InputMediaAudio(
+                        file_id,
+                        duration=metadata.get("duration", 0),
+                        title=metadata.get("title", ""),
+                        performer=metadata.get("performer", "")
+                    ))
+                else:
+                    backup_media_list.append(InputMediaDocument(file_id))
+            
             # Send as media group to backup group
             await status_msg.edit(f"📤 Menghantar album ke backup group...")
-            backup_media_list = [item[0] for item in uploaded_media]
             
             try:
                 backup_msgs = await client.send_media_group(
@@ -642,8 +663,8 @@ async def link_handler(client: Client, message: Message):
 
 async def upload_single_media_for_group(client: Client, user_client: Client, target_msg: Message,
                                          current_idx: int, total_count: int):
-    """Upload a single media file and return InputMedia for send_media_group. 
-    Returns (InputMedia, InputMedia_for_user, file_size) or None if failed."""
+    """Upload a single media file to Telegram and return file_id with media type info.
+    Returns (file_id, media_type, file_size, metadata) or None if failed."""
     try:
         from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
         
@@ -660,33 +681,106 @@ async def upload_single_media_for_group(client: Client, user_client: Client, tar
         if target_msg.photo:
             file_name = "photo.jpg"
         
-        # Upload and get file path (for InputMedia)
+        # Upload using raw API and get the file
         input_file = await upload_stream(client, streamer, file_name)
         
-        # Create appropriate InputMedia based on media type
+        # We need to send to a chat first to get the file_id, then delete
+        # Use the backup group peer
+        peer = await get_backup_group_peer(client)
+        if not peer:
+            return None
+        
+        # Determine media type and create appropriate InputMedia for raw API
         if target_msg.photo:
-            return (InputMediaPhoto(media=input_file), None, file_size)
+            media = InputMediaUploadedPhoto(file=input_file)
+            media_type = "photo"
+            metadata = {}
         elif target_msg.video:
             video = target_msg.video
-            return (InputMediaVideo(
-                media=input_file,
-                duration=video.duration or 0,
-                width=video.width or 0,
-                height=video.height or 0,
-                supports_streaming=True
-            ), None, file_size)
+            attributes = [
+                DocumentAttributeVideo(
+                    duration=video.duration or 0,
+                    w=video.width or 0,
+                    h=video.height or 0,
+                    supports_streaming=True
+                ),
+                DocumentAttributeFilename(file_name=file_name)
+            ]
+            media = InputMediaUploadedDocument(
+                file=input_file,
+                mime_type=video.mime_type or "video/mp4",
+                attributes=attributes
+            )
+            media_type = "video"
+            metadata = {"duration": video.duration or 0, "width": video.width or 0, "height": video.height or 0}
         elif target_msg.audio:
             audio = target_msg.audio
-            return (InputMediaAudio(
-                media=input_file,
-                duration=audio.duration or 0,
-                title=audio.title or "",
-                performer=audio.performer or ""
-            ), None, file_size)
-        elif target_msg.document or target_msg.animation or target_msg.sticker:
-            return (InputMediaDocument(media=input_file), None, file_size)
+            attributes = [
+                DocumentAttributeAudio(
+                    duration=audio.duration or 0,
+                    title=audio.title or "",
+                    performer=audio.performer or ""
+                ),
+                DocumentAttributeFilename(file_name=file_name)
+            ]
+            media = InputMediaUploadedDocument(
+                file=input_file,
+                mime_type=audio.mime_type or "audio/mpeg",
+                attributes=attributes
+            )
+            media_type = "audio"
+            metadata = {"duration": audio.duration or 0, "title": audio.title or "", "performer": audio.performer or ""}
         else:
-            return (InputMediaDocument(media=input_file), None, file_size)
+            # Document
+            attributes = [DocumentAttributeFilename(file_name=file_name)]
+            mime_type = getattr(media_obj, "mime_type", "application/octet-stream")
+            media = InputMediaUploadedDocument(
+                file=input_file,
+                mime_type=mime_type,
+                attributes=attributes
+            )
+            media_type = "document"
+            metadata = {}
+        
+        # Send using raw API to get the message with file_id
+        updates = await client.invoke(
+            SendMedia(
+                peer=peer,
+                media=media,
+                message="",
+                random_id=random.randint(0, 2**63 - 1)
+            )
+        )
+        
+        # Extract message ID and get the file_id from the sent message
+        msg_id = None
+        for update in updates.updates:
+            if isinstance(update, (UpdateNewMessage, UpdateNewChannelMessage)):
+                msg_id = update.message.id
+                break
+        
+        if msg_id:
+            # Get the message to extract file_id
+            sent_msg = await client.get_messages(BACKUP_GROUP_ID, msg_id)
+            
+            if sent_msg.photo:
+                file_id = sent_msg.photo.file_id
+            elif sent_msg.video:
+                file_id = sent_msg.video.file_id
+            elif sent_msg.audio:
+                file_id = sent_msg.audio.file_id
+            elif sent_msg.document:
+                file_id = sent_msg.document.file_id
+            else:
+                file_id = None
+            
+            # Delete the temporary message
+            await client.delete_messages(BACKUP_GROUP_ID, msg_id)
+            
+            if file_id:
+                return (file_id, media_type, file_size, metadata)
+        
+        return None
             
     except Exception as e:
         print(f"DEBUG: Error uploading media {current_idx}/{total_count}: {e}")
