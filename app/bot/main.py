@@ -696,12 +696,10 @@ async def upload_single_media_for_group(client: Client, user_client: Client, tar
             await user_client.download_media(target_msg, file_name=temp_file_path)
             media_source = temp_file_path
         else:
-            # Use BytesIO for small media
-            buffer = BytesIO()
-            await user_client.download_media(target_msg, file_name=buffer)
-            buffer.seek(0)
-            buffer.name = file_name if not target_msg.photo else "photo.jpg"
-            media_source = buffer
+            # Use in_memory download for small media (returns BytesIO)
+            media_source = await user_client.download_media(target_msg, in_memory=True)
+            if media_source:
+                media_source.name = file_name if not target_msg.photo else "photo.jpg"
         
         # Send to backup group to get file_id, then delete
         sent_msg = None
