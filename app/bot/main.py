@@ -531,84 +531,100 @@ async def link_handler(client: Client, message: Message):
         # Check if this is a media group that should be sent together
         is_media_group = target_msg.media_group_id is not None and len(messages_to_process) > 1
 
-        # Process all files individually (works for both single and group)
-        for idx, msg_to_process in enumerate(messages_to_process, 1):
-            await status_msg.edit(f"⬇️ Memproses {idx}/{total_files}...")
+        if is_media_group:
+            # Process as media group - upload all files and send as album to both backup and user
+            from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
             
-            # Process single media file
-            backup_msg_id, file_name, file_size = await process_single_media(
-                client, user_client, msg_to_process, message, status_msg, idx, total_files
-            )
+            uploaded_media = []  # List of (InputMedia for backup, InputMedia for user, file_size)
             
-            if backup_msg_id:
-                backup_msg_ids.append(backup_msg_id)
-                # Construct backup message link
-                channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
-                backup_message_link = f"https://t.me/c/{channel_id}/{backup_msg_id}"
-                # Log each file
-                await log_forward(message.from_user.username, backup_msg_id, file_size, source_name, backup_message_link)
-
-        if not backup_msg_ids:
-            await status_msg.edit("❌ Gagal memproses media/file.")
-            return
-
-        # 4. Forward all to User (Clean)
-        await status_msg.edit(f"⬆️ Mengirim {len(backup_msg_ids)} file(s) ke Anda...")
-        
-        if is_media_group and len(backup_msg_ids) > 1:
-            # Send as media group (album) to preserve grouping
+            for idx, msg_to_process in enumerate(messages_to_process, 1):
+                await status_msg.edit(f"⬇️ Memuat naik {idx}/{total_files}...")
+                
+                # Upload each file and get InputMedia objects
+                result = await upload_single_media_for_group(
+                    client, user_client, msg_to_process, idx, total_files
+                )
+                
+                if result:
+                    uploaded_media.append(result)
+            
+            if not uploaded_media:
+                await status_msg.edit("❌ Gagal memproses media/file.")
+                return
+            
+            # Send as media group to backup group
+            await status_msg.edit(f"📤 Menghantar album ke backup group...")
+            backup_media_list = [item[0] for item in uploaded_media]
+            
             try:
-                from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+                backup_msgs = await client.send_media_group(
+                    chat_id=BACKUP_GROUP_ID,
+                    media=backup_media_list
+                )
                 
-                # Get backup messages to build media group
-                media_list = []
-                for backup_msg_id in backup_msg_ids:
-                    try:
-                        backup_msg = await client.get_messages(BACKUP_GROUP_ID, backup_msg_id)
-                        if backup_msg.photo:
-                            media_list.append(InputMediaPhoto(backup_msg.photo.file_id))
-                        elif backup_msg.video:
-                            media_list.append(InputMediaVideo(backup_msg.video.file_id))
-                        elif backup_msg.audio:
-                            media_list.append(InputMediaAudio(backup_msg.audio.file_id))
-                        elif backup_msg.document:
-                            media_list.append(InputMediaDocument(backup_msg.document.file_id))
-                    except Exception as e:
-                        print(f"DEBUG: Failed to get backup message {backup_msg_id}: {e}")
+                # Log each file
+                for idx, backup_msg in enumerate(backup_msgs):
+                    backup_msg_ids.append(backup_msg.id)
+                    file_size = uploaded_media[idx][2] if idx < len(uploaded_media) else 0
+                    channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
+                    backup_message_link = f"https://t.me/c/{channel_id}/{backup_msg.id}"
+                    await log_forward(message.from_user.username, backup_msg.id, file_size, source_name, backup_message_link)
                 
-                if len(media_list) > 1:
-                    await client.send_media_group(chat_id=user_id, media=media_list)
-                else:
-                    # Fallback if only one media
-                    for backup_msg_id in backup_msg_ids:
-                        await client.copy_message(
-                            chat_id=user_id,
-                            from_chat_id=BACKUP_GROUP_ID,
-                            message_id=backup_msg_id,
-                            caption=""
-                        )
+                # Forward as album to user
+                await status_msg.edit(f"⬆️ Menghantar album ke anda...")
+                
+                # Build media list using file_ids from backup messages
+                user_media_list = []
+                for backup_msg in backup_msgs:
+                    if backup_msg.photo:
+                        user_media_list.append(InputMediaPhoto(backup_msg.photo.file_id))
+                    elif backup_msg.video:
+                        user_media_list.append(InputMediaVideo(backup_msg.video.file_id))
+                    elif backup_msg.audio:
+                        user_media_list.append(InputMediaAudio(backup_msg.audio.file_id))
+                    elif backup_msg.document:
+                        user_media_list.append(InputMediaDocument(backup_msg.document.file_id))
+                
+                if user_media_list:
+                    await client.send_media_group(chat_id=user_id, media=user_media_list)
+                    
             except Exception as e:
-                print(f"DEBUG: Failed to send media group: {e}")
-                # Fallback to individual copy if media group fails
-                for backup_msg_id in backup_msg_ids:
-                    try:
-                        await client.copy_message(
-                            chat_id=user_id,
-                            from_chat_id=BACKUP_GROUP_ID,
-                            message_id=backup_msg_id,
-                            caption=""
-                        )
-                    except Exception as e2:
-                        print(f"DEBUG: Failed to copy message {backup_msg_id}: {e2}")
+                print(f"DEBUG: Failed to send media group to backup: {e}")
+                import traceback
+                traceback.print_exc()
+                await status_msg.edit(f"❌ Gagal menghantar album: {e}")
+                return
         else:
-            # Forward individual messages
+            # Process single file individually
+            for idx, msg_to_process in enumerate(messages_to_process, 1):
+                await status_msg.edit(f"⬇️ Memproses {idx}/{total_files}...")
+                
+                # Process single media file
+                backup_msg_id, file_name, file_size = await process_single_media(
+                    client, user_client, msg_to_process, message, status_msg, idx, total_files
+                )
+                
+                if backup_msg_id:
+                    backup_msg_ids.append(backup_msg_id)
+                    # Construct backup message link
+                    channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
+                    backup_message_link = f"https://t.me/c/{channel_id}/{backup_msg_id}"
+                    # Log each file
+                    await log_forward(message.from_user.username, backup_msg_id, file_size, source_name, backup_message_link)
+
+            if not backup_msg_ids:
+                await status_msg.edit("❌ Gagal memproses media/file.")
+                return
+
+            # Forward individual messages to user
+            await status_msg.edit(f"⬆️ Mengirim {len(backup_msg_ids)} file(s) ke Anda...")
             for backup_msg_id in backup_msg_ids:
                 try:
                     await client.copy_message(
                         chat_id=user_id,
                         from_chat_id=BACKUP_GROUP_ID,
                         message_id=backup_msg_id,
-                        caption="" # Strip caption
+                        caption=""
                     )
                 except Exception as e:
                     print(f"DEBUG: Failed to copy message {backup_msg_id}: {e}")
@@ -622,6 +638,61 @@ async def link_handler(client: Client, message: Message):
     finally:
         # Always clear the active process flag when done
         active_user_processes.pop(user_id, None)
+
+
+async def upload_single_media_for_group(client: Client, user_client: Client, target_msg: Message,
+                                         current_idx: int, total_count: int):
+    """Upload a single media file and return InputMedia for send_media_group. 
+    Returns (InputMedia, InputMedia_for_user, file_size) or None if failed."""
+    try:
+        from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+        
+        # Create the streamer object
+        media_obj = (target_msg.document or target_msg.video or target_msg.audio or 
+                     target_msg.photo or target_msg.voice or target_msg.video_note or
+                     target_msg.animation or target_msg.sticker)
+        file_size = getattr(media_obj, "file_size", 0)
+        file_name = getattr(media_obj, "file_name", None) or "file"
+
+        streamer = MediaStreamer(user_client, target_msg, file_size)
+
+        # Determine file name based on media type
+        if target_msg.photo:
+            file_name = "photo.jpg"
+        
+        # Upload and get file path (for InputMedia)
+        input_file = await upload_stream(client, streamer, file_name)
+        
+        # Create appropriate InputMedia based on media type
+        if target_msg.photo:
+            return (InputMediaPhoto(media=input_file), None, file_size)
+        elif target_msg.video:
+            video = target_msg.video
+            return (InputMediaVideo(
+                media=input_file,
+                duration=video.duration or 0,
+                width=video.width or 0,
+                height=video.height or 0,
+                supports_streaming=True
+            ), None, file_size)
+        elif target_msg.audio:
+            audio = target_msg.audio
+            return (InputMediaAudio(
+                media=input_file,
+                duration=audio.duration or 0,
+                title=audio.title or "",
+                performer=audio.performer or ""
+            ), None, file_size)
+        elif target_msg.document or target_msg.animation or target_msg.sticker:
+            return (InputMediaDocument(media=input_file), None, file_size)
+        else:
+            return (InputMediaDocument(media=input_file), None, file_size)
+            
+    except Exception as e:
+        print(f"DEBUG: Error uploading media {current_idx}/{total_count}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 async def process_single_media(client: Client, user_client: Client, target_msg: Message, 
