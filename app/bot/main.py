@@ -575,7 +575,7 @@ async def link_handler(client: Client, message: Message):
                     backup_media_list.append(InputMediaDocument(file_id))
             
             # Send as media group to backup group
-            await status_msg.edit(f"📤 Menghantar album ke backup group...")
+            await status_msg.edit(f"📤 ...")
             
             try:
                 backup_msgs = await client.send_media_group(
