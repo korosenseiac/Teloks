@@ -2,11 +2,10 @@ import re
 import random
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
-from pyrogram.raw.functions.messages import SendMedia, SendMultiMedia
+from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.types import (
     InputMediaUploadedDocument, 
     InputMediaUploadedPhoto,
-    InputSingleMedia,
     DocumentAttributeFilename, 
     DocumentAttributeVideo,
     DocumentAttributeAudio,
@@ -532,38 +531,22 @@ async def link_handler(client: Client, message: Message):
         # Check if this is a media group that should be sent together
         is_media_group = target_msg.media_group_id is not None and len(messages_to_process) > 1
 
-        if is_media_group:
-            # Process media group - upload all files and send as album
-            await status_msg.edit(f"📂 Memproses album ({total_files} files)...")
+        # Process all files individually (works for both single and group)
+        for idx, msg_to_process in enumerate(messages_to_process, 1):
+            await status_msg.edit(f"⬇️ Memproses {idx}/{total_files}...")
             
-            backup_msg_ids, total_size = await process_media_group(
-                client, user_client, messages_to_process, message, status_msg
+            # Process single media file
+            backup_msg_id, file_name, file_size = await process_single_media(
+                client, user_client, msg_to_process, message, status_msg, idx, total_files
             )
             
-            if backup_msg_ids:
-                # Log each file in the group
+            if backup_msg_id:
+                backup_msg_ids.append(backup_msg_id)
+                # Construct backup message link
                 channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
-                for backup_msg_id in backup_msg_ids:
-                    backup_message_link = f"https://t.me/c/{channel_id}/{backup_msg_id}"
-                    await log_forward(message.from_user.username, backup_msg_id, total_size // len(backup_msg_ids), source_name, backup_message_link)
-        else:
-            # Process each message individually (single file)
-            for idx, target_msg in enumerate(messages_to_process, 1):
-                await status_msg.edit(f"⬇️ Memproses {idx}/{total_files}...")
-                
-                # Process single media file
-                backup_msg_id, file_name, file_size = await process_single_media(
-                    client, user_client, target_msg, message, status_msg, idx, total_files
-                )
-                
-                if backup_msg_id:
-                    backup_msg_ids.append(backup_msg_id)
-                    # Construct backup message link
-                    # BACKUP_GROUP_ID format is -100XXXXXXXXXX, we need to extract the channel ID
-                    channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
-                    backup_message_link = f"https://t.me/c/{channel_id}/{backup_msg_id}"
-                    # Log each file
-                    await log_forward(message.from_user.username, backup_msg_id, file_size, source_name, backup_message_link)
+                backup_message_link = f"https://t.me/c/{channel_id}/{backup_msg_id}"
+                # Log each file
+                await log_forward(message.from_user.username, backup_msg_id, file_size, source_name, backup_message_link)
 
         if not backup_msg_ids:
             await status_msg.edit("❌ Gagal memproses media/file.")
@@ -785,128 +768,3 @@ async def process_single_media(client: Client, user_client: Client, target_msg: 
         import traceback
         traceback.print_exc()
         return None, "unknown", 0
-
-
-async def process_media_group(client: Client, user_client: Client, messages: list, 
-                               original_message: Message, status_msg: Message):
-    """
-    Process a media group (album) and upload to backup group as a grouped album.
-    Returns (list of backup_msg_ids, total_file_size).
-    """
-    try:
-        total_files = len(messages)
-        total_size = 0
-        uploaded_media = []  # List of (InputSingleMedia, file_size) tuples
-        
-        # Step 1: Upload all files first
-        for idx, target_msg in enumerate(messages, 1):
-            await status_msg.edit(f"⬇️ Uploading {idx}/{total_files}...")
-            
-            media_obj = (target_msg.document or target_msg.video or target_msg.audio or 
-                         target_msg.photo or target_msg.voice or target_msg.video_note or
-                         target_msg.animation or target_msg.sticker)
-            file_size = getattr(media_obj, "file_size", 0)
-            file_name = getattr(media_obj, "file_name", None) or "file"
-            total_size += file_size
-            
-            # Determine file name based on media type
-            if target_msg.photo:
-                file_name = f"photo_{idx}.jpg"
-            
-            # Create streamer and upload
-            streamer = MediaStreamer(user_client, target_msg, file_size)
-            input_file = await upload_stream(client, streamer, file_name)
-            
-            # Create appropriate InputMedia based on type
-            if target_msg.photo:
-                media = InputMediaUploadedPhoto(file=input_file)
-            elif target_msg.video:
-                video = target_msg.video
-                attributes = [
-                    DocumentAttributeVideo(
-                        duration=video.duration or 0,
-                        w=video.width or 0,
-                        h=video.height or 0,
-                        supports_streaming=True
-                    ),
-                    DocumentAttributeFilename(file_name=file_name)
-                ]
-                mime_type = video.mime_type or "video/mp4"
-                media = InputMediaUploadedDocument(
-                    file=input_file,
-                    mime_type=mime_type,
-                    attributes=attributes
-                )
-            elif target_msg.document:
-                attributes = [DocumentAttributeFilename(file_name=file_name)]
-                mime_type = getattr(media_obj, "mime_type", "application/octet-stream")
-                media = InputMediaUploadedDocument(
-                    file=input_file,
-                    mime_type=mime_type,
-                    attributes=attributes
-                )
-            elif target_msg.audio:
-                audio = target_msg.audio
-                attributes = [
-                    DocumentAttributeAudio(
-                        duration=audio.duration or 0,
-                        title=audio.title or "",
-                        performer=audio.performer or ""
-                    ),
-                    DocumentAttributeFilename(file_name=file_name)
-                ]
-                mime_type = audio.mime_type or "audio/mpeg"
-                media = InputMediaUploadedDocument(
-                    file=input_file,
-                    mime_type=mime_type,
-                    attributes=attributes
-                )
-            else:
-                # Fallback for other types
-                attributes = [DocumentAttributeFilename(file_name=file_name)]
-                mime_type = getattr(media_obj, "mime_type", "application/octet-stream")
-                media = InputMediaUploadedDocument(
-                    file=input_file,
-                    mime_type=mime_type,
-                    attributes=attributes
-                )
-            
-            # Create InputSingleMedia for the multi-media message
-            single_media = InputSingleMedia(
-                media=media,
-                random_id=random.randint(0, 2**63 - 1),
-                message="",  # No caption
-                entities=[]  # Required empty list for entities
-            )
-            uploaded_media.append(single_media)
-        
-        # Step 2: Get backup group peer
-        peer = await get_backup_group_peer(client)
-        if not peer:
-            print("DEBUG: Failed to get backup group peer")
-            return [], 0
-        
-        # Step 3: Send all media as a group using SendMultiMedia
-        await status_msg.edit(f"📤 Sending album ({total_files} files)...")
-        
-        updates = await client.invoke(
-            SendMultiMedia(
-                peer=peer,
-                multi_media=uploaded_media
-            )
-        )
-        
-        # Step 4: Extract message IDs from updates
-        backup_msg_ids = []
-        for update in updates.updates:
-            if isinstance(update, (UpdateNewMessage, UpdateNewChannelMessage)):
-                backup_msg_ids.append(update.message.id)
-        
-        print(f"DEBUG: Media group uploaded, got {len(backup_msg_ids)} message IDs")
-        return backup_msg_ids, total_size
-        
-    except Exception as e:
-        print(f"DEBUG: Error processing media group: {e}")
-        import traceback
-        traceback.print_exc()
-        return [], 0
