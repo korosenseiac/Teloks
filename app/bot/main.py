@@ -671,6 +671,8 @@ async def upload_single_media_for_group(client: Client, user_client: Client, tar
     Returns (file_id, media_type, file_size, metadata) or None if failed."""
     try:
         from io import BytesIO
+        import tempfile
+        import os
         
         # Get media object and file info
         media_obj = (target_msg.document or target_msg.video or target_msg.audio or 
@@ -679,168 +681,82 @@ async def upload_single_media_for_group(client: Client, user_client: Client, tar
         file_size = getattr(media_obj, "file_size", 0)
         file_name = getattr(media_obj, "file_name", None) or "file"
         
-        # Threshold for using streaming vs memory (50MB)
-        STREAM_THRESHOLD = 50 * 1024 * 1024
+        # For large files (>50MB), use temp file to avoid memory issues
+        # For small files, use BytesIO (in-memory)
+        MEMORY_THRESHOLD = 50 * 1024 * 1024  # 50MB
         
-        # For large files, use streaming approach
-        if file_size > STREAM_THRESHOLD:
-            # Use streaming for large files
-            streamer = MediaStreamer(user_client, target_msg, file_size)
-            
-            if target_msg.photo:
-                file_name = "photo.jpg"
-            
-            input_file = await upload_stream(client, streamer, file_name)
-            
-            # Get backup group peer
-            peer = await get_backup_group_peer(client)
-            if not peer:
-                return None
-            
-            # Determine media type and create appropriate InputMedia
-            if target_msg.photo:
-                media = InputMediaUploadedPhoto(file=input_file)
-                media_type = "photo"
-                metadata = {}
-            elif target_msg.video:
-                video = target_msg.video
-                attributes = [
-                    DocumentAttributeVideo(
-                        duration=video.duration or 0,
-                        w=video.width or 0,
-                        h=video.height or 0,
-                        supports_streaming=True
-                    ),
-                    DocumentAttributeFilename(file_name=file_name)
-                ]
-                media = InputMediaUploadedDocument(
-                    file=input_file,
-                    mime_type=video.mime_type or "video/mp4",
-                    attributes=attributes
-                )
-                media_type = "video"
-                metadata = {"duration": video.duration or 0, "width": video.width or 0, "height": video.height or 0}
-            elif target_msg.audio:
-                audio = target_msg.audio
-                attributes = [
-                    DocumentAttributeAudio(
-                        duration=audio.duration or 0,
-                        title=audio.title or "",
-                        performer=audio.performer or ""
-                    ),
-                    DocumentAttributeFilename(file_name=file_name)
-                ]
-                media = InputMediaUploadedDocument(
-                    file=input_file,
-                    mime_type=audio.mime_type or "audio/mpeg",
-                    attributes=attributes
-                )
-                media_type = "audio"
-                metadata = {"duration": audio.duration or 0, "title": audio.title or "", "performer": audio.performer or ""}
-            else:
-                attributes = [DocumentAttributeFilename(file_name=file_name)]
-                mime_type = getattr(media_obj, "mime_type", "application/octet-stream")
-                media = InputMediaUploadedDocument(
-                    file=input_file,
-                    mime_type=mime_type,
-                    attributes=attributes
-                )
-                media_type = "document"
-                metadata = {}
-            
-            # Send using raw API
-            updates = await client.invoke(
-                SendMedia(
-                    peer=peer,
-                    media=media,
-                    message="",
-                    random_id=random.randint(0, 2**63 - 1)
-                )
-            )
-            
-            # Extract message ID and file_id
-            msg_id = None
-            for update in updates.updates:
-                if isinstance(update, (UpdateNewMessage, UpdateNewChannelMessage)):
-                    msg_id = update.message.id
-                    break
-            
-            if msg_id:
-                sent_msg = await client.get_messages(BACKUP_GROUP_ID, msg_id)
-                
-                if sent_msg.photo:
-                    file_id = sent_msg.photo.file_id
-                elif sent_msg.video:
-                    file_id = sent_msg.video.file_id
-                elif sent_msg.audio:
-                    file_id = sent_msg.audio.file_id
-                elif sent_msg.document:
-                    file_id = sent_msg.document.file_id
-                else:
-                    file_id = None
-                
-                await client.delete_messages(BACKUP_GROUP_ID, msg_id)
-                
-                if file_id:
-                    return (file_id, media_type, file_size, metadata)
-            
-            return None
+        temp_file_path = None
+        media_source = None
         
-        # For small files, use BytesIO (simpler and more reliable)
-        buffer = BytesIO()
-        await user_client.download_media(target_msg, file_name=buffer)
-        buffer.seek(0)
-        buffer.name = file_name if not target_msg.photo else "photo.jpg"
+        if file_size > MEMORY_THRESHOLD:
+            # Use temporary file for large media
+            suffix = os.path.splitext(file_name)[1] or ".tmp"
+            temp_fd, temp_file_path = tempfile.mkstemp(suffix=suffix)
+            os.close(temp_fd)
+            await user_client.download_media(target_msg, file_name=temp_file_path)
+            media_source = temp_file_path
+        else:
+            # Use BytesIO for small media
+            buffer = BytesIO()
+            await user_client.download_media(target_msg, file_name=buffer)
+            buffer.seek(0)
+            buffer.name = file_name if not target_msg.photo else "photo.jpg"
+            media_source = buffer
         
         # Send to backup group to get file_id, then delete
         sent_msg = None
         
-        if target_msg.photo:
-            sent_msg = await client.send_photo(BACKUP_GROUP_ID, photo=buffer)
-            media_type = "photo"
-            metadata = {}
-            file_id = sent_msg.photo.file_id if sent_msg and sent_msg.photo else None
-        elif target_msg.video:
-            video = target_msg.video
-            sent_msg = await client.send_video(
-                BACKUP_GROUP_ID, 
-                video=buffer,
-                duration=video.duration or 0,
-                width=video.width or 0,
-                height=video.height or 0,
-                supports_streaming=True
-            )
-            media_type = "video"
-            metadata = {"duration": video.duration or 0, "width": video.width or 0, "height": video.height or 0}
-            file_id = sent_msg.video.file_id if sent_msg and sent_msg.video else None
-        elif target_msg.audio:
-            audio = target_msg.audio
-            sent_msg = await client.send_audio(
-                BACKUP_GROUP_ID,
-                audio=buffer,
-                duration=audio.duration or 0,
-                title=audio.title or "",
-                performer=audio.performer or ""
-            )
-            media_type = "audio"
-            metadata = {"duration": audio.duration or 0, "title": audio.title or "", "performer": audio.performer or ""}
-            file_id = sent_msg.audio.file_id if sent_msg and sent_msg.audio else None
-        else:
-            # Document
-            mime_type = getattr(media_obj, "mime_type", "application/octet-stream")
-            sent_msg = await client.send_document(BACKUP_GROUP_ID, document=buffer)
-            media_type = "document"
-            metadata = {}
-            file_id = sent_msg.document.file_id if sent_msg and sent_msg.document else None
-        
-        # Delete the temporary message
-        if sent_msg:
-            await client.delete_messages(BACKUP_GROUP_ID, sent_msg.id)
-        
-        if file_id:
-            return (file_id, media_type, file_size, metadata)
-        
-        return None
+        try:
+            if target_msg.photo:
+                sent_msg = await client.send_photo(BACKUP_GROUP_ID, photo=media_source)
+                media_type = "photo"
+                metadata = {}
+                file_id = sent_msg.photo.file_id if sent_msg and sent_msg.photo else None
+            elif target_msg.video:
+                video = target_msg.video
+                sent_msg = await client.send_video(
+                    BACKUP_GROUP_ID, 
+                    video=media_source,
+                    duration=video.duration or 0,
+                    width=video.width or 0,
+                    height=video.height or 0,
+                    supports_streaming=True
+                )
+                media_type = "video"
+                metadata = {"duration": video.duration or 0, "width": video.width or 0, "height": video.height or 0}
+                file_id = sent_msg.video.file_id if sent_msg and sent_msg.video else None
+            elif target_msg.audio:
+                audio = target_msg.audio
+                sent_msg = await client.send_audio(
+                    BACKUP_GROUP_ID,
+                    audio=media_source,
+                    duration=audio.duration or 0,
+                    title=audio.title or "",
+                    performer=audio.performer or ""
+                )
+                media_type = "audio"
+                metadata = {"duration": audio.duration or 0, "title": audio.title or "", "performer": audio.performer or ""}
+                file_id = sent_msg.audio.file_id if sent_msg and sent_msg.audio else None
+            else:
+                # Document
+                sent_msg = await client.send_document(BACKUP_GROUP_ID, document=media_source)
+                media_type = "document"
+                metadata = {}
+                file_id = sent_msg.document.file_id if sent_msg and sent_msg.document else None
+            
+            # Delete the temporary message from backup group
+            if sent_msg:
+                await client.delete_messages(BACKUP_GROUP_ID, sent_msg.id)
+            
+            if file_id:
+                return (file_id, media_type, file_size, metadata)
+            
+            return None
+            
+        finally:
+            # Clean up temp file if used
+            if temp_file_path and os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
             
     except Exception as e:
         print(f"DEBUG: Error uploading media {current_idx}/{total_count}: {e}")
