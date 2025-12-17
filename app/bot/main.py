@@ -583,13 +583,17 @@ async def link_handler(client: Client, message: Message):
                     media=backup_media_list
                 )
                 
-                # Log each file
-                for idx, backup_msg in enumerate(backup_msgs):
+                # Collect all message IDs
+                for backup_msg in backup_msgs:
                     backup_msg_ids.append(backup_msg.id)
-                    file_size = uploaded_media[idx][2] if idx < len(uploaded_media) else 0
-                    channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
-                    backup_message_link = f"https://t.me/c/{channel_id}/{backup_msg.id}"
-                    await log_forward(message.from_user.username, backup_msg.id, file_size, source_name, backup_message_link)
+                
+                # Log only the first message ID (represents the album)
+                # Calculate total file size for the album
+                total_album_size = sum(item[2] for item in uploaded_media)
+                first_msg_id = backup_msgs[0].id
+                channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
+                backup_message_link = f"https://t.me/c/{channel_id}/{first_msg_id}"
+                await log_forward(message.from_user.username, first_msg_id, total_album_size, source_name, backup_message_link)
                 
                 # Forward as album to user
                 await status_msg.edit(f"⬆️ Menghantar album ke anda...")
