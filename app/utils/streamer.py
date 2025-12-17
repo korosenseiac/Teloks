@@ -125,19 +125,26 @@ async def upload_stream(client: Client, streamer: MediaStreamer, file_name: str)
     """
     Manually uploads a stream to Telegram using raw API calls.
     Returns an InputFile or InputFileBig.
+    
+    Note: For files > 10MB (big files), Telegram requires file_total_parts to be known upfront.
+    We calculate this from the known file_size.
     """
     file_id = random.randint(0, 1000000000)
     part_count = 0
-    is_big = streamer.file_size > 10 * 1024 * 1024
-    chunk_size = 512 * 1024  # 512KB - must be consistent
-    total_parts = math.ceil(streamer.file_size / chunk_size)
+    file_size = streamer.file_size
+    is_big = file_size > 10 * 1024 * 1024
+    chunk_size = 512 * 1024  # 512KB - Telegram requirement
     
-    buffer = b""  # Buffer to accumulate chunks to exact size
+    # Calculate total parts from file_size (required for SaveBigFilePart)
+    total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
+    
+    buffer = b""
+    bytes_uploaded = 0
 
     while True:
         chunk = await streamer.read()
         if not chunk:
-            # Upload remaining buffer if any
+            # Upload remaining buffer if any (this is the last part, can be smaller)
             if buffer:
                 if is_big:
                     await client.invoke(
@@ -160,6 +167,7 @@ async def upload_stream(client: Client, streamer: MediaStreamer, file_name: str)
                         retries=3,
                         timeout=60
                     )
+                bytes_uploaded += len(buffer)
                 part_count += 1
             break
         
@@ -191,7 +199,12 @@ async def upload_stream(client: Client, streamer: MediaStreamer, file_name: str)
                     retries=3,
                     timeout=60
                 )
+            bytes_uploaded += len(part_data)
             part_count += 1
+    
+    # Verify we uploaded the expected number of parts
+    if part_count != total_parts:
+        print(f"WARNING: Part count mismatch! Expected {total_parts}, got {part_count}. File size: {file_size}, uploaded: {bytes_uploaded}")
 
     if is_big:
         return InputFileBig(
