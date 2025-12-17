@@ -129,35 +129,69 @@ async def upload_stream(client: Client, streamer: MediaStreamer, file_name: str)
     file_id = random.randint(0, 1000000000)
     part_count = 0
     is_big = streamer.file_size > 10 * 1024 * 1024
-    total_parts = math.ceil(streamer.file_size / streamer.chunk_size)
+    chunk_size = 512 * 1024  # 512KB - must be consistent
+    total_parts = math.ceil(streamer.file_size / chunk_size)
+    
+    buffer = b""  # Buffer to accumulate chunks to exact size
 
     while True:
         chunk = await streamer.read()
         if not chunk:
+            # Upload remaining buffer if any
+            if buffer:
+                if is_big:
+                    await client.invoke(
+                        SaveBigFilePart(
+                            file_id=file_id,
+                            file_part=part_count,
+                            file_total_parts=total_parts,
+                            bytes=buffer
+                        ),
+                        retries=3,
+                        timeout=60
+                    )
+                else:
+                    await client.invoke(
+                        SaveFilePart(
+                            file_id=file_id,
+                            file_part=part_count,
+                            bytes=buffer
+                        ),
+                        retries=3,
+                        timeout=60
+                    )
+                part_count += 1
             break
         
-        if is_big:
-            await client.invoke(
-                SaveBigFilePart(
-                    file_id=file_id,
-                    file_part=part_count,
-                    file_total_parts=total_parts,
-                    bytes=chunk
-                ),
-                retries=3,
-                timeout=60
-            )
-        else:
-            await client.invoke(
-                SaveFilePart(
-                    file_id=file_id,
-                    file_part=part_count,
-                    bytes=chunk
-                ),
-                retries=3,
-                timeout=60
-            )
-        part_count += 1
+        buffer += chunk
+        
+        # Upload complete chunks of exactly chunk_size
+        while len(buffer) >= chunk_size:
+            part_data = buffer[:chunk_size]
+            buffer = buffer[chunk_size:]
+            
+            if is_big:
+                await client.invoke(
+                    SaveBigFilePart(
+                        file_id=file_id,
+                        file_part=part_count,
+                        file_total_parts=total_parts,
+                        bytes=part_data
+                    ),
+                    retries=3,
+                    timeout=60
+                )
+            else:
+                await client.invoke(
+                    SaveFilePart(
+                        file_id=file_id,
+                        file_part=part_count,
+                        bytes=part_data
+                    ),
+                    retries=3,
+                    timeout=60
+                )
+            part_count += 1
 
     if is_big:
         return InputFileBig(
