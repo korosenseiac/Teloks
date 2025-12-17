@@ -556,17 +556,40 @@ async def link_handler(client: Client, message: Message):
         await status_msg.edit(f"⬆️ Mengirim {len(backup_msg_ids)} file(s) ke Anda...")
         
         if is_media_group and len(backup_msg_ids) > 1:
-            # Forward as media group (album) to preserve grouping
+            # Send as media group (album) to preserve grouping
             try:
-                await client.copy_media_group(
-                    chat_id=user_id,
-                    from_chat_id=BACKUP_GROUP_ID,
-                    message_id=backup_msg_ids[0],  # Any message ID from the group works
-                    captions=""  # Strip all captions
-                )
+                from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+                
+                # Get backup messages to build media group
+                media_list = []
+                for backup_msg_id in backup_msg_ids:
+                    try:
+                        backup_msg = await client.get_messages(BACKUP_GROUP_ID, backup_msg_id)
+                        if backup_msg.photo:
+                            media_list.append(InputMediaPhoto(backup_msg.photo.file_id))
+                        elif backup_msg.video:
+                            media_list.append(InputMediaVideo(backup_msg.video.file_id))
+                        elif backup_msg.audio:
+                            media_list.append(InputMediaAudio(backup_msg.audio.file_id))
+                        elif backup_msg.document:
+                            media_list.append(InputMediaDocument(backup_msg.document.file_id))
+                    except Exception as e:
+                        print(f"DEBUG: Failed to get backup message {backup_msg_id}: {e}")
+                
+                if len(media_list) > 1:
+                    await client.send_media_group(chat_id=user_id, media=media_list)
+                else:
+                    # Fallback if only one media
+                    for backup_msg_id in backup_msg_ids:
+                        await client.copy_message(
+                            chat_id=user_id,
+                            from_chat_id=BACKUP_GROUP_ID,
+                            message_id=backup_msg_id,
+                            caption=""
+                        )
             except Exception as e:
-                print(f"DEBUG: Failed to copy media group: {e}")
-                # Fallback to individual copy if media group copy fails
+                print(f"DEBUG: Failed to send media group: {e}")
+                # Fallback to individual copy if media group fails
                 for backup_msg_id in backup_msg_ids:
                     try:
                         await client.copy_message(
