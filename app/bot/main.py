@@ -678,9 +678,115 @@ async def upload_single_media_for_group(client: Client, user_client: Client, tar
                      target_msg.animation or target_msg.sticker)
         file_size = getattr(media_obj, "file_size", 0)
         file_name = getattr(media_obj, "file_name", None) or "file"
-
-        # For album media, download to memory and re-upload using Pyrogram's high-level API
-        # This is more reliable than raw API for smaller files in albums
+        
+        # Threshold for using streaming vs memory (50MB)
+        STREAM_THRESHOLD = 50 * 1024 * 1024
+        
+        # For large files, use streaming approach
+        if file_size > STREAM_THRESHOLD:
+            # Use streaming for large files
+            streamer = MediaStreamer(user_client, target_msg, file_size)
+            
+            if target_msg.photo:
+                file_name = "photo.jpg"
+            
+            input_file = await upload_stream(client, streamer, file_name)
+            
+            # Get backup group peer
+            peer = await get_backup_group_peer(client)
+            if not peer:
+                return None
+            
+            # Determine media type and create appropriate InputMedia
+            if target_msg.photo:
+                media = InputMediaUploadedPhoto(file=input_file)
+                media_type = "photo"
+                metadata = {}
+            elif target_msg.video:
+                video = target_msg.video
+                attributes = [
+                    DocumentAttributeVideo(
+                        duration=video.duration or 0,
+                        w=video.width or 0,
+                        h=video.height or 0,
+                        supports_streaming=True
+                    ),
+                    DocumentAttributeFilename(file_name=file_name)
+                ]
+                media = InputMediaUploadedDocument(
+                    file=input_file,
+                    mime_type=video.mime_type or "video/mp4",
+                    attributes=attributes
+                )
+                media_type = "video"
+                metadata = {"duration": video.duration or 0, "width": video.width or 0, "height": video.height or 0}
+            elif target_msg.audio:
+                audio = target_msg.audio
+                attributes = [
+                    DocumentAttributeAudio(
+                        duration=audio.duration or 0,
+                        title=audio.title or "",
+                        performer=audio.performer or ""
+                    ),
+                    DocumentAttributeFilename(file_name=file_name)
+                ]
+                media = InputMediaUploadedDocument(
+                    file=input_file,
+                    mime_type=audio.mime_type or "audio/mpeg",
+                    attributes=attributes
+                )
+                media_type = "audio"
+                metadata = {"duration": audio.duration or 0, "title": audio.title or "", "performer": audio.performer or ""}
+            else:
+                attributes = [DocumentAttributeFilename(file_name=file_name)]
+                mime_type = getattr(media_obj, "mime_type", "application/octet-stream")
+                media = InputMediaUploadedDocument(
+                    file=input_file,
+                    mime_type=mime_type,
+                    attributes=attributes
+                )
+                media_type = "document"
+                metadata = {}
+            
+            # Send using raw API
+            updates = await client.invoke(
+                SendMedia(
+                    peer=peer,
+                    media=media,
+                    message="",
+                    random_id=random.randint(0, 2**63 - 1)
+                )
+            )
+            
+            # Extract message ID and file_id
+            msg_id = None
+            for update in updates.updates:
+                if isinstance(update, (UpdateNewMessage, UpdateNewChannelMessage)):
+                    msg_id = update.message.id
+                    break
+            
+            if msg_id:
+                sent_msg = await client.get_messages(BACKUP_GROUP_ID, msg_id)
+                
+                if sent_msg.photo:
+                    file_id = sent_msg.photo.file_id
+                elif sent_msg.video:
+                    file_id = sent_msg.video.file_id
+                elif sent_msg.audio:
+                    file_id = sent_msg.audio.file_id
+                elif sent_msg.document:
+                    file_id = sent_msg.document.file_id
+                else:
+                    file_id = None
+                
+                await client.delete_messages(BACKUP_GROUP_ID, msg_id)
+                
+                if file_id:
+                    return (file_id, media_type, file_size, metadata)
+            
+            return None
+        
+        # For small files, use BytesIO (simpler and more reliable)
         buffer = BytesIO()
         await user_client.download_media(target_msg, file_name=buffer)
         buffer.seek(0)
