@@ -1,8 +1,11 @@
 import re
 import random
+import math
+from io import BytesIO
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
 from pyrogram.raw.functions.messages import SendMedia
+from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
     InputMediaUploadedDocument, 
     InputMediaUploadedPhoto,
@@ -12,7 +15,8 @@ from pyrogram.raw.types import (
     DocumentAttributeAnimated,
     UpdateNewMessage, 
     UpdateNewChannelMessage, 
-    InputPeerChannel
+    InputPeerChannel,
+    InputFile
 )
 from app.config import API_ID, API_HASH, BOT_TOKEN, BACKUP_GROUP_ID
 from app.database.db import add_user, save_user_session, log_forward, get_user_session, save_backup_group_cache, get_backup_group_cache, get_user_profile
@@ -712,9 +716,21 @@ async def upload_single_media_for_group(client: Client, user_client: Client, tar
                 file_id = sent_msg.photo.file_id if sent_msg and sent_msg.photo else None
             elif target_msg.video:
                 video = target_msg.video
+                # Download thumbnail from source video
+                thumb_data = None
+                try:
+                    if video.thumbs:
+                        thumb_data = await user_client.download_media(
+                            video.thumbs[0].file_id, in_memory=True
+                        )
+                except Exception as e:
+                    print(f"DEBUG: Failed to download video thumbnail: {e}")
+                    thumb_data = None
+                
                 sent_msg = await client.send_video(
                     BACKUP_GROUP_ID, 
                     video=media_source,
+                    thumb=thumb_data,
                     duration=video.duration or 0,
                     width=video.width or 0,
                     height=video.height or 0,
@@ -806,10 +822,48 @@ async def process_single_media(client: Client, user_client: Client, target_msg: 
                 DocumentAttributeFilename(file_name=file_name)
             ]
             mime_type = video.mime_type or "video/mp4"
+            
+            # Download and upload thumbnail for video
+            thumb_input_file = None
+            try:
+                if video.thumbs:
+                    thumb_bytes_io = await user_client.download_media(
+                        video.thumbs[0].file_id, in_memory=True
+                    )
+                    if thumb_bytes_io:
+                        if isinstance(thumb_bytes_io, BytesIO):
+                            thumb_bytes_io.seek(0)
+                            thumb_raw = thumb_bytes_io.read()
+                        else:
+                            thumb_raw = thumb_bytes_io
+                        
+                        if thumb_raw and len(thumb_raw) > 0:
+                            # Upload thumbnail using raw API SaveFilePart
+                            thumb_file_id_raw = random.randint(0, 2**63 - 1)
+                            await client.invoke(
+                                SaveFilePart(
+                                    file_id=thumb_file_id_raw,
+                                    file_part=0,
+                                    bytes=thumb_raw
+                                )
+                            )
+                            thumb_input_file = InputFile(
+                                id=thumb_file_id_raw,
+                                parts=1,
+                                name="thumb.jpg",
+                                md5_checksum=""
+                            )
+            except Exception as e:
+                print(f"DEBUG: Failed to download/upload thumbnail for raw API: {e}")
+                import traceback
+                traceback.print_exc()
+                thumb_input_file = None
+            
             media = InputMediaUploadedDocument(
                 file=input_file,
                 mime_type=mime_type,
-                attributes=attributes
+                attributes=attributes,
+                thumb=thumb_input_file
             )
         elif target_msg.audio:
             # Upload as audio with proper attributes
