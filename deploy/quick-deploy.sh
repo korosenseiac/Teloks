@@ -142,7 +142,44 @@ case "$1" in
     logs) sudo journalctl -u $SERVICE_NAME -f --no-pager ;;
     logs-tail) sudo journalctl -u $SERVICE_NAME -n ${2:-100} --no-pager ;;
     edit-env) sudo nano $BOT_DIR/.env ;;
-    *) echo "Usage: bot {start|stop|restart|status|logs|logs-tail|edit-env}" ;;
+    update)
+        echo "========================================="
+        echo "  Updating Bot from GitHub..."
+        echo "========================================="
+        echo ""
+        echo "[1/5] Stopping bot..."
+        sudo systemctl stop $SERVICE_NAME
+        echo ""
+        echo "[2/5] Creating backup..."
+        BACKUP_DIR="/opt/telegram-forwarder-bot-backup-$(date +%Y%m%d_%H%M%S)"
+        sudo mkdir -p $BACKUP_DIR
+        sudo cp -r $BOT_DIR/* $BACKUP_DIR/ 2>/dev/null || true
+        echo "Backup saved at: $BACKUP_DIR"
+        echo ""
+        echo "[3/5] Pulling latest code from GitHub..."
+        cd $BOT_DIR
+        if [ ! -d "$BOT_DIR/.git" ]; then
+            sudo -u botuser git init
+            sudo -u botuser git remote add origin https://github.com/korosenseiac/Teloks.git
+        fi
+        sudo -u botuser git fetch origin
+        sudo -u botuser git reset --hard origin/main 2>/dev/null || sudo -u botuser git reset --hard origin/master
+        sudo cp $BACKUP_DIR/.env $BOT_DIR/.env 2>/dev/null || true
+        sudo cp $BACKUP_DIR/*.session $BOT_DIR/ 2>/dev/null || true
+        sudo chown -R botuser:botuser $BOT_DIR
+        echo "Code updated."
+        echo ""
+        echo "[4/5] Updating dependencies..."
+        sudo -u botuser $BOT_DIR/venv/bin/pip install -r requirements.txt --upgrade
+        echo ""
+        echo "[5/5] Starting bot..."
+        sudo systemctl start $SERVICE_NAME
+        echo ""
+        echo "========================================="
+        echo "  Update Complete!"
+        echo "========================================="
+        ;;
+    *) echo "Usage: bot {start|stop|restart|status|logs|logs-tail|edit-env|update}" ;;
 esac
 BOTCMD
 chmod +x /usr/local/bin/bot

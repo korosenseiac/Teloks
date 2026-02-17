@@ -3,7 +3,8 @@
 # =============================================================================
 # Telegram Forwarder Bot - Update Script
 # =============================================================================
-# Use this script to update bot files from a new version
+# Pulls the latest version from GitHub and restarts the bot
+# Usage: sudo bash update-bot.sh
 # =============================================================================
 
 set -e
@@ -16,6 +17,7 @@ NC='\033[0m'
 
 BOT_DIR="/opt/telegram-forwarder-bot"
 SERVICE_NAME="telegram-forwarder"
+REPO_URL="https://github.com/korosenseiac/Teloks.git"
 BACKUP_DIR="/opt/telegram-forwarder-bot-backup-$(date +%Y%m%d_%H%M%S)"
 
 echo -e "${BLUE}========================================${NC}"
@@ -28,43 +30,46 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Check if new files are provided
-if [ ! -f "main.py" ]; then
-    echo -e "${RED}Error: No bot files found in current directory${NC}"
-    echo "Please run this script from the directory containing the new bot files"
-    exit 1
-fi
-
-echo -e "${BLUE}Step 1: Creating backup...${NC}"
+# Step 1: Create backup
+echo -e "${BLUE}[1/5] Creating backup...${NC}"
 mkdir -p $BACKUP_DIR
 cp -r $BOT_DIR/* $BACKUP_DIR/ 2>/dev/null || true
 echo -e "${GREEN}[✓]${NC} Backup created at $BACKUP_DIR"
 
-echo -e "${BLUE}Step 2: Stopping bot...${NC}"
+# Step 2: Stop bot
+echo -e "${BLUE}[2/5] Stopping bot...${NC}"
 systemctl stop $SERVICE_NAME
 echo -e "${GREEN}[✓]${NC} Bot stopped"
 
-echo -e "${BLUE}Step 3: Updating files...${NC}"
-# Preserve .env and session files
-cp $BOT_DIR/.env /tmp/bot_env_backup 2>/dev/null || true
-cp $BOT_DIR/*.session /tmp/ 2>/dev/null || true
+# Step 3: Pull latest code from GitHub
+echo -e "${BLUE}[3/5] Pulling latest code from GitHub...${NC}"
+cd $BOT_DIR
 
-# Copy new files (exclude deploy folder)
-rsync -av --exclude='deploy' --exclude='.env' --exclude='*.session' --exclude='venv' ./ $BOT_DIR/
+# Initialize git if not already a repo
+if [ ! -d "$BOT_DIR/.git" ]; then
+    sudo -u botuser git init
+    sudo -u botuser git remote add origin $REPO_URL
+fi
 
-# Restore preserved files
-cp /tmp/bot_env_backup $BOT_DIR/.env 2>/dev/null || true
-cp /tmp/*.session $BOT_DIR/ 2>/dev/null || true
+# Fetch and reset to latest
+sudo -u botuser git fetch origin
+sudo -u botuser git reset --hard origin/main 2>/dev/null || sudo -u botuser git reset --hard origin/master
+
+# Restore .env and session files from backup
+cp $BACKUP_DIR/.env $BOT_DIR/.env 2>/dev/null || true
+cp $BACKUP_DIR/*.session $BOT_DIR/ 2>/dev/null || true
 
 chown -R botuser:botuser $BOT_DIR
-echo -e "${GREEN}[✓]${NC} Files updated"
+echo -e "${GREEN}[✓]${NC} Code updated to latest version"
 
-echo -e "${BLUE}Step 4: Updating dependencies...${NC}"
+# Step 4: Update dependencies
+echo -e "${BLUE}[4/5] Updating dependencies...${NC}"
 cd $BOT_DIR
 sudo -u botuser $BOT_DIR/venv/bin/pip install -r requirements.txt --upgrade
 echo -e "${GREEN}[✓]${NC} Dependencies updated"
 
-echo -e "${BLUE}Step 5: Starting bot...${NC}"
+# Step 5: Start bot
+echo -e "${BLUE}[5/5] Starting bot...${NC}"
 systemctl start $SERVICE_NAME
 echo -e "${GREEN}[✓]${NC} Bot started"
 

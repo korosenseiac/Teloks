@@ -223,14 +223,50 @@ case "$1" in
         sudo nano $BOT_DIR/.env
         ;;
     update)
-        echo "Stopping bot..."
+        echo "========================================="
+        echo "  Updating Bot from GitHub..."
+        echo "========================================="
+        echo ""
+        echo "[1/5] Stopping bot..."
         sudo systemctl stop $SERVICE_NAME
-        echo "Updating dependencies..."
+        echo "Bot stopped."
+        echo ""
+        echo "[2/5] Creating backup..."
+        BACKUP_DIR="/opt/telegram-forwarder-bot-backup-$(date +%Y%m%d_%H%M%S)"
+        sudo mkdir -p $BACKUP_DIR
+        sudo cp -r $BOT_DIR/* $BACKUP_DIR/ 2>/dev/null || true
+        echo "Backup saved at: $BACKUP_DIR"
+        echo ""
+        echo "[3/5] Pulling latest code from GitHub..."
         cd $BOT_DIR
+        # Initialize git if not already a repo
+        if [ ! -d "$BOT_DIR/.git" ]; then
+            sudo -u botuser git init
+            sudo -u botuser git remote add origin https://github.com/korosenseiac/Teloks.git
+        fi
+        # Stash any local changes, pull latest, then restore .env and sessions
+        sudo -u botuser git fetch origin
+        sudo -u botuser git reset --hard origin/main 2>/dev/null || sudo -u botuser git reset --hard origin/master
+        # Restore preserved files from backup
+        sudo cp $BACKUP_DIR/.env $BOT_DIR/.env 2>/dev/null || true
+        sudo cp $BACKUP_DIR/*.session $BOT_DIR/ 2>/dev/null || true
+        sudo chown -R botuser:botuser $BOT_DIR
+        echo "Code updated to latest version."
+        echo ""
+        echo "[4/5] Updating dependencies..."
         sudo -u botuser $BOT_DIR/venv/bin/pip install -r requirements.txt --upgrade
-        echo "Starting bot..."
+        echo "Dependencies updated."
+        echo ""
+        echo "[5/5] Starting bot..."
         sudo systemctl start $SERVICE_NAME
-        echo "Bot updated and restarted"
+        echo "Bot started."
+        echo ""
+        echo "========================================="
+        echo "  Update Complete!"
+        echo "========================================="
+        echo "Backup: $BACKUP_DIR"
+        echo "Check status: bot status"
+        echo "View logs: bot logs"
         ;;
     *)
         echo "Telegram Forwarder Bot Management"
@@ -245,7 +281,7 @@ case "$1" in
         echo "  logs        - Show live logs (Ctrl+C to exit)"
         echo "  logs-tail   - Show last N logs (default 100)"
         echo "  edit-env    - Edit environment variables"
-        echo "  update      - Update dependencies and restart"
+        echo "  update      - Pull latest version from GitHub and restart"
         ;;
 esac
 EOF
