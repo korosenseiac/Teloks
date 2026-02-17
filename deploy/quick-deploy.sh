@@ -162,6 +162,7 @@ case "$1" in
             sudo -u botuser git init
             sudo -u botuser git remote add origin https://github.com/korosenseiac/Teloks.git
         fi
+        sudo chown -R botuser:botuser $BOT_DIR/.git
         sudo -u botuser git fetch origin
         sudo -u botuser git reset --hard origin/main 2>/dev/null || sudo -u botuser git reset --hard origin/master
         sudo cp $BACKUP_DIR/.env $BOT_DIR/.env 2>/dev/null || true

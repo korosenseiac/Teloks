@@ -52,6 +52,7 @@ if [ ! -d "$BOT_DIR/.git" ]; then
 fi
 
 # Fetch and reset to latest
+chown -R botuser:botuser $BOT_DIR/.git
 sudo -u botuser git fetch origin
 sudo -u botuser git reset --hard origin/main 2>/dev/null || sudo -u botuser git reset --hard origin/master
 

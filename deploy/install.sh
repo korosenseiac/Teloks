@@ -245,6 +245,7 @@ case "$1" in
             sudo -u botuser git remote add origin https://github.com/korosenseiac/Teloks.git
         fi
         # Stash any local changes, pull latest, then restore .env and sessions
+        sudo chown -R botuser:botuser $BOT_DIR/.git
         sudo -u botuser git fetch origin
         sudo -u botuser git reset --hard origin/main 2>/dev/null || sudo -u botuser git reset --hard origin/master
         # Restore preserved files from backup
