@@ -25,8 +25,8 @@ import asyncio
 # Track active processes per user (user_id: True if processing)
 active_user_processes = {}
 
-# File size limit (600MB in bytes)
-MAX_FILE_SIZE = 600 * 1024 * 1024  # 600MB
+# File size limit (2GB in bytes)
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 
 def format_file_size(size_bytes):
     """Format file size in human readable format."""
