@@ -14,3 +14,6 @@ MONGO_URI = os.getenv("MONGO_URI", "")
 # Configuration
 BACKUP_GROUP_ID = int(os.getenv("BACKUP_GROUP_ID", "0")) # The private group for storage
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+# TeraBox
+TERABOX_NDUS = os.getenv("TERABOX_NDUS", "")

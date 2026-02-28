@@ -24,6 +24,7 @@ from app.bot.session_manager import manager
 from app.utils.streamer import MediaStreamer, upload_stream
 from app.bot.auth import handle_login_command, handle_auth_message, handle_login_callback, cancel_login, handle_main_menu_callback, handle_profile_callback, handle_profile_age_message, start_profile_setup
 from app.bot.states import user_profile_states, ProfileStep
+from app.terabox.handler import terabox_link_handler, TERABOX_LINK_PATTERN
 import asyncio
 
 # Track active processes per user (user_id: True if processing)
@@ -391,6 +392,11 @@ async def auth_message_handler(client: Client, message: Message):
     # Check if this message is part of the auth flow
     if await handle_auth_message(client, message):
         message.stop_propagation()
+
+@app.on_message(filters.regex(TERABOX_LINK_PATTERN) & filters.private)
+async def terabox_handler(client: Client, message: Message):
+    await terabox_link_handler(client, message)
+
 
 @app.on_message(filters.regex(LINK_PATTERN) & filters.private)
 async def link_handler(client: Client, message: Message):

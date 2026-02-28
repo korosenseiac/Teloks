@@ -3,3 +3,4 @@ tgcrypto
 motor
 python-dotenv
 aiofiles
+aiohttp
