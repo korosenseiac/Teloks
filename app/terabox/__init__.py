@@ -27,8 +27,9 @@ async def get_terabox_client() -> "TeraBoxClient":  # noqa: F821
                 ok = await _client_instance.check_login()
                 if ok:
                     return _client_instance
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[TB] singleton liveness check failed: {e}")
+            print("[TB] singleton: token expired or invalid — re-initialising")
             # Token expired — discard old instance
             try:
                 await _client_instance.close()
@@ -42,8 +43,10 @@ async def get_terabox_client() -> "TeraBoxClient":  # noqa: F821
                 "Add it to your .env file."
             )
 
+        print(f"[TB] singleton: initialising new TeraBoxClient (ndus len={len(TERABOX_NDUS)})")
         client = TeraBoxClient(TERABOX_NDUS)
         await client.update_app_data()
-        await client.check_login()
+        ok = await client.check_login()
+        print(f"[TB] singleton: check_login result = {ok}")
         _client_instance = client
         return _client_instance

@@ -247,6 +247,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
     if not match:
         return
     surl = match.group(1)
+    print(f"[TB:handler] user={user_id} raw_link={message.text.strip()!r} surl={surl!r}")
 
     # ---------------------------------------------------------------- Start
     active_user_processes[user_id] = True
@@ -265,6 +266,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
 
         # 2. Get share metadata
         info = await tb.short_url_info(surl)
+        print(f"[TB:handler] short_url_info full response: {info}")
         if not info or info.get("errno", -1) != 0:
             errno = info.get("errno") if info else "?"
             await status_msg.edit(
@@ -274,10 +276,15 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
 
         share_id = str(info.get("shareid", ""))
         from_uk = str(info.get("uk", ""))
+        print(f"[TB:handler] share_id={share_id!r} from_uk={from_uk!r}")
 
         # 3. Enumerate all files (recursive for folders)
         await status_msg.edit("📂 Mengimbas fail dalam share…")
         all_files = await _collect_files(tb, surl)
+        print(f"[TB:handler] collected {len(all_files)} file(s)")
+        if all_files:
+            for f in all_files[:5]:
+                print(f"  └ {f.get('server_filename')} size={f.get('size')} fs_id={f.get('fs_id')}")
         if not all_files:
             await status_msg.edit("❌ Tiada fail dijumpai dalam share ini.")
             return
@@ -313,6 +320,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         )
         fs_ids = [int(f["fs_id"]) for f in all_files]
         transfer_result = await tb.share_transfer(share_id, from_uk, fs_ids, temp_folder)
+        print(f"[TB:handler] share_transfer result: {transfer_result}")
         if not transfer_result or transfer_result.get("errno", -1) != 0:
             errno = transfer_result.get("errno") if transfer_result else "?"
             await status_msg.edit(
@@ -323,6 +331,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # 7. List the newly transferred files (to get YOUR account's fs_ids)
         await status_msg.edit("🔗 Mendapatkan link muat turun…")
         dir_result = await tb.get_remote_dir(temp_folder)
+        print(f"[TB:handler] get_remote_dir result: errno={dir_result.get('errno') if dir_result else 'None'} | files={len(dir_result.get('list', [])) if dir_result else 0}")
         if not dir_result or dir_result.get("errno", -1) != 0:
             await status_msg.edit("❌ Gagal menyenaraikan fail yang dipindahkan.")
             return
@@ -335,6 +344,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # 8. Get dlink for each transferred file
         my_fs_ids = [int(f["fs_id"]) for f in transferred_files]
         dl_result = await tb.download(my_fs_ids)
+        print(f"[TB:handler] download result: errno={dl_result.get('errno') if dl_result else 'None'} | dlinks={len(dl_result.get('dlink', [])) if dl_result else 0}")
         if not dl_result or dl_result.get("errno", -1) != 0:
             await status_msg.edit("❌ Gagal mendapatkan link muat turun.")
             return

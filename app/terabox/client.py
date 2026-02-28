@@ -123,6 +123,7 @@ class TeraBoxClient:
         """
         path = custom_path or "main"
         url = f"{self.domain}/{path}"
+        print(f"[TB] update_app_data → GET {url}")
         try:
             async with self._session_for() as session:
                 async with session.get(
@@ -134,8 +135,10 @@ class TeraBoxClient:
                     if resp.url.host != urllib.parse.urlparse(self.domain).hostname:
                         self.domain = f"{resp.url.scheme}://{resp.url.host}"
                         self._cookie_str = f"lang=en; ndus={self.ndus_token}"
+                        print(f"[TB] update_app_data → domain redirected to {self.domain}")
 
                     html = await resp.text(errors="replace")
+                    print(f"[TB] update_app_data ← HTTP {resp.status} | html_len={len(html)}")
 
             # Extract jsToken
             js_token_match = re.search(r'jsToken\s*=\s*["\']([^"\']+)["\']', html)
@@ -168,10 +171,16 @@ class TeraBoxClient:
                 if bds_match:
                     self.bds_token = bds_match.group(1)
 
+            print(
+                f"[TB] update_app_data → tokens: "
+                f"js_token={'OK' if self.js_token else 'MISSING'} "
+                f"bds_token={'OK' if self.bds_token else 'MISSING'} "
+                f"logid={self.logid!r} csrf={self.csrf!r}"
+            )
             return True
 
         except Exception as e:
-            print(f"[TeraBox] update_app_data error: {e}")
+            print(f"[TB] update_app_data error: {e}")
             return False
 
     # ----------------------------------------------------------- check_login
@@ -183,6 +192,7 @@ class TeraBoxClient:
         Returns True if logged in, False otherwise.
         """
         url = f"{self.domain}/api/check/login"
+        print(f"[TB] check_login → GET {url}")
         try:
             async with self._session_for() as session:
                 async with session.get(
@@ -194,11 +204,13 @@ class TeraBoxClient:
                     new_prefix = resp.headers.get("x-redirect-domain", "")
                     if new_prefix:
                         self.domain = f"https://{new_prefix}.terabox.com"
+                        print(f"[TB] check_login → domain redirected to {self.domain}")
                     data = await resp.json(content_type=None)
+                    print(f"[TB] check_login ← HTTP {resp.status} | {data}")
                     errno = data.get("errno", -1)
                     return errno == 0
         except Exception as e:
-            print(f"[TeraBox] check_login error: {e}")
+            print(f"[TB] check_login error: {e}")
             return False
 
     # -------------------------------------------------------- short_url_info
@@ -208,19 +220,25 @@ class TeraBoxClient:
         Fetch share metadata (share_id, uk, file list).
         Mirrors TeraBoxApp#shortUrlInfo (lines 2018–2050 of api.js).
         Uses cipher-restricted TLS connector.
+
+        NOTE: surl is the raw code extracted from the share URL path (e.g. "1AbcXyz").
+        We pass it directly — do NOT prepend "1" again.
         """
         url = (
             f"{self.domain}/api/shorturlinfo"
-            f"?shorturl=1{urllib.parse.quote(surl)}&root=1"
+            f"?shorturl={urllib.parse.quote(surl)}&root=1"
         )
+        print(f"[TB] short_url_info → GET {url}  (surl={surl!r})")
         try:
             async with self._session_for(restricted=True) as session:
                 async with session.get(
                     url, timeout=aiohttp.ClientTimeout(total=20)
                 ) as resp:
-                    return await resp.json(content_type=None)
+                    data = await resp.json(content_type=None)
+                    print(f"[TB] short_url_info ← HTTP {resp.status} | errno={data.get('errno')} | keys={list(data.keys())}")
+                    return data
         except Exception as e:
-            print(f"[TeraBox] short_url_info error: {e}")
+            print(f"[TB] short_url_info error: {e}")
             return None
 
     # -------------------------------------------------------- short_url_list
@@ -253,14 +271,18 @@ class TeraBoxClient:
             params["root"] = "1"
 
         url = f"{self.domain}/share/list?" + urllib.parse.urlencode(params)
+        print(f"[TB] short_url_list → GET {url}")
         try:
             async with self._session_for(restricted=True) as session:
                 async with session.get(
                     url, timeout=aiohttp.ClientTimeout(total=20)
                 ) as resp:
-                    return await resp.json(content_type=None)
+                    data = await resp.json(content_type=None)
+                    file_count = len(data.get("list", []))
+                    print(f"[TB] short_url_list ← HTTP {resp.status} | errno={data.get('errno')} | files={file_count}")
+                    return data
         except Exception as e:
-            print(f"[TeraBox] short_url_list error: {e}")
+            print(f"[TB] short_url_list error: {e}")
             return None
 
     # -------------------------------------------------------- share_transfer
@@ -303,6 +325,7 @@ class TeraBoxClient:
                     "path": dest_path,
                 }
             )
+            print(f"[TB] share_transfer → POST {url}  (attempt={attempt+1}, fs_ids={fs_ids}, dest={dest_path})")
             try:
                 async with self._session_for() as session:
                     async with session.post(
@@ -312,16 +335,17 @@ class TeraBoxClient:
                         timeout=aiohttp.ClientTimeout(total=60),
                     ) as resp:
                         result = await resp.json(content_type=None)
+                        print(f"[TB] share_transfer ← HTTP {resp.status} | {result}")
                         errno = result.get("errno", -1)
                         if errno == 400810 and attempt == 0:
-                            # Refresh tokens and retry
+                            print("[TB] share_transfer: errno=400810 → refreshing tokens and retrying")
                             self.js_token = ""
                             self.bds_token = ""
                             await self.update_app_data()
                             continue
                         return result
             except Exception as e:
-                print(f"[TeraBox] share_transfer error: {e}")
+                print(f"[TB] share_transfer error (attempt={attempt+1}): {e}")
                 if attempt == 1:
                     return None
         return None
@@ -352,6 +376,7 @@ class TeraBoxClient:
                 "block_list": "[]",
             }
         )
+        print(f"[TB] create_dir → POST {url}  (path={remote_dir})")
         try:
             async with self._session_for() as session:
                 async with session.post(
@@ -360,9 +385,11 @@ class TeraBoxClient:
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
-                    return await resp.json(content_type=None)
+                    data = await resp.json(content_type=None)
+                    print(f"[TB] create_dir ← HTTP {resp.status} | {data}")
+                    return data
         except Exception as e:
-            print(f"[TeraBox] create_dir error: {e}")
+            print(f"[TB] create_dir error: {e}")
             return None
 
     # -------------------------------------------------------------- get_remote_dir
@@ -395,6 +422,7 @@ class TeraBoxClient:
                 "showempty": "0",
             }
         )
+        print(f"[TB] get_remote_dir → POST {url}  (dir={remote_dir})")
         try:
             async with self._session_for() as session:
                 async with session.post(
@@ -403,9 +431,12 @@ class TeraBoxClient:
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
-                    return await resp.json(content_type=None)
+                    data = await resp.json(content_type=None)
+                    file_count = len(data.get("list", []))
+                    print(f"[TB] get_remote_dir ← HTTP {resp.status} | errno={data.get('errno')} | files={file_count}")
+                    return data
         except Exception as e:
-            print(f"[TeraBox] get_remote_dir error: {e}")
+            print(f"[TB] get_remote_dir error: {e}")
             return None
 
     # ----------------------------------------------------------- get_home_info
@@ -416,14 +447,17 @@ class TeraBoxClient:
         Mirrors TeraBoxApp#getHomeInfo (lines 2223–2248 of api.js).
         """
         url = f"{self.domain}/api/home/info"
+        print(f"[TB] get_home_info → GET {url}")
         try:
             async with self._session_for() as session:
                 async with session.get(
                     url, timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
-                    return await resp.json(content_type=None)
+                    data = await resp.json(content_type=None)
+                    print(f"[TB] get_home_info ← HTTP {resp.status} | errno={data.get('errno')} | has_sign={bool(data.get('sign1'))}")
+                    return data
         except Exception as e:
-            print(f"[TeraBox] get_home_info error: {e}")
+            print(f"[TB] get_home_info error: {e}")
             return None
 
     # --------------------------------------------------------- sign_download
@@ -501,6 +535,7 @@ class TeraBoxClient:
                 "need_speed": "1",
             }
         )
+        print(f"[TB] download → POST {url}  (fs_ids={fs_ids})")
         try:
             async with self._session_for() as session:
                 async with session.post(
@@ -509,9 +544,12 @@ class TeraBoxClient:
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
-                    return await resp.json(content_type=None)
+                    data = await resp.json(content_type=None)
+                    link_count = len(data.get("dlink", []))
+                    print(f"[TB] download ← HTTP {resp.status} | errno={data.get('errno')} | dlinks={link_count}")
+                    return data
         except Exception as e:
-            print(f"[TeraBox] download error: {e}")
+            print(f"[TB] download error: {e}")
             return None
 
     # -------------------------------------------------------------- filemanager
@@ -543,6 +581,7 @@ class TeraBoxClient:
         )
         url = f"{self.domain}/api/filemanager?{params}"
         body = urllib.parse.urlencode({"filelist": json.dumps(fm_params)})
+        print(f"[TB] filemanager → POST {url}  (opera={operation}, params={fm_params})")
         try:
             async with self._session_for() as session:
                 async with session.post(
@@ -551,9 +590,11 @@ class TeraBoxClient:
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
-                    return await resp.json(content_type=None)
+                    data = await resp.json(content_type=None)
+                    print(f"[TB] filemanager ← HTTP {resp.status} | {data}")
+                    return data
         except Exception as e:
-            print(f"[TeraBox] filemanager error: {e}")
+            print(f"[TB] filemanager error: {e}")
             return None
 
     # -------------------------------------------------- download_file_stream
