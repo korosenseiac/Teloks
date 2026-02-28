@@ -902,89 +902,103 @@ class TeraBoxClient:
     ) -> Optional[Dict[str, Any]]:
         """
         Copy shared files into *your* TeraBox account at dest_path.
-        Uses the share domain + merged cookies (share session + NDUS).
-        Retries once on errno=400810 (token refresh needed).
+
+        Strategy: try the **account domain** first (dm.terabox.com) where our
+        jsToken / bdstoken are valid.  If that returns errno=-6 (auth fail),
+        fall back to the **share domain** with a merged cookie header.
         """
-        # Determine which domain to send the transfer request to.
-        # We must use the share domain (the one that served the share page)
-        # because the shareid lives on that server cluster.
-        transfer_domain = self._share_domain or self.domain
+        decoded_sekey = urllib.parse.unquote(self._randsk) if self._randsk else ""
 
-        for attempt in range(2):
-            if not self.js_token or not self.bds_token:
-                await self.update_app_data()
+        # Domains to try: account domain first, then share domain (if different)
+        domains_to_try = [self.domain]
+        if self._share_domain and self._share_domain != self.domain:
+            domains_to_try.append(self._share_domain)
 
-            # Build merged Cookie header: share-session cookies + NDUS
-            cookie_parts: Dict[str, str] = {
-                "lang": "en",
-                "ndus": self.ndus_token,
-            }
-            if self._share_jar:
-                for c in self._share_jar:
-                    cookie_parts[c.key] = c.value
-            if self._randsk:
-                decoded_randsk = urllib.parse.unquote(self._randsk)
-                cookie_parts["TSID"] = decoded_randsk
-                cookie_parts["sekey"] = decoded_randsk
-            cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_parts.items())
+        for domain_idx, transfer_domain in enumerate(domains_to_try):
+            for attempt in range(2):
+                if not self.js_token or not self.bds_token:
+                    await self.update_app_data()
 
-            params = urllib.parse.urlencode(
-                {
-                    "app_id": "250528",
-                    "web": "1",
-                    "channel": "dubox",
-                    "clienttype": "0",
-                    "jsToken": self.js_token,
-                    "shareid": share_id,
-                    "from": from_uk,
-                    "sekey": urllib.parse.unquote(self._randsk) if self._randsk else "",
-                    "ondup": "newcopy",
-                    "async": "1",
-                    "bdstoken": self.bds_token,
-                    "logid": self.logid,
+                params = urllib.parse.urlencode(
+                    {
+                        "app_id": "250528",
+                        "web": "1",
+                        "channel": "dubox",
+                        "clienttype": "0",
+                        "jsToken": self.js_token,
+                        "shareid": share_id,
+                        "from": from_uk,
+                        "sekey": decoded_sekey,
+                        "ondup": "newcopy",
+                        "async": "1",
+                        "bdstoken": self.bds_token,
+                        "logid": self.logid,
+                    }
+                )
+                url = f"{transfer_domain}/share/transfer?{params}"
+                body = urllib.parse.urlencode(
+                    {
+                        "fsidlist": json.dumps(fs_ids),
+                        "path": dest_path,
+                    }
+                )
+
+                # Build cookie header.  For the account domain just use
+                # the normal NDUS cookie; for the share domain merge in
+                # the share-session jar.
+                cookie_parts: Dict[str, str] = {
+                    "lang": "en",
+                    "ndus": self.ndus_token,
                 }
-            )
-            url = f"{transfer_domain}/share/transfer?{params}"
-            body = urllib.parse.urlencode(
-                {
-                    "fsidlist": json.dumps(fs_ids),
-                    "path": dest_path,
+                if domain_idx > 0 and self._share_jar:
+                    for c in self._share_jar:
+                        cookie_parts[c.key] = c.value
+                if decoded_sekey:
+                    cookie_parts["TSID"] = decoded_sekey
+                cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_parts.items())
+
+                headers = {
+                    "User-Agent": self.USER_AGENT,
+                    "Cookie": cookie_header,
+                    "Referer": transfer_domain + "/",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept-Encoding": "identity",
                 }
-            )
-            headers = {
-                "User-Agent": self.USER_AGENT,
-                "Cookie": cookie_header,
-                "Referer": transfer_domain + "/",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept-Encoding": "identity",
-            }
-            print(f"[TB] share_transfer → POST {url}")
-            print(f"[TB] share_transfer   domain={transfer_domain}  attempt={attempt+1}")
-            print(f"[TB] share_transfer   fs_ids={fs_ids}  dest={dest_path}")
-            print(f"[TB] share_transfer   cookies={list(cookie_parts.keys())}")
-            try:
-                connector = _default_connector()
-                async with aiohttp.ClientSession(connector=connector) as session:
-                    async with session.post(
-                        url,
-                        data=body,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=60),
-                    ) as resp:
-                        result = await resp.json(content_type=None)
-                        print(f"[TB] share_transfer ← HTTP {resp.status} | {result}")
-                        errno = result.get("errno", -1)
-                        if errno == 400810 and attempt == 0:
-                            print("[TB] share_transfer: errno=400810 → refreshing tokens and retrying")
-                            self.js_token = ""
-                            self.bds_token = ""
-                            await self.update_app_data()
-                            continue
-                        return result
-            except Exception as e:
-                print(f"[TB] share_transfer error (attempt={attempt+1}): {e}")
-                if attempt == 1:
-                    return None
+                print(f"[TB] share_transfer → POST {transfer_domain}/share/transfer")
+                print(f"[TB] share_transfer   domain={transfer_domain}  domain_idx={domain_idx}  attempt={attempt+1}")
+                print(f"[TB] share_transfer   fs_ids={fs_ids}  dest={dest_path}  sekey_len={len(decoded_sekey)}")
+                print(f"[TB] share_transfer   cookies={list(cookie_parts.keys())}")
+                try:
+                    connector = _default_connector()
+                    async with aiohttp.ClientSession(connector=connector) as session:
+                        async with session.post(
+                            url,
+                            data=body,
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=60),
+                        ) as resp:
+                            result = await resp.json(content_type=None)
+                            print(f"[TB] share_transfer ← HTTP {resp.status} | {result}")
+                            errno = result.get("errno", -1)
+                            if errno == 400810 and attempt == 0:
+                                print("[TB] share_transfer: errno=400810 → refreshing tokens")
+                                self.js_token = ""
+                                self.bds_token = ""
+                                await self.update_app_data()
+                                continue
+                            if errno in (-6, -1) and domain_idx < len(domains_to_try) - 1:
+                                print(f"[TB] share_transfer: errno={errno} on {transfer_domain} → trying next domain")
+                                break  # break inner loop, try next domain
+                            return result
+                except Exception as e:
+                    print(f"[TB] share_transfer error (attempt={attempt+1}): {e}")
+                    if attempt == 1:
+                        break  # try next domain
+            else:
+                # inner loop completed without break → got a result already
+                continue
+            # inner loop broke → try next domain
+            continue
         return None
 
     # --------------------------------------------------------------- create_dir

@@ -499,8 +499,12 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             try:
                 from app.terabox import get_terabox_client
                 tb_cleanup = await get_terabox_client()
-                await tb_cleanup.filemanager("delete", [temp_folder])
-                print(f"[TeraBox] Deleted temp folder: {temp_folder}")
+                del_result = await tb_cleanup.filemanager("delete", [temp_folder])
+                del_errno = del_result.get("errno", "?") if del_result else "?"
+                if del_result and del_result.get("errno", -1) == 0:
+                    print(f"[TeraBox] Deleted temp folder: {temp_folder}")
+                else:
+                    print(f"[TeraBox] Failed to delete temp folder {temp_folder}: errno={del_errno} | {del_result}")
             except Exception as e:
                 print(f"[TeraBox] Failed to delete temp folder {temp_folder}: {e}")
 
