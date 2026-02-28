@@ -11,7 +11,7 @@ MediaStreamer so that upload_stream() can consume either class unchanged.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
     from app.terabox.client import TeraBoxClient
@@ -32,9 +32,12 @@ class TeraBoxMediaStreamer:
         part calculation).
     file_name : str
         File name (used by upload_stream as the InputFile name).
+    on_download_chunk : callable(int)
+        Optional callback invoked with byte count after each chunk is
+        downloaded from TeraBox.  Used for progress tracking.
     """
 
-    CHUNK_SIZE: int = 512 * 1024  # 512 KB — same as MediaStreamer
+    CHUNK_SIZE: int = 2 * 1024 * 1024  # 2 MB — large reads saturate premium connections
 
     def __init__(
         self,
@@ -42,13 +45,17 @@ class TeraBoxMediaStreamer:
         dlink: str,
         file_size: int,
         file_name: str,
+        on_download_chunk: Optional[Callable[[int], None]] = None,
     ) -> None:
         self.client = terabox_client
         self.dlink = dlink
         self.file_size = file_size
         self.name = file_name
+        self.on_download_chunk = on_download_chunk
 
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=5)
+        # Queue holds up to 32 × 2 MB = 64 MB prefetch buffer so the
+        # downloader can race ahead of the (slower) Telegram upload pipeline.
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=32)
         self.current_offset: int = 0
         self.download_task: asyncio.Task | None = None
         self.is_downloading: bool = True
@@ -73,6 +80,8 @@ class TeraBoxMediaStreamer:
                 self.dlink, chunk_size=self.CHUNK_SIZE
             ):
                 await self.queue.put(chunk)
+                if self.on_download_chunk:
+                    self.on_download_chunk(len(chunk))
         except Exception as e:
             print(f"[TeraBoxMediaStreamer] Download error: {e}")
         finally:

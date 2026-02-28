@@ -1289,10 +1289,13 @@ class TeraBoxClient:
     # -------------------------------------------------- download_file_stream
 
     async def download_file_stream(
-        self, dlink: str, chunk_size: int = 512 * 1024
+        self, dlink: str, chunk_size: int = 2 * 1024 * 1024
     ):
         """
         Async generator that yields raw bytes chunks from a TeraBox dlink URL.
+
+        Default chunk_size is 2 MB — large reads reduce per-chunk overhead
+        and saturate fast (premium) connections better.
 
         Usage::
 
@@ -1303,13 +1306,14 @@ class TeraBoxClient:
             "User-Agent": self.USER_AGENT,
             "Cookie": self._cookie_str,
             "Referer": self.domain + "/",
+            "Accept-Encoding": "identity",  # raw bytes, no gzip
         }
         async with self._session_for() as session:
             async with session.get(
                 dlink,
                 headers=headers,
                 allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=None, connect=30, sock_read=60),
+                timeout=aiohttp.ClientTimeout(total=None, connect=30, sock_read=120),
             ) as resp:
                 resp.raise_for_status()
                 async for chunk in resp.content.iter_chunked(chunk_size):

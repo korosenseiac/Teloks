@@ -42,6 +42,7 @@ from app.config import BACKUP_GROUP_ID
 from app.database.db import log_forward, get_user_session, get_user_profile
 from app.utils.streamer import upload_stream
 from app.terabox.streamer import TeraBoxMediaStreamer
+from app.terabox.progress import ProgressTracker
 
 # ---------------------------------------------------------------------------
 # Multi-domain regex for TeraBox share links
@@ -194,14 +195,22 @@ async def _upload_terabox_file_to_backup(
     file_size: int,
     file_name: str,
     thumb_url: str = "",
+    tracker: Optional[ProgressTracker] = None,
 ) -> Optional[int]:
     """
     Download from TeraBox and upload to the backup Telegram group.
     Returns the Telegram message_id in the backup group, or None on failure.
     """
     try:
-        streamer = TeraBoxMediaStreamer(tb_client, dlink, file_size, file_name)
-        input_file = await upload_stream(bot, streamer, file_name)
+        # Build callbacks for progress tracking
+        on_dl = tracker.add_downloaded if tracker else None
+        on_ul = tracker.add_uploaded if tracker else None
+
+        streamer = TeraBoxMediaStreamer(
+            tb_client, dlink, file_size, file_name,
+            on_download_chunk=on_dl,
+        )
+        input_file = await upload_stream(bot, streamer, file_name, on_upload_chunk=on_ul)
 
         kind = _classify(file_name)
         mime = _mime(file_name)
@@ -455,14 +464,24 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         total_up = len(enriched)
 
         for idx, entry in enumerate(enriched, 1):
-            await status_msg.edit(
-                f"⬇️ Muat naik {idx}/{total_up}: `{entry['name']}`…"
+            # Create and start progress tracker for this file
+            tracker = ProgressTracker(
+                status_msg=status_msg,
+                file_name=entry["name"],
+                file_size=entry["size"],
+                file_index=idx,
+                file_total=total_up,
             )
+            tracker.start()
+
             bmid = await _upload_terabox_file_to_backup(
                 bot, tb, backup_peer,
                 entry["dlink"], entry["size"], entry["name"],
                 thumb_url=entry.get("thumb_url", ""),
+                tracker=tracker,
             )
+
+            await tracker.stop()
             if bmid:
                 uploaded.append((bmid, entry["kind"], entry["name"], entry["size"]))
                 # Log each upload

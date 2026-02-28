@@ -121,87 +121,99 @@ class MediaStreamer:
     def seek(self, offset, whence=0):
         pass # Streaming doesn't support seeking
 
-async def upload_stream(client: Client, streamer: MediaStreamer, file_name: str):
+async def upload_stream(client: Client, streamer, file_name: str, on_upload_chunk=None):
     """
     Manually uploads a stream to Telegram using raw API calls.
     Returns an InputFile or InputFileBig.
-    
-    Note: For files > 10MB (big files), Telegram requires file_total_parts to be known upfront.
-    We calculate this from the known file_size.
+
+    For big files (>10 MB) it uploads up to *UPLOAD_WORKERS* parts concurrently,
+    which dramatically improves throughput compared to sequential uploads.
+
+    Parameters
+    ----------
+    on_upload_chunk : callable(int) | None
+        Optional callback invoked with byte count after each part is uploaded.
     """
     file_id = random.randint(0, 1000000000)
-    part_count = 0
     file_size = streamer.file_size
     is_big = file_size > 10 * 1024 * 1024
-    chunk_size = 512 * 1024  # 512KB - Telegram requirement
-    
+    chunk_size = 512 * 1024  # 512KB — Telegram max part size
+
     # Calculate total parts from file_size (required for SaveBigFilePart)
     total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
-    
+
+    # --- Concurrent upload machinery ----------------------------------------
+    UPLOAD_WORKERS = 8 if is_big else 1
+    sem = asyncio.Semaphore(UPLOAD_WORKERS)
+    pending: list = []
+
+    async def _upload_part(part_idx: int, data: bytes):
+        async with sem:
+            if is_big:
+                await client.invoke(
+                    SaveBigFilePart(
+                        file_id=file_id,
+                        file_part=part_idx,
+                        file_total_parts=total_parts,
+                        bytes=data,
+                    ),
+                    retries=3,
+                    timeout=60,
+                )
+            else:
+                await client.invoke(
+                    SaveFilePart(
+                        file_id=file_id,
+                        file_part=part_idx,
+                        bytes=data,
+                    ),
+                    retries=3,
+                    timeout=60,
+                )
+            if on_upload_chunk:
+                on_upload_chunk(len(data))
+
+    # --- Read & upload loop --------------------------------------------------
+    part_count = 0
     buffer = b""
     bytes_uploaded = 0
 
     while True:
         chunk = await streamer.read()
         if not chunk:
-            # Upload remaining buffer if any (this is the last part, can be smaller)
+            # Upload remaining buffer (last part, may be smaller than chunk_size)
             if buffer:
-                if is_big:
-                    await client.invoke(
-                        SaveBigFilePart(
-                            file_id=file_id,
-                            file_part=part_count,
-                            file_total_parts=total_parts,
-                            bytes=buffer
-                        ),
-                        retries=3,
-                        timeout=60
-                    )
-                else:
-                    await client.invoke(
-                        SaveFilePart(
-                            file_id=file_id,
-                            file_part=part_count,
-                            bytes=buffer
-                        ),
-                        retries=3,
-                        timeout=60
-                    )
+                pending.append(asyncio.create_task(_upload_part(part_count, buffer)))
                 bytes_uploaded += len(buffer)
                 part_count += 1
             break
-        
+
         buffer += chunk
-        
-        # Upload complete chunks of exactly chunk_size
+
+        # Split buffer into complete 512 KB parts and dispatch concurrently
         while len(buffer) >= chunk_size:
             part_data = buffer[:chunk_size]
             buffer = buffer[chunk_size:]
-            
-            if is_big:
-                await client.invoke(
-                    SaveBigFilePart(
-                        file_id=file_id,
-                        file_part=part_count,
-                        file_total_parts=total_parts,
-                        bytes=part_data
-                    ),
-                    retries=3,
-                    timeout=60
-                )
-            else:
-                await client.invoke(
-                    SaveFilePart(
-                        file_id=file_id,
-                        file_part=part_count,
-                        bytes=part_data
-                    ),
-                    retries=3,
-                    timeout=60
-                )
+            pending.append(asyncio.create_task(_upload_part(part_count, part_data)))
             bytes_uploaded += len(part_data)
             part_count += 1
-    
+
+            # Housekeeping: collect finished tasks periodically to cap memory
+            if len(pending) >= UPLOAD_WORKERS * 3:
+                done, still_pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in done:
+                    t.result()  # propagate any upload exception
+                pending = list(still_pending)
+
+    # Wait for all remaining uploads to finish
+    if pending:
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                raise r
+
     # Verify we uploaded the expected number of parts
     if part_count != total_parts:
         print(f"WARNING: Part count mismatch! Expected {total_parts}, got {part_count}. File size: {file_size}, uploaded: {bytes_uploaded}")
