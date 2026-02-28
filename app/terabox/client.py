@@ -1179,9 +1179,11 @@ class TeraBoxClient:
         if not home_info:
             return None
 
-        sign1 = home_info.get("sign1", "")
-        sign3 = home_info.get("sign3", "")
-        timestamp = home_info.get("timestamp", "")
+        # sign data may be at top level or nested inside "data"
+        hi = home_info.get("data", home_info) if isinstance(home_info.get("data"), dict) else home_info
+        sign1 = hi.get("sign1", "")
+        sign3 = hi.get("sign3", "")
+        timestamp = hi.get("timestamp", "")
 
         if not sign1 or not sign3:
             print(f"[TB] download: home/info missing sign data (sign1={sign1!r}, sign3={sign3!r})")
