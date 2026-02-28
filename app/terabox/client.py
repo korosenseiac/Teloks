@@ -1097,7 +1097,21 @@ class TeraBoxClient:
         Fetch sign data needed for download link generation.
         Mirrors TeraBoxApp#getHomeInfo (lines 2223–2248 of api.js).
         """
-        url = f"{self.domain}/api/home/info"
+        if not self.js_token or not self.bds_token:
+            await self.update_app_data()
+
+        params = urllib.parse.urlencode(
+            {
+                "app_id": "250528",
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "0",
+                "jsToken": self.js_token,
+                "bdstoken": self.bds_token,
+                "logid": self.logid,
+            }
+        )
+        url = f"{self.domain}/api/home/info?{params}"
         print(f"[TB] get_home_info → GET {url}")
         try:
             async with self._session_for() as session:
@@ -1105,7 +1119,12 @@ class TeraBoxClient:
                     url, timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
                     data = await resp.json(content_type=None)
-                    print(f"[TB] get_home_info ← HTTP {resp.status} | errno={data.get('errno')} | has_sign={bool(data.get('sign1'))}")
+                    print(
+                        f"[TB] get_home_info ← HTTP {resp.status} | errno={data.get('errno')}"
+                        f" | sign1={data.get('sign1','')[:8] if data.get('sign1') else 'EMPTY'}"
+                        f" | sign3={data.get('sign3','')[:8] if data.get('sign3') else 'EMPTY'}"
+                        f" | timestamp={data.get('timestamp','')}"
+                    )
                     return data
         except Exception as e:
             print(f"[TB] get_home_info error: {e}")
@@ -1163,6 +1182,12 @@ class TeraBoxClient:
         sign1 = home_info.get("sign1", "")
         sign3 = home_info.get("sign3", "")
         timestamp = home_info.get("timestamp", "")
+
+        if not sign1 or not sign3:
+            print(f"[TB] download: home/info missing sign data (sign1={sign1!r}, sign3={sign3!r})")
+            print(f"[TB] download: full home_info response: {home_info}")
+            return {"errno": -1, "errmsg": "home/info returned no sign data", "dlink": []}
+
         sign_b = self.sign_download(sign3, sign1)
 
         params = urllib.parse.urlencode(
