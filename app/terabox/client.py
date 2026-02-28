@@ -383,12 +383,23 @@ class TeraBoxClient:
             self._randsk = randsk
             print(f"[TB] _apply_share_tokens → stored randsk (len={len(randsk)})")
             if self._share_jar and self._share_domain:
+                # Do NOT overwrite TSID — the server-set value from page
+                # visits is the correct share verification token.
+                # Only add 'randsk' as a separate cookie.
+                existing_tsid = None
+                for c in self._share_jar:
+                    if c.key == "TSID":
+                        existing_tsid = c.value
+                        break
                 decoded_randsk = urllib.parse.unquote(randsk)
                 self._share_jar.update_cookies(
-                    {"TSID": decoded_randsk, "randsk": decoded_randsk},
+                    {"randsk": decoded_randsk},
                     yarl.URL(self._share_domain),
                 )
-                print(f"[TB] _apply_share_tokens → injected into jar for {self._share_domain}")
+                print(
+                    f"[TB] _apply_share_tokens → jar: existing TSID={existing_tsid!r} "
+                    f"| added randsk for {self._share_domain}"
+                )
 
         # Store share identifiers needed for share/list
         for src, attr in [
@@ -818,11 +829,10 @@ class TeraBoxClient:
         if self._share_jar:
             for c in self._share_jar:
                 cookie_map[c.key] = c.value
-        # Ensure essential cookies are present
+        # Ensure essential cookies are present — but DON'T overwrite
+        # the server-set TSID; it's the correct share verification token.
         cookie_map.setdefault("lang", "en")
         cookie_map["ndus"] = self.ndus_token
-        if decoded_randsk:
-            cookie_map["TSID"] = decoded_randsk
         cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_map.items())
 
         browser_ua = (
@@ -835,7 +845,8 @@ class TeraBoxClient:
             f"[TB] short_url_list → params: uk={params.get('uk','?')} "
             f"shareid={params.get('shareid','?')} sign={params.get('sign','?')[:8]}... "
             f"ts={params.get('timestamp','?')} sekey_len={len(decoded_randsk)} "
-            f"dir={remote_dir!r} | cookies={list(cookie_map.keys())}"
+            f"dir={remote_dir!r} | cookies={list(cookie_map.keys())} "
+            f"| TSID={cookie_map.get('TSID', '??')[:20]}..."
         )
 
         # Try multiple domains — the jar domain, the share base, and self.domain
@@ -873,7 +884,9 @@ class TeraBoxClient:
                         print(f"[TB] short_url_list ← HTTP {resp.status} | errno={errno} | files={file_count} | final={final}")
                         if errno == 0:
                             return data
-                        print(f"[TB] short_url_list → errno={errno}, trying next domain...")
+                        # Log full response for debugging auth failures
+                        print(f"[TB] short_url_list → errno={errno} body={data}")
+                        print(f"[TB] short_url_list → trying next domain...")
             except Exception as e:
                 print(f"[TB] short_url_list error ({try_base}): {e}")
 
