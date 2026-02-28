@@ -578,19 +578,37 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                         await asyncio.sleep(2)
             return None
 
+        # Track which backup message IDs have been confirmed delivered
+        delivered_mids: set = set()
+
+        # ---------- Helper: send one file individually -----------------------
+        async def _send_single(mid: int) -> bool:
+            """Send a single backup message to the user. Returns True on success."""
+            r = await _safe_send(
+                lambda _mid=mid: bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=BACKUP_GROUP_ID,
+                    message_id=_mid,
+                )
+            )
+            if r:
+                delivered_mids.add(mid)
+                return True
+            return False
+
         # ---------- Helper: send album chunk to user -------------------------
         async def _send_album_to_user(
             items: List[Tuple[int, str, str, int]],
-        ) -> int:
+        ) -> None:
             """
-            Send a list of backup-group items to the user as albums (max 10).
-            Returns how many files were successfully delivered.
+            Send a list of backup-group items to the user as albums (max 8).
+            Tracks delivered mids in the outer `delivered_mids` set.
             """
             if not items:
-                return 0
+                return
 
-            delivered = 0
-            CHUNK = 10  # Telegram max per media group
+            # Use 8 instead of 10 to stay safely within Telegram limits
+            CHUNK = 8
 
             for i in range(0, len(items), CHUNK):
                 chunk = items[i : i + CHUNK]
@@ -603,15 +621,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 if backup_msgs is None:
                     # Fallback: send each individually
                     for mid, kind, name, size in chunk:
-                        r = await _safe_send(
-                            lambda _mid=mid: bot.copy_message(
-                                chat_id=user_id,
-                                from_chat_id=BACKUP_GROUP_ID,
-                                message_id=_mid,
-                            )
-                        )
-                        if r:
-                            delivered += 1
+                        await _send_single(mid)
                         await asyncio.sleep(0.5)
                     continue
 
@@ -635,45 +645,41 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                         valid_mids.append(msg.id)
 
                 if not media_list:
+                    # get_messages returned nothing useful — send individually
+                    for mid, kind, name, size in chunk:
+                        await _send_single(mid)
+                        await asyncio.sleep(0.5)
                     continue
 
                 if len(media_list) == 1:
                     # send_media_group requires ≥2 items — send single file directly
-                    m = media_list[0]
-                    if isinstance(m, InputMediaPhoto):
-                        r = await _safe_send(lambda _m=m: bot.send_photo(user_id, _m.media))
-                    elif isinstance(m, InputMediaVideo):
-                        r = await _safe_send(lambda _m=m: bot.send_video(user_id, _m.media))
-                    else:
-                        r = await _safe_send(lambda _m=m: bot.send_document(user_id, _m.media))
-                    if r:
-                        delivered += 1
+                    await _send_single(valid_mids[0])
                 else:
                     # Try sending as album
                     r = await _safe_send(
                         lambda _ml=media_list: bot.send_media_group(user_id, _ml)
                     )
                     if r:
-                        delivered += len(media_list)
+                        # Verify: count actual messages returned
+                        actual = len(r) if isinstance(r, list) else 0
+                        if actual == len(media_list):
+                            # All delivered
+                            delivered_mids.update(valid_mids)
+                        else:
+                            # Partial delivery — mark what we can, remainder
+                            # will be caught by safety-net pass below
+                            print(f"[TeraBox] Album partial: sent {actual}/{len(media_list)}")
+                            for vm in valid_mids[:actual]:
+                                delivered_mids.add(vm)
                     else:
                         # Album failed — fallback: send each individually
                         print(f"[TeraBox] Album send failed, falling back to individual sends")
                         for mid in valid_mids:
-                            r2 = await _safe_send(
-                                lambda _mid=mid: bot.copy_message(
-                                    chat_id=user_id,
-                                    from_chat_id=BACKUP_GROUP_ID,
-                                    message_id=_mid,
-                                )
-                            )
-                            if r2:
-                                delivered += 1
+                            await _send_single(mid)
                             await asyncio.sleep(0.5)
 
-                # Small delay between chunks to avoid FloodWait
-                await asyncio.sleep(1)
-
-            return delivered
+                # Delay between chunks to avoid FloodWait
+                await asyncio.sleep(1.5)
 
         # 11. Separate by type for album grouping
         photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
@@ -682,40 +688,36 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         others = [(mid, k, n, s) for mid, k, n, s in uploaded
                   if k not in ("photo", "video", "audio")]
 
-        sent_count = 0
-        total_to_send = len(uploaded)
-
         # Send: photos album first
-        sent_count += await _send_album_to_user(photos)
+        await _send_album_to_user(photos)
 
         # Send: videos album next
-        sent_count += await _send_album_to_user(videos)
+        await _send_album_to_user(videos)
 
         # Send: audio files individually
         for mid, *_ in audios:
-            r = await _safe_send(
-                lambda _mid=mid: bot.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=BACKUP_GROUP_ID,
-                    message_id=_mid,
-                )
-            )
-            if r:
-                sent_count += 1
+            await _send_single(mid)
             await asyncio.sleep(0.5)
 
         # Send: other documents individually
         for mid, *_ in others:
-            r = await _safe_send(
-                lambda _mid=mid: bot.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=BACKUP_GROUP_ID,
-                    message_id=_mid,
-                )
-            )
-            if r:
-                sent_count += 1
+            await _send_single(mid)
             await asyncio.sleep(0.5)
+
+        # ---------- SAFETY NET: resend any files not confirmed delivered ------
+        all_mids = {mid for mid, *_ in uploaded}
+        missing_mids = all_mids - delivered_mids
+
+        if missing_mids:
+            print(f"[TeraBox] Safety net: {len(missing_mids)} file(s) not confirmed delivered, resending individually")
+            await asyncio.sleep(2)  # extra breathing room
+            for mid in missing_mids:
+                await _send_single(mid)
+                await asyncio.sleep(1)
+
+        # Final count
+        total_to_send = len(uploaded)
+        sent_count = len(delivered_mids)
 
         # Summary
         if sent_count < total_to_send:
