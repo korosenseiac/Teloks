@@ -14,6 +14,7 @@ import urllib.parse
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+import yarl
 
 
 # ---------------------------------------------------------------------------
@@ -281,126 +282,345 @@ class TeraBoxClient:
         """
         Fetch share metadata (share_id, uk, file list).
 
-        **Strategy**: First try scraping the share page HTML directly (most
-        reliable — works from datacenter IPs).  Fall back to the REST API
-        endpoint if the scrape doesn't yield data.
+        Multi-strategy approach to bypass datacenter IP anti-bot:
+        1. Browser-session scrape with cookie chain (WAP, sharing/link, /s/)
+        2. REST API with different configurations (UA, clienttype, jsToken)
 
         Parameters
         ----------
         surl : str
-            The raw code from the share URL path (e.g. "12VSvUMj_3xxS35TG63_lHQ").
+            The raw code from the share URL path.
         share_host : str, optional
-            Hostname from the original share URL (e.g. "1024terabox.com").
+            Hostname from the original share URL.
         """
         base = f"https://{share_host}" if share_host else self.domain
 
-        # -------- Approach 1: Scrape the share page HTML --------
+        # -------- Strategy 1: Browser-session scrape --------
         page_data = await self._scrape_share_page(base, surl)
         if page_data and page_data.get("shareid"):
-            print(f"[TB] short_url_info → got data from share page scrape")
+            print(f"[TB] short_url_info → got data from scrape")
             return {**page_data, "errno": 0}
 
-        # -------- Approach 2: REST API (may need domain-specific jsToken) --
-        # Always refresh jsToken for the share host
-        if share_host and share_host not in self.domain:
-            print(f"[TB] short_url_info → fetching jsToken from share host: {base}")
-            await self._fetch_js_token_from(base)
-        elif not self.js_token:
-            await self.update_app_data()
+        # -------- Strategy 2: REST API with multiple configs --------
+        browser_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
+        # Ensure jsToken is available
+        if not self.js_token:
+            if share_host and share_host not in self.domain:
+                await self._fetch_js_token_from(base)
+            else:
+                await self.update_app_data()
 
-        params = urllib.parse.urlencode({
-            "app_id": "250528",
-            "web": "1",
-            "channel": "dubox",
-            "clienttype": "0",
-            "jsToken": self.js_token,
-            "shorturl": surl,
-            "root": "1",
-        })
-        url = f"{base}/api/shorturlinfo?{params}"
-        print(f"[TB] short_url_info → GET {url}  (surl={surl!r})")
-        try:
-            async with self._session_for(restricted=True) as session:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=20)
-                ) as resp:
-                    data = await resp.json(content_type=None)
-                    print(f"[TB] short_url_info ← HTTP {resp.status} | errno={data.get('errno')} | keys={list(data.keys())}")
-                    return data
-        except Exception as e:
-            print(f"[TB] short_url_info error: {e}")
-            return None
+        api_configs = [
+            # (extra_params, user_agent, description)
+            (
+                {"jsToken": self.js_token, "web": "1", "channel": "dubox", "clienttype": "0"},
+                self.USER_AGENT, "desktop+jsToken",
+            ),
+            ({}, browser_ua, "browser_minimal"),
+            ({"clienttype": "5"}, browser_ua, "mobile_ct"),
+        ]
+
+        last_data = None
+        for extra, ua, desc in api_configs:
+            params = {"app_id": "250528", "shorturl": surl, "root": "1", **extra}
+            url = f"{base}/api/shorturlinfo?" + urllib.parse.urlencode(params)
+            print(f"[TB] short_url_info({desc}) → GET {url}")
+            try:
+                req_headers = {
+                    "User-Agent": ua,
+                    "Cookie": self._cookie_str,
+                    "Referer": base + "/",
+                    "Accept-Encoding": "identity",
+                }
+                async with self._session_for(restricted=True) as session:
+                    async with session.get(
+                        url, headers=req_headers,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                        errno = data.get("errno", -1)
+                        print(f"[TB] short_url_info({desc}) ← HTTP {resp.status} | errno={errno} | keys={list(data.keys())}")
+                        if errno == 0:
+                            return data
+                        last_data = data
+                        if errno != 400210:
+                            return data  # Non-verify error, stop trying
+            except Exception as e:
+                print(f"[TB] short_url_info({desc}) error: {e}")
+                continue
+
+        print(f"[TB] short_url_info → all strategies exhausted")
+        return last_data
 
     async def _scrape_share_page(
         self, base_url: str, surl: str
     ) -> Optional[Dict[str, Any]]:
         """
-        Load the share page (e.g. ``/s/12VSvUMj...``) and extract the
-        embedded JSON data that contains shareid, uk, and the file list.
+        Multi-strategy scrape of TeraBox share pages.
 
-        TeraBox share pages embed data in ``window.__INITIAL_STATE__`` or
-        in a ``<script>`` block containing ``locals.init({...})``.
+        Uses browser-like sessions with cookie accumulation to avoid
+        triggering anti-bot protections.  Tries multiple endpoints
+        (WAP, sharing/link, /s/) across multiple domains.
         """
-        url = f"{base_url}/s/{surl}"
-        print(f"[TB] _scrape_share_page → GET {url}")
+        browser_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
+        mobile_ua = (
+            "Mozilla/5.0 (Linux; Android 13; SM-S918B) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Mobile Safari/537.36"
+        )
+
+        # Build list of domains to try
+        domains = [base_url]
+        for alt in ("https://www.terabox.com", "https://1024terabox.com"):
+            if alt.rstrip("/") != base_url.rstrip("/"):
+                domains.append(alt)
+
+        for domain in domains:
+            print(f"[TB] _scrape → domain {domain}")
+            result = await self._scrape_one_domain(domain, surl, browser_ua, mobile_ua)
+            if result and result.get("shareid"):
+                return result
+
+        print(f"[TB] _scrape → all domains/endpoints failed")
+        return None
+
+    async def _scrape_one_domain(
+        self, domain: str, surl: str,
+        browser_ua: str, mobile_ua: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Try multiple share-page endpoints on *one* TeraBox domain,
+        all sharing the same ``CookieJar`` so that session cookies
+        accumulate naturally (like a real browser).
+        """
+        # Cookie jar pre-seeded with NDUS
+        jar = aiohttp.CookieJar(unsafe=True)
+        jar.update_cookies(
+            {"lang": "en", "ndus": self.ndus_token},
+            yarl.URL(domain),
+        )
+
+        connector = aiohttp.TCPConnector(ssl=None)
+        base_headers = {
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "identity",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
         try:
-            async with self._session_for() as session:
-                async with session.get(
-                    url,
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as resp:
-                    html = await resp.text(errors="replace")
-                    print(f"[TB] _scrape_share_page ← HTTP {resp.status} | html_len={len(html)}")
+            async with aiohttp.ClientSession(
+                connector=connector,
+                cookie_jar=jar,
+                headers=base_headers,
+            ) as session:
+                # ------ Step 1: Warm up — visit domain root for session cookies ------
+                print(f"[TB]   warmup → GET {domain}/")
+                try:
+                    async with session.get(
+                        f"{domain}/",
+                        headers={"User-Agent": browser_ua},
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        warmup_html = await resp.text(errors="replace")
+                        real_domain = f"{resp.url.scheme}://{resp.url.host}"
+                        cookie_count = sum(1 for _ in jar)
+                        print(
+                            f"[TB]   warmup ← HTTP {resp.status} | len={len(warmup_html)} "
+                            f"| final={real_domain} | cookies={cookie_count}"
+                        )
+                        # Harvest jsToken from warmup page
+                        js = self._extract_js_token(warmup_html)
+                        if js:
+                            self.js_token = js
+                            print(f"[TB]   warmup → got jsToken")
+                except Exception as e:
+                    print(f"[TB]   warmup error: {e}")
+
+                # ------ Step 2: Try share-page endpoints ------
+                endpoints = [
+                    # WAP mobile endpoint — usually server-side rendered
+                    (f"{domain}/wap/share/filelist?surl={surl}", mobile_ua, "WAP"),
+                    # sharing/link desktop page
+                    (f"{domain}/sharing/link?surl={surl}&root=1&path=%2F", browser_ua, "sharing"),
+                    # Original /s/ page
+                    (f"{domain}/s/{surl}", browser_ua, "/s/"),
+                ]
+
+                for url, ua, desc in endpoints:
+                    print(f"[TB]   try {desc} → GET {url}")
+                    try:
+                        async with session.get(
+                            url,
+                            headers={"User-Agent": ua},
+                            allow_redirects=True,
+                            timeout=aiohttp.ClientTimeout(total=25),
+                        ) as resp:
+                            html = await resp.text(errors="replace")
+                            print(
+                                f"[TB]   {desc} ← HTTP {resp.status} | len={len(html)} "
+                                f"| final={resp.url}"
+                            )
+                            if len(html) < 500:
+                                print(f"[TB]   {desc} → too short, skipping")
+                                continue
+                    except Exception as e:
+                        print(f"[TB]   {desc} error: {e}")
+                        continue
+
+                    result = self._parse_share_html(html)
+                    if result and result.get("shareid"):
+                        print(f"[TB]   {desc} → SUCCESS shareid={result['shareid']}")
+                        # Bonus: grab jsToken from this page
+                        js = self._extract_js_token(html)
+                        if js:
+                            self.js_token = js
+                        return result
+
+                # ------ Step 3: Try the REST API with accumulated session cookies ------
+                api_params: Dict[str, str] = {
+                    "app_id": "250528",
+                    "shorturl": surl,
+                    "root": "1",
+                }
+                if self.js_token:
+                    api_params["jsToken"] = self.js_token
+                print(f"[TB]   try API (session cookies) → {domain}/api/shorturlinfo")
+                try:
+                    async with session.get(
+                        f"{domain}/api/shorturlinfo",
+                        params=api_params,
+                        headers={"User-Agent": browser_ua},
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                        errno = data.get("errno", -1)
+                        print(f"[TB]   API ← HTTP {resp.status} | errno={errno}")
+                        if errno == 0:
+                            return data
+                except Exception as e:
+                    print(f"[TB]   API error: {e}")
+
         except Exception as e:
-            print(f"[TB] _scrape_share_page request error: {e}")
-            return None
+            print(f"[TB] _scrape_one_domain session error: {e}")
 
-        # ---- Try multiple embedded JSON patterns ----
+        return None
 
+    # ----------------------------------------------------- _parse_share_html
+
+    @staticmethod
+    def _parse_share_html(html: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract share data (shareid, uk, file_list) from TeraBox HTML.
+        Tries multiple known patterns.
+        """
         result: Dict[str, Any] = {}
 
         # Pattern 1: window.__INITIAL_STATE__ = {...}
-        m = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});\s*</', html, re.DOTALL)
-        if m:
-            try:
-                state = json.loads(m.group(1))
-                print(f"[TB] _scrape_share_page → found __INITIAL_STATE__ keys={list(state.keys())[:10]}")
-                # Navigate to share data inside the state object
-                share_data = state
-                # Some structures nest under "share" or "shareInfo"
-                for key in ("shareid", "share_id"):
-                    if key in share_data:
-                        break
-                else:
-                    # Look one level deeper
-                    for k, v in share_data.items():
+        for pat in (
+            r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});\s*</script',
+            r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});\s*\n',
+        ):
+            m = re.search(pat, html, re.DOTALL)
+            if m:
+                try:
+                    state = json.loads(m.group(1))
+                    print(f"[TB]   found __INITIAL_STATE__ keys={list(state.keys())[:12]}")
+                    share = state
+                    for k, v in state.items():
                         if isinstance(v, dict) and ("shareid" in v or "share_id" in v):
-                            share_data = v
+                            share = v
                             break
-                result["shareid"] = share_data.get("shareid") or share_data.get("share_id", "")
-                result["uk"] = share_data.get("uk") or share_data.get("owner_id", "")
-                file_list = share_data.get("file_list") or share_data.get("list", [])
-                if isinstance(file_list, dict):
-                    file_list = file_list.get("list", [])
-                result["file_list"] = file_list
-            except json.JSONDecodeError as e:
-                print(f"[TB] _scrape_share_page → __INITIAL_STATE__ JSON parse error: {e}")
+                    result["shareid"] = str(share.get("shareid") or share.get("share_id", ""))
+                    result["uk"] = str(share.get("uk") or share.get("owner_id", ""))
+                    fl = share.get("file_list") or share.get("list", [])
+                    if isinstance(fl, dict):
+                        fl = fl.get("list", [])
+                    result["file_list"] = fl
+                    if result.get("shareid"):
+                        return result
+                except json.JSONDecodeError as e:
+                    print(f"[TB]   __INITIAL_STATE__ JSON error: {e}")
+                break
 
-        # Pattern 2: locals.init({...}) or window.locals = {...}
+        # Pattern 2: locals.init({...})
         if not result.get("shareid"):
             m = re.search(r'locals\.init\((\{.+?\})\)', html, re.DOTALL)
             if m:
                 try:
-                    init_data = json.loads(m.group(1))
-                    print(f"[TB] _scrape_share_page → found locals.init keys={list(init_data.keys())[:10]}")
-                    result["shareid"] = init_data.get("shareid", "")
-                    result["uk"] = init_data.get("uk", "")
-                    result["file_list"] = init_data.get("file_list", [])
+                    data = json.loads(m.group(1))
+                    print(f"[TB]   found locals.init keys={list(data.keys())[:12]}")
+                    result["shareid"] = str(data.get("shareid", ""))
+                    result["uk"] = str(data.get("uk", ""))
+                    result["file_list"] = data.get("file_list", [])
+                    if result.get("shareid"):
+                        return result
                 except json.JSONDecodeError:
                     pass
 
-        # Pattern 3: Inline regex extraction as last resort
+        # Pattern 3: window.jsData = {...}
+        if not result.get("shareid"):
+            m = re.search(r'window\.jsData\s*=\s*(\{.+?\})\s*;', html, re.DOTALL)
+            if m:
+                try:
+                    data = json.loads(m.group(1))
+                    print(f"[TB]   found jsData keys={list(data.keys())[:12]}")
+                    result["shareid"] = str(data.get("shareid") or data.get("share_id", ""))
+                    result["uk"] = str(data.get("uk") or data.get("owner_id", ""))
+                    fl = data.get("file_list") or data.get("list", [])
+                    if isinstance(fl, dict):
+                        fl = fl.get("list", [])
+                    result["file_list"] = fl
+                    if result.get("shareid"):
+                        return result
+                except json.JSONDecodeError:
+                    pass
+
+        # Pattern 4: Any large JSON object in <script> with shareid
+        if not result.get("shareid"):
+            for script_m in re.finditer(
+                r'<script[^>]*>([^<]{200,})</script>', html, re.DOTALL
+            ):
+                content = script_m.group(1)
+                for json_m in re.finditer(r'=\s*(\{.+?\})\s*;', content, re.DOTALL):
+                    try:
+                        obj = json.loads(json_m.group(1))
+                        if isinstance(obj, dict) and (
+                            "shareid" in obj or "share_id" in obj
+                        ):
+                            print(f"[TB]   found shareid in script JSON")
+                            result["shareid"] = str(
+                                obj.get("shareid") or obj.get("share_id", "")
+                            )
+                            result["uk"] = str(
+                                obj.get("uk") or obj.get("owner_id", "")
+                            )
+                            fl = obj.get("file_list") or obj.get("list", [])
+                            if isinstance(fl, dict):
+                                fl = fl.get("list", [])
+                            result["file_list"] = fl
+                            if result.get("shareid"):
+                                return result
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+
+        # Pattern 5: Regex extraction (last resort)
         if not result.get("shareid"):
             sid = re.search(r'"shareid"\s*:\s*"?(\d+)"?', html)
             uk = re.search(r'"uk"\s*:\s*"?(\d+)"?', html)
@@ -408,19 +628,19 @@ class TeraBoxClient:
                 result["shareid"] = sid.group(1)
             if uk:
                 result["uk"] = uk.group(1)
-            print(f"[TB] _scrape_share_page → regex fallback: shareid={result.get('shareid')!r} uk={result.get('uk')!r}")
+            if result.get("shareid"):
+                print(f"[TB]   regex fallback: shareid={result['shareid']} uk={result.get('uk')}")
+                return result
 
-        # Also extract jsToken from the share page for future calls
-        js = self._extract_js_token(html)
-        if js:
-            self.js_token = js
-            print(f"[TB] _scrape_share_page → updated jsToken from share page")
-
-        if result.get("shareid"):
-            print(f"[TB] _scrape_share_page → success: shareid={result['shareid']} uk={result.get('uk')} files={len(result.get('file_list', []))}")
-            return result
-
-        print(f"[TB] _scrape_share_page → could not extract share data from HTML")
+        # Debug: log script tags
+        scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+        print(
+            f"[TB]   parse FAILED — {len(scripts)} scripts | "
+            f"html[:200]={html[:200]!r}"
+        )
+        for i, s in enumerate(scripts[:5]):
+            preview = s.strip()[:120].replace("\n", " ")
+            print(f"[TB]     script[{i}] len={len(s)} {preview!r}")
         return None
 
     async def _fetch_js_token_from(self, base_url: str) -> None:
