@@ -101,8 +101,6 @@ class TeraBoxClient:
         self._share_id: str = ""
         self._share_sign: str = ""
         self._share_timestamp: str = ""
-        # Verified sekey from share/verify (needed for share/list)
-        self._verified_sekey: str = ""
 
     # ---------------------------------------------------------------- helpers
 
@@ -781,77 +779,6 @@ class TeraBoxClient:
 
     # -------------------------------------------------------- short_url_list
 
-    async def _share_verify(
-        self, surl: str, domain: str, cookie_str: str, ua: str,
-    ) -> Optional[str]:
-        """
-        Call POST /share/verify to obtain a verified sekey cookie.
-
-        TeraBox requires this step even for non-password shares.
-        Returns the sekey value on success, or None.
-        """
-        verify_params = {
-            "surl": surl,
-            "t": str(int(__import__("time").time() * 1000)),
-            "channel": "dubox",
-            "web": "1",
-            "app_id": "250528",
-            "clienttype": "0",
-        }
-        if self.js_token:
-            verify_params["jsToken"] = self.js_token
-        if self.bds_token:
-            verify_params["bdstoken"] = self.bds_token
-
-        verify_url = f"{domain}/share/verify?" + urllib.parse.urlencode(verify_params)
-        print(f"[TB] share_verify → POST {domain}/share/verify (surl={surl})")
-
-        try:
-            connector = aiohttp.TCPConnector(ssl=None)
-            jar = self._share_jar or aiohttp.CookieJar(unsafe=True)
-            async with aiohttp.ClientSession(
-                connector=connector,
-                cookie_jar=jar,
-            ) as session:
-                async with session.post(
-                    verify_url,
-                    data={"pwd": ""},  # empty password for non-password shares
-                    headers={
-                        "User-Agent": ua,
-                        "Accept-Encoding": "identity",
-                        "Cookie": cookie_str,
-                        "Referer": f"{domain}/",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as resp:
-                    data = await resp.json(content_type=None)
-                    errno = data.get("errno", -1)
-                    final = f"{resp.url.scheme}://{resp.url.host}"
-                    print(f"[TB] share_verify ← HTTP {resp.status} | errno={errno} | final={final} | body={data}")
-
-                    if errno == 0:
-                        # Extract sekey from response or from updated jar cookies
-                        sekey = data.get("sekey", "")
-                        if not sekey:
-                            # Check if server set a new sekey/TSID cookie
-                            for c in jar:
-                                if c.key in ("sekey", "TSID"):
-                                    sekey = c.value
-                                    print(f"[TB] share_verify → got sekey from cookie {c.key} (len={len(sekey)})")
-                                    break
-                        else:
-                            print(f"[TB] share_verify → got sekey from response (len={len(sekey)})")
-                        # Update share jar with any new cookies
-                        self._share_jar = jar
-                        return sekey or None
-                    else:
-                        print(f"[TB] share_verify → failed errno={errno}")
-        except Exception as e:
-            print(f"[TB] share_verify error: {e}")
-        return None
-
     async def short_url_list(
         self, surl: str, remote_dir: str = "", page: int = 1,
         share_host: Optional[str] = None,
@@ -859,8 +786,9 @@ class TeraBoxClient:
         """
         List files in a TeraBox share.
 
-        Calls share/verify first to obtain a verified sekey, then
-        passes all required tokens to share/list.
+        In the browser, JavaScript sets  TSID = decodeURIComponent(randsk)
+        and then share/list is called with  sekey = <same decoded randsk>.
+        The server checks that TSID cookie == sekey param.
         """
         base = f"https://{share_host}" if share_host else self.domain
 
@@ -870,38 +798,22 @@ class TeraBoxClient:
             "Chrome/131.0.0.0 Safari/537.36"
         )
 
-        # Build cookie string from ALL jar cookies
+        # Decode randsk → this becomes both the TSID cookie AND the sekey param
+        decoded_randsk = urllib.parse.unquote(self._randsk) if self._randsk else ""
+
+        # Build cookie string from ALL jar cookies, then OVERRIDE TSID
         cookie_map: Dict[str, str] = {}
         if self._share_jar:
             for c in self._share_jar:
                 cookie_map[c.key] = c.value
         cookie_map.setdefault("lang", "en")
         cookie_map["ndus"] = self.ndus_token
+        if decoded_randsk:
+            # This is the critical step — TSID must equal decoded randsk
+            cookie_map["TSID"] = decoded_randsk
         cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_map.items())
 
-        # Determine which domain to use
-        domain = self._share_domain or base
-
-        # ---------- Step 1: share/verify to get sekey ----------
-        if not self._verified_sekey:
-            sekey = await self._share_verify(surl, domain, cookie_str, browser_ua)
-            if sekey:
-                self._verified_sekey = sekey
-                # Rebuild cookie string with updated jar
-                cookie_map = {}
-                if self._share_jar:
-                    for c in self._share_jar:
-                        cookie_map[c.key] = c.value
-                cookie_map.setdefault("lang", "en")
-                cookie_map["ndus"] = self.ndus_token
-                cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_map.items())
-
-        # Use the verified sekey, fall back to decoded randsk
-        sekey_value = self._verified_sekey or (
-            urllib.parse.unquote(self._randsk) if self._randsk else ""
-        )
-
-        # ---------- Step 2: share/list ----------
+        # Build query params
         params: Dict[str, str] = {
             "app_id": "250528",
             "web": "1",
@@ -926,15 +838,14 @@ class TeraBoxClient:
             params["sign"] = self._share_sign
         if self._share_timestamp:
             params["timestamp"] = self._share_timestamp
-        if sekey_value:
-            params["sekey"] = sekey_value
+        if decoded_randsk:
+            params["sekey"] = decoded_randsk
 
         print(
             f"[TB] short_url_list → params: uk={params.get('uk','?')} "
             f"shareid={params.get('shareid','?')} sign={params.get('sign','?')[:8]}... "
-            f"ts={params.get('timestamp','?')} sekey_len={len(sekey_value)} "
-            f"sekey_src={'verify' if self._verified_sekey else 'randsk'} "
-            f"dir={remote_dir!r} | cookies={list(cookie_map.keys())}"
+            f"ts={params.get('timestamp','?')} sekey_len={len(decoded_randsk)} "
+            f"dir={remote_dir!r} | TSID=sekey={'match' if cookie_map.get('TSID') == decoded_randsk else 'MISMATCH!'}"
         )
 
         # Try multiple domains
@@ -991,12 +902,31 @@ class TeraBoxClient:
     ) -> Optional[Dict[str, Any]]:
         """
         Copy shared files into *your* TeraBox account at dest_path.
-        Mirrors TeraBoxApp#shareTransfer (lines 2496–2545 of api.js).
+        Uses the share domain + merged cookies (share session + NDUS).
         Retries once on errno=400810 (token refresh needed).
         """
+        # Determine which domain to send the transfer request to.
+        # We must use the share domain (the one that served the share page)
+        # because the shareid lives on that server cluster.
+        transfer_domain = self._share_domain or self.domain
+
         for attempt in range(2):
             if not self.js_token or not self.bds_token:
                 await self.update_app_data()
+
+            # Build merged Cookie header: share-session cookies + NDUS
+            cookie_parts: Dict[str, str] = {
+                "lang": "en",
+                "ndus": self.ndus_token,
+            }
+            if self._share_jar:
+                for c in self._share_jar:
+                    cookie_parts[c.key] = c.value
+            if self._randsk:
+                decoded_randsk = urllib.parse.unquote(self._randsk)
+                cookie_parts["TSID"] = decoded_randsk
+                cookie_parts["sekey"] = decoded_randsk
+            cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_parts.items())
 
             params = urllib.parse.urlencode(
                 {
@@ -1007,26 +937,38 @@ class TeraBoxClient:
                     "jsToken": self.js_token,
                     "shareid": share_id,
                     "from": from_uk,
+                    "sekey": urllib.parse.unquote(self._randsk) if self._randsk else "",
                     "ondup": "newcopy",
                     "async": "1",
                     "bdstoken": self.bds_token,
                     "logid": self.logid,
                 }
             )
-            url = f"{self.domain}/share/transfer?{params}"
+            url = f"{transfer_domain}/share/transfer?{params}"
             body = urllib.parse.urlencode(
                 {
                     "fsidlist": json.dumps(fs_ids),
                     "path": dest_path,
                 }
             )
-            print(f"[TB] share_transfer → POST {url}  (attempt={attempt+1}, fs_ids={fs_ids}, dest={dest_path})")
+            headers = {
+                "User-Agent": self.USER_AGENT,
+                "Cookie": cookie_header,
+                "Referer": transfer_domain + "/",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept-Encoding": "identity",
+            }
+            print(f"[TB] share_transfer → POST {url}")
+            print(f"[TB] share_transfer   domain={transfer_domain}  attempt={attempt+1}")
+            print(f"[TB] share_transfer   fs_ids={fs_ids}  dest={dest_path}")
+            print(f"[TB] share_transfer   cookies={list(cookie_parts.keys())}")
             try:
-                async with self._session_for() as session:
+                connector = _default_connector()
+                async with aiohttp.ClientSession(connector=connector) as session:
                     async with session.post(
                         url,
                         data=body,
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        headers=headers,
                         timeout=aiohttp.ClientTimeout(total=60),
                     ) as resp:
                         result = await resp.json(content_type=None)

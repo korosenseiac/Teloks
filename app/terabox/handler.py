@@ -96,35 +96,33 @@ def _mime(name: str, category: int = 0) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Helper: recursively collect all files from a TeraBox share
+# Helper: recursively collect files from YOUR OWN TeraBox directory
 # ---------------------------------------------------------------------------
 
-async def _collect_files(
+async def _collect_own_files(
     tb_client,
-    surl: str,
-    remote_dir: str = "",
+    remote_dir: str,
     depth: int = 0,
-    share_host: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Return a flat list of file entries from the share.
-    Each entry keeps: fs_id, server_filename, size, isdir, category, path.
+    Recursively list files inside your own TeraBox directory (api/list).
+    This avoids the errno=105 issue with share/list entirely — we only
+    query our own account's files after they've been transferred in.
     """
     if depth > 5:
-        return []  # Safety: don't recurse too deep
+        return []
 
-    result = await tb_client.short_url_list(surl, remote_dir=remote_dir, share_host=share_host)
+    result = await tb_client.get_remote_dir(remote_dir)
     if not result or result.get("errno", -1) != 0:
         return []
 
     files: List[Dict[str, Any]] = []
     for entry in result.get("list", []):
-        if entry.get("isdir"):
-            sub = await _collect_files(
-                tb_client, surl,
-                remote_dir=entry.get("path", entry.get("server_filename", "")),
+        if str(entry.get("isdir", "0")) != "0":
+            sub = await _collect_own_files(
+                tb_client,
+                remote_dir=entry.get("path", ""),
                 depth=depth + 1,
-                share_host=share_host,
             )
             files.extend(sub)
         else:
@@ -281,50 +279,11 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         from_uk = str(info.get("uk", ""))
         print(f"[TB:handler] share_id={share_id!r} from_uk={from_uk!r}")
 
-        # 3. Enumerate all files (recursive for folders)
-        await status_msg.edit("📂 Mengimbas fail dalam share…")
-
-        # If the share page scrape already returned a file_list, use it directly
-        scraped_files = info.get("file_list") or info.get("list", [])
-        if scraped_files:
-            # Flatten: filter out directories (they need recursive listing)
-            all_files = [f for f in scraped_files if str(f.get("isdir", "0")) == "0"]
-            dirs = [f for f in scraped_files if str(f.get("isdir", "0")) != "0"]
-            # Recursively enumerate subdirectories via API
-            for d in dirs:
-                sub = await _collect_files(
-                    tb, surl,
-                    remote_dir=d.get("path", d.get("server_filename", "")),
-                    share_host=share_host,
-                )
-                all_files.extend(sub)
-        else:
-            all_files = await _collect_files(tb, surl, share_host=share_host)
-        print(f"[TB:handler] collected {len(all_files)} file(s)")
-        if all_files:
-            for f in all_files[:5]:
-                print(f"  └ {f.get('server_filename')} size={f.get('size')} fs_id={f.get('fs_id')}")
-        if not all_files:
-            await status_msg.edit("❌ Tiada fail dijumpai dalam share ini.")
-            return
-
-        total = len(all_files)
-
-        # 4. Validate sizes
-        oversized = [f for f in all_files if f.get("size", 0) > MAX_FILE_SIZE]
-        if oversized:
-            names = "\n".join(
-                f"• `{f['server_filename']}` ({f['size'] / 1e9:.2f} GB)"
-                for f in oversized
-            )
-            await status_msg.edit(
-                f"❌ **{len(oversized)} fail melebihi had 2 GB:**\n\n{names}"
-            )
-            return
-
-        # 5. Create temp folder on your TeraBox account
+        # 3. Transfer share items into a temp folder on YOUR TeraBox account.
+        #    Inspired by TeraFetch: skip share/list (errno=105 on datacenter IPs)
+        #    and transfer root items directly, then list our own files.
+        await status_msg.edit("📁 Mencipta folder sementara…")
         temp_folder = f"/terabox_temp_{uuid.uuid4().hex[:12]}"
-        await status_msg.edit(f"📁 Mencipta folder sementara…")
         cd_result = await tb.create_dir(temp_folder)
         if not cd_result or cd_result.get("errno", -1) != 0:
             await status_msg.edit(
@@ -333,35 +292,56 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             )
             return
 
-        # 6. Transfer share files into temp folder
+        root_items = info.get("file_list") or info.get("list", [])
+        root_fs_ids = [int(f["fs_id"]) for f in root_items]
+        root_count = len(root_items)
+        print(f"[TB:handler] transferring {root_count} root items: {root_fs_ids}")
+
         await status_msg.edit(
-            f"➡️ Memindahkan {total} fail ke akaun TeraBox anda…"
+            f"➡️ Memindahkan {root_count} item ke akaun TeraBox anda…"
         )
-        fs_ids = [int(f["fs_id"]) for f in all_files]
-        transfer_result = await tb.share_transfer(share_id, from_uk, fs_ids, temp_folder)
+        transfer_result = await tb.share_transfer(share_id, from_uk, root_fs_ids, temp_folder)
         print(f"[TB:handler] share_transfer result: {transfer_result}")
         if not transfer_result or transfer_result.get("errno", -1) != 0:
             errno = transfer_result.get("errno") if transfer_result else "?"
+            extra = transfer_result.get("task_id", "") if transfer_result else ""
+            # errno=12 means "already exists" — that's OK, continue
+            if transfer_result and transfer_result.get("errno") == 12:
+                print(f"[TB:handler] share_transfer errno=12 (already exists), continuing")
+            else:
+                await status_msg.edit(
+                    f"❌ Gagal memindahkan fail. (errno={errno}) {extra}"
+                )
+                return
+
+        # 4. List OUR temp folder recursively (api/list, not share/list)
+        await status_msg.edit("📂 Mengimbas fail yang dipindahkan…")
+        all_files = await _collect_own_files(tb, temp_folder)
+        print(f"[TB:handler] collected {len(all_files)} file(s) from own dir")
+        if all_files:
+            for f in all_files[:5]:
+                print(f"  └ {f.get('server_filename')} size={f.get('size')} fs_id={f.get('fs_id')}")
+        if not all_files:
+            await status_msg.edit("❌ Tiada fail dijumpai selepas pemindahan.")
+            return
+
+        total = len(all_files)
+
+        # 5. Validate sizes
+        oversized = [f for f in all_files if int(f.get("size", 0)) > MAX_FILE_SIZE]
+        if oversized:
+            names = "\n".join(
+                f"• `{f['server_filename']}` ({int(f['size']) / 1e9:.2f} GB)"
+                for f in oversized
+            )
             await status_msg.edit(
-                f"❌ Gagal memindahkan fail. (errno={errno})"
+                f"❌ **{len(oversized)} fail melebihi had 2 GB:**\n\n{names}"
             )
             return
 
-        # 7. List the newly transferred files (to get YOUR account's fs_ids)
+        # 6. Get dlink for each transferred file
         await status_msg.edit("🔗 Mendapatkan link muat turun…")
-        dir_result = await tb.get_remote_dir(temp_folder)
-        print(f"[TB:handler] get_remote_dir result: errno={dir_result.get('errno') if dir_result else 'None'} | files={len(dir_result.get('list', [])) if dir_result else 0}")
-        if not dir_result or dir_result.get("errno", -1) != 0:
-            await status_msg.edit("❌ Gagal menyenaraikan fail yang dipindahkan.")
-            return
-
-        transferred_files: List[Dict[str, Any]] = dir_result.get("list", [])
-        if not transferred_files:
-            await status_msg.edit("❌ Tiada fail selepas pemindahan.")
-            return
-
-        # 8. Get dlink for each transferred file
-        my_fs_ids = [int(f["fs_id"]) for f in transferred_files]
+        my_fs_ids = [int(f["fs_id"]) for f in all_files]
         dl_result = await tb.download(my_fs_ids)
         print(f"[TB:handler] download result: errno={dl_result.get('errno') if dl_result else 'None'} | dlinks={len(dl_result.get('dlink', [])) if dl_result else 0}")
         if not dl_result or dl_result.get("errno", -1) != 0:
@@ -376,7 +356,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
 
         # Build enriched file list: {name, size, dlink, kind}
         enriched: List[Dict[str, Any]] = []
-        for tf in transferred_files:
+        for tf in all_files:
             fid = int(tf["fs_id"])
             dlink = dlink_map.get(fid, "")
             if not dlink:
