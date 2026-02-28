@@ -66,8 +66,8 @@ echo -e "${GREEN}[✓]${NC} Code updated to latest version"
 # Step 4: Update dependencies
 echo -e "${BLUE}[4/5] Updating dependencies...${NC}"
 
-# Ensure system dependency for RAR extraction
-apt-get install -y unrar >/dev/null 2>&1 || true
+# Ensure system dependencies for RAR extraction and video thumbnails
+apt-get install -y unrar ffmpeg >/dev/null 2>&1 || true
 
 cd $BOT_DIR
 sudo -u botuser $BOT_DIR/venv/bin/pip install -r requirements.txt --upgrade

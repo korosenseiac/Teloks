@@ -29,6 +29,7 @@ import aiohttp
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 from pyrogram.raw.functions.messages import SendMedia
+from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
     DocumentAttributeFilename,
     DocumentAttributeVideo,
@@ -86,6 +87,120 @@ def _format_size(b: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Video thumbnail & metadata helpers (ffmpeg / ffprobe)
+# ---------------------------------------------------------------------------
+
+
+async def _generate_video_thumb(video_path: str) -> Optional[bytes]:
+    """
+    Use ffmpeg to extract a JPEG thumbnail from the video at ~1 second.
+    Returns raw JPEG bytes or None on failure.
+    """
+    try:
+        thumb_path = video_path + ".thumb.jpg"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-ss", "1",          # seek to 1 second
+            "-frames:v", "1",    # single frame
+            "-q:v", "5",         # JPEG quality (lower = better, 2-31)
+            "-vf", "scale='min(320,iw)':-2",  # max 320px wide, keep ratio
+            thumb_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        if proc.returncode == 0 and os.path.exists(thumb_path):
+            with open(thumb_path, "rb") as f:
+                data = f.read()
+            os.remove(thumb_path)
+            if len(data) > 100:  # sanity check
+                return data
+        # Clean up on failure
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
+    except Exception as e:
+        print(f"[MediaFire] _generate_video_thumb error: {e}")
+    return None
+
+
+async def _get_video_metadata(video_path: str) -> Dict[str, int]:
+    """
+    Use ffprobe to get duration, width, height of a video file.
+    Returns {"duration": int, "width": int, "height": int}.
+    """
+    meta = {"duration": 0, "width": 0, "height": 0}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0:s=,",
+            video_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0 and stdout:
+            # Output lines: stream line (w,h,dur) then format line (dur)
+            lines = stdout.decode().strip().splitlines()
+            if lines:
+                # Parse stream line: "1920,1080,123.456" or "1920,1080,N/A"
+                parts = lines[0].split(",")
+                if len(parts) >= 2:
+                    try:
+                        meta["width"] = int(parts[0])
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        meta["height"] = int(parts[1])
+                    except (ValueError, TypeError):
+                        pass
+                    # Duration from stream
+                    if len(parts) >= 3:
+                        try:
+                            meta["duration"] = int(float(parts[2]))
+                        except (ValueError, TypeError):
+                            pass
+                # If stream duration missing, try format duration (second line)
+                if meta["duration"] == 0 and len(lines) > 1:
+                    try:
+                        meta["duration"] = int(float(lines[1].strip().rstrip(",")))
+                    except (ValueError, TypeError):
+                        pass
+    except Exception as e:
+        print(f"[MediaFire] _get_video_metadata error: {e}")
+    return meta
+
+
+async def _upload_thumb_to_telegram(
+    bot: Client, thumb_raw: bytes
+) -> Optional[InputFile]:
+    """Upload thumbnail bytes via SaveFilePart and return an InputFile."""
+    try:
+        thumb_file_id = random.randint(0, 2 ** 63 - 1)
+        await bot.invoke(
+            SaveFilePart(
+                file_id=thumb_file_id,
+                file_part=0,
+                bytes=thumb_raw,
+            )
+        )
+        return InputFile(
+            id=thumb_file_id,
+            parts=1,
+            name="thumb.jpg",
+            md5_checksum="",
+        )
+    except Exception as e:
+        print(f"[MediaFire] _upload_thumb_to_telegram error: {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Upload a single file to the backup group via raw Telegram API
 # ---------------------------------------------------------------------------
 
@@ -96,10 +211,15 @@ async def _upload_file_to_backup(
     file_name: str,
     file_size: int,
     tracker: Optional[ProgressTracker] = None,
+    thumb_raw: Optional[bytes] = None,
+    video_meta: Optional[Dict[str, int]] = None,
 ) -> Optional[int]:
     """
     Upload *streamer* to the backup Telegram group.
     Returns the Telegram ``message_id`` in the backup group, or ``None``.
+
+    For videos, *thumb_raw* (JPEG bytes) and *video_meta* (duration/w/h)
+    are used to set the thumbnail and video attributes.
     """
     try:
         on_ul = tracker.add_uploaded if tracker else None
@@ -111,15 +231,29 @@ async def _upload_file_to_backup(
         if kind == "photo":
             media = InputMediaUploadedPhoto(file=input_file)
         elif kind == "video":
+            vm = video_meta or {}
+            duration = vm.get("duration", 0)
+            width = vm.get("width", 0)
+            height = vm.get("height", 0)
+
+            # Upload thumbnail if available
+            thumb_input_file = None
+            if thumb_raw:
+                thumb_input_file = await _upload_thumb_to_telegram(bot, thumb_raw)
+                if thumb_input_file:
+                    print(f"[MediaFire] Thumbnail uploaded for {file_name} ({len(thumb_raw)} bytes)")
+
             media = InputMediaUploadedDocument(
                 file=input_file,
                 mime_type=mime_type,
                 attributes=[
                     DocumentAttributeVideo(
-                        duration=0, w=0, h=0, supports_streaming=True
+                        duration=duration, w=width, h=height,
+                        supports_streaming=True,
                     ),
                     DocumentAttributeFilename(file_name=file_name),
                 ],
+                thumb=thumb_input_file,
             )
         else:
             media = InputMediaUploadedDocument(
@@ -128,14 +262,25 @@ async def _upload_file_to_backup(
                 attributes=[DocumentAttributeFilename(file_name=file_name)],
             )
 
-        updates = await bot.invoke(
-            SendMedia(
-                peer=backup_peer,
-                media=media,
-                message="",
-                random_id=random.randint(0, 2 ** 63 - 1),
-            )
-        )
+        # SendMedia with FloodWait handling
+        for _send_attempt in range(1, 4):
+            try:
+                updates = await bot.invoke(
+                    SendMedia(
+                        peer=backup_peer,
+                        media=media,
+                        message="",
+                        random_id=random.randint(0, 2 ** 63 - 1),
+                    )
+                )
+                break
+            except FloodWait as fw:
+                wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 10)
+                print(f"[MediaFire] SendMedia FloodWait {wait}s (attempt {_send_attempt}/3)")
+                await asyncio.sleep(wait + 1)
+        else:
+            print(f"[MediaFire] SendMedia failed after 3 FloodWait retries for {file_name}")
+            return None
 
         # Extract message_id from various Telegram response types
         msg_id = _extract_msg_id(updates)
@@ -703,8 +848,16 @@ async def _handle_archive(
 
         # ----- Phase 3: Upload each extracted media file -----
         uploaded: List[Tuple[int, str, str, int]] = []
+        MAX_RETRIES = 3
 
         for idx, mf in enumerate(media_files, 1):
+            # Generate thumbnail & metadata for videos (ffmpeg)
+            thumb_raw = None
+            video_meta = None
+            if mf["kind"] == "video":
+                thumb_raw = await _generate_video_thumb(mf["path"])
+                video_meta = await _get_video_metadata(mf["path"])
+
             tracker = ProgressTracker(
                 status_msg=status_msg,
                 file_name=mf["name"],
@@ -714,16 +867,34 @@ async def _handle_archive(
             )
             tracker.start()
 
-            streamer = FileStreamer(
-                mf["path"], mf["name"],
-                on_download_chunk=tracker.add_downloaded,
-            )
+            bmid = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                streamer = FileStreamer(
+                    mf["path"], mf["name"],
+                    on_download_chunk=tracker.add_downloaded,
+                )
 
-            bmid = await _upload_file_to_backup(
-                bot, backup_peer, streamer,
-                mf["name"], mf["size"],
-                tracker=tracker,
-            )
+                bmid = await _upload_file_to_backup(
+                    bot, backup_peer, streamer,
+                    mf["name"], mf["size"],
+                    tracker=tracker,
+                    thumb_raw=thumb_raw,
+                    video_meta=video_meta,
+                )
+                if bmid:
+                    break
+
+                print(
+                    f"[MediaFire] Upload failed for {mf['name']} "
+                    f"(attempt {attempt}/{MAX_RETRIES})"
+                )
+                if attempt < MAX_RETRIES:
+                    # Reset tracker counters for retry
+                    tracker.downloaded = 0
+                    tracker.uploaded = 0
+                    tracker._dl_samples.clear()
+                    tracker._ul_samples.clear()
+                    await asyncio.sleep(3)
 
             await tracker.stop()
 
@@ -736,13 +907,17 @@ async def _handle_archive(
                     f"MediaFire/{filename}/{mf['name']}", link,
                 )
             else:
-                print(f"[MediaFire] Skipping {mf['name']} — upload failed.")
+                print(f"[MediaFire] Skipping {mf['name']} — upload failed after {MAX_RETRIES} attempts.")
 
             # Delete extracted file after upload to free space incrementally
             try:
                 os.remove(mf["path"])
             except OSError:
                 pass
+
+            # Delay between uploads to avoid Telegram rate limits
+            if idx < total_files:
+                await asyncio.sleep(2)
 
         if not uploaded:
             await status_msg.edit("❌ Semua fail gagal dimuat naik.")
