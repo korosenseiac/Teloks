@@ -514,6 +514,9 @@ class TeraBoxClient:
                     (f"{domain}/s/{surl}", browser_ua, "/s/"),
                 ]
 
+                # Collect redirect-target domains seen during page visits
+                seen_domains: list[str] = []
+
                 for url, ua, desc in endpoints:
                     print(f"[TB]   try {desc} → GET {url}")
                     try:
@@ -525,6 +528,8 @@ class TeraBoxClient:
                         ) as resp:
                             html = await resp.text(errors="replace")
                             resp_domain = f"{resp.url.scheme}://{resp.url.host}"
+                            if resp_domain not in seen_domains:
+                                seen_domains.append(resp_domain)
                             print(
                                 f"[TB]   {desc} ← HTTP {resp.status} | len={len(html)} "
                                 f"| final={resp.url}"
@@ -549,7 +554,18 @@ class TeraBoxClient:
                         self._share_domain = resp_domain
                         return result
 
-                # ------ Step 3: Try the REST API with accumulated session cookies ------
+                # ------ Step 3: Try REST API on redirect-target domains ------
+                # Pages redirected to different domains (e.g. 1024terabox.com →
+                # www.1024tera.com).  Cookies in the jar are keyed by the domain
+                # that *set* them, so we must hit the same domain for the API call.
+                api_domains = list(dict.fromkeys(seen_domains + [domain]))
+                print(f"[TB]   API domains to try: {api_domains}")
+
+                # Also build an explicit Cookie header from the jar as fallback
+                all_cookies = {c.key: c.value for c in jar}
+                cookie_str = "; ".join(f"{k}={v}" for k, v in all_cookies.items())
+                print(f"[TB]   jar cookies: {list(all_cookies.keys())}")
+
                 api_params: Dict[str, str] = {
                     "app_id": "250528",
                     "shorturl": surl,
@@ -557,25 +573,32 @@ class TeraBoxClient:
                 }
                 if self.js_token:
                     api_params["jsToken"] = self.js_token
-                print(f"[TB]   try API (session cookies) → {domain}/api/shorturlinfo")
-                try:
-                    async with session.get(
-                        f"{domain}/api/shorturlinfo",
-                        params=api_params,
-                        headers={"User-Agent": browser_ua},
-                        timeout=aiohttp.ClientTimeout(total=20),
-                    ) as resp:
-                        data = await resp.json(content_type=None)
-                        errno = data.get("errno", -1)
-                        final_domain = f"{resp.url.scheme}://{resp.url.host}"
-                        print(f"[TB]   API ← HTTP {resp.status} | errno={errno} | final={final_domain}")
-                        if errno == 0:
-                            self._share_jar = jar
-                            self._share_domain = final_domain
-                            self._apply_randsk(data)
-                            return data
-                except Exception as e:
-                    print(f"[TB]   API error: {e}")
+
+                for api_domain in api_domains:
+                    api_url = f"{api_domain}/api/shorturlinfo"
+                    print(f"[TB]   try API → {api_url}")
+                    try:
+                        async with session.get(
+                            api_url,
+                            params=api_params,
+                            headers={
+                                "User-Agent": browser_ua,
+                                "Cookie": cookie_str,
+                                "Referer": f"{api_domain}/",
+                            },
+                            timeout=aiohttp.ClientTimeout(total=20),
+                        ) as resp:
+                            data = await resp.json(content_type=None)
+                            errno = data.get("errno", -1)
+                            final_domain = f"{resp.url.scheme}://{resp.url.host}"
+                            print(f"[TB]   API ← HTTP {resp.status} | errno={errno} | final={final_domain}")
+                            if errno == 0:
+                                self._share_jar = jar
+                                self._share_domain = final_domain
+                                self._apply_randsk(data)
+                                return data
+                    except Exception as e:
+                        print(f"[TB]   API error ({api_domain}): {e}")
 
         except Exception as e:
             print(f"[TB] _scrape_one_domain session error: {e}")
