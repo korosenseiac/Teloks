@@ -812,11 +812,18 @@ class TeraBoxClient:
         if decoded_randsk:
             params["sekey"] = decoded_randsk
 
-        # Build explicit cookie string — survives any redirect
-        cookie_parts = [f"lang=en", f"ndus={self.ndus_token}"]
+        # Build explicit cookie string from ALL jar cookies — the explicit
+        # Cookie header overrides the jar so we must include everything.
+        cookie_map: Dict[str, str] = {}
+        if self._share_jar:
+            for c in self._share_jar:
+                cookie_map[c.key] = c.value
+        # Ensure essential cookies are present
+        cookie_map.setdefault("lang", "en")
+        cookie_map["ndus"] = self.ndus_token
         if decoded_randsk:
-            cookie_parts.append(f"TSID={decoded_randsk}")
-        cookie_str = "; ".join(cookie_parts)
+            cookie_map["TSID"] = decoded_randsk
+        cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_map.items())
 
         browser_ua = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -828,7 +835,7 @@ class TeraBoxClient:
             f"[TB] short_url_list → params: uk={params.get('uk','?')} "
             f"shareid={params.get('shareid','?')} sign={params.get('sign','?')[:8]}... "
             f"ts={params.get('timestamp','?')} sekey_len={len(decoded_randsk)} "
-            f"dir={remote_dir!r}"
+            f"dir={remote_dir!r} | cookies={list(cookie_map.keys())}"
         )
 
         # Try multiple domains — the jar domain, the share base, and self.domain
