@@ -1,5 +1,11 @@
+import sys
 import asyncio
 from pyrogram import idle
+
+# Force unbuffered stdout so all print() calls appear immediately in server logs
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 from pyrogram.raw.functions.messages import SendMessage
 from pyrogram.raw.types import InputPeerChannel
 from app.bot.main import app as bot_app, get_backup_group_peer
