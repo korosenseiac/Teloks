@@ -98,6 +98,7 @@ class TeraBoxClient:
             "User-Agent": self.USER_AGENT,
             "Cookie": self._cookie_str,
             "Referer": self.domain + "/",
+            "Accept-Encoding": "identity",
         }
 
     def _session_for(self, restricted: bool = False) -> aiohttp.ClientSession:
@@ -122,18 +123,18 @@ class TeraBoxClient:
         Extract the actual jsToken value from an HTML page.
 
         TeraBox embeds jsToken in two known formats:
-          1. jsToken = "HEXSTRING"                     → direct value
-          2. jsToken = "function fn(a){...};fn(\"HEXSTRING\")"  → wrapped in fn()
+          1. jsToken = "HEXSTRING"                                       → direct
+          2. jsToken = "function%20fn%28a%29...fn%28%22HEXSTRING%22%29"  → URL-encoded wrapper
 
-        In case (2) the first regex captures the whole wrapper.  We detect
-        that and extract the fn() argument instead.
+        In case (2) the value is URL-encoded inside the quotes, so we
+        URL-decode it first, then extract the fn() argument.
         """
-        # Step 1: Try the fn("...") pattern first — this is the cleanest.
+        # Step 1: Try fn("HEX") directly in the raw HTML (unlikely but free)
         fn_match = re.search(r'fn\(\\?"([A-Fa-f0-9]{32,})\\?"\)', html)
         if fn_match:
             return fn_match.group(1)
 
-        # Step 2: Broad capture of jsToken = "..." (may include the fn wrapper)
+        # Step 2: Broad capture of jsToken = "..." (may be URL-encoded wrapper)
         m = (
             re.search(r'jsToken\s*=\s*"([^"]+)"', html)
             or re.search(r"jsToken\s*=\s*'([^']+)'", html)
@@ -144,13 +145,27 @@ class TeraBoxClient:
 
         raw = m.group(1)
 
-        # Step 3: If the captured value contains fn(), extract just the argument.
-        inner = re.search(r'fn\(\\?"([A-Fa-f0-9]{32,})\\?"\)', raw)
-        if inner:
-            return inner.group(1)
+        # Step 3: URL-decode the captured value (may be encoded once or twice)
+        decoded = urllib.parse.unquote(raw)
+        decoded2 = urllib.parse.unquote(decoded)
+        print(f"[TB] _extract_js_token raw_len={len(raw)} decoded_preview={decoded2[:80]!r}")
 
-        # Step 4: If it looks like code / not a token, reject it.
-        if "function" in raw or "{" in raw:
+        # Step 4: Look for fn("HEXSTRING") in the decoded value
+        for candidate in (decoded2, decoded, raw):
+            inner = re.search(r'fn\("([A-Fa-f0-9]{32,})"\)', candidate)
+            if inner:
+                return inner.group(1)
+
+        # Step 5: If decoded value is purely hex (direct token), return it
+        if re.fullmatch(r'[A-Fa-f0-9]{32,}', decoded2):
+            return decoded2
+
+        # Step 6: If it looks like code / not a token, reject it.
+        if "function" in decoded2 or "{" in decoded2:
+            # Last resort: try to find any long hex string in the decoded value
+            hex_match = re.search(r'([A-Fa-f0-9]{64,})', decoded2)
+            if hex_match:
+                return hex_match.group(1)
             return ""
 
         return raw
@@ -325,6 +340,7 @@ class TeraBoxClient:
                         "User-Agent": self.USER_AGENT,
                         "Cookie": f"lang=en; ndus={self.ndus_token}",
                         "Referer": base_url + "/",
+                        "Accept-Encoding": "identity",
                     }
                     async with session.get(
                         url,
