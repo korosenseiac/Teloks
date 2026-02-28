@@ -15,6 +15,7 @@ Flow
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 import re
@@ -24,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
@@ -555,98 +557,179 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             await status_msg.edit("❌ Semua fail gagal dimuat naik.")
             return
 
-        # 11. Separate by type for album grouping
-        photos  = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
-        videos  = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
-        audios  = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "audio"]
-        others  = [(mid, k, n, s) for mid, k, n, s in uploaded
-                   if k not in ("photo", "video", "audio")]
-
         await status_msg.edit("⬆️ Menghantar ke anda…")
 
-        # ---------- Helper: send media group to user from backup file_ids ----
-        async def _send_album_to_user(items: List[Tuple[int, str, str, int]]) -> None:
-            """Fetch backup msgs and forward as album to the user."""
+        # ---------- Reliable send helper with FloodWait + retry --------------
+        async def _safe_send(coro_factory, retries: int = 3):
+            """
+            Call coro_factory() up to *retries* times, handling FloodWait.
+            Returns the result on success, None on permanent failure.
+            """
+            for attempt in range(1, retries + 1):
+                try:
+                    return await coro_factory()
+                except FloodWait as fw:
+                    wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 10)
+                    print(f"[TeraBox] FloodWait {wait}s (attempt {attempt}/{retries})")
+                    await asyncio.sleep(wait + 1)
+                except Exception as e:
+                    print(f"[TeraBox] _safe_send error (attempt {attempt}/{retries}): {e}")
+                    if attempt < retries:
+                        await asyncio.sleep(2)
+            return None
+
+        # ---------- Helper: send album chunk to user -------------------------
+        async def _send_album_to_user(
+            items: List[Tuple[int, str, str, int]],
+        ) -> int:
+            """
+            Send a list of backup-group items to the user as albums (max 10).
+            Returns how many files were successfully delivered.
+            """
             if not items:
-                return
-            # Telegram caps media groups at 10
-            CHUNK = 10
+                return 0
+
+            delivered = 0
+            CHUNK = 10  # Telegram max per media group
+
             for i in range(0, len(items), CHUNK):
                 chunk = items[i : i + CHUNK]
-                try:
-                    media_list = []
-                    backup_msgs = await bot.get_messages(
-                        BACKUP_GROUP_ID, [mid for mid, *_ in chunk]
-                    )
-                    if not isinstance(backup_msgs, list):
-                        backup_msgs = [backup_msgs]
-                    for msg in backup_msgs:
-                        if not msg or msg.empty:
-                            continue
-                        if msg.photo:
-                            media_list.append(InputMediaPhoto(msg.photo.file_id))
-                        elif msg.video:
-                            media_list.append(InputMediaVideo(msg.video.file_id))
-                        elif msg.document:
-                            media_list.append(InputMediaDocument(msg.document.file_id))
+                chunk_mids = [mid for mid, *_ in chunk]
 
-                    if not media_list:
-                        continue
-
-                    if len(media_list) == 1:
-                        m = media_list[0]
-                        if isinstance(m, InputMediaPhoto):
-                            await bot.send_photo(user_id, m.media)
-                        elif isinstance(m, InputMediaVideo):
-                            await bot.send_video(user_id, m.media)
-                        else:
-                            await bot.send_document(user_id, m.media)
-                    else:
-                        await bot.send_media_group(user_id, media_list)
-                except Exception as e:
-                    print(f"[TeraBox] _send_album_to_user chunk error: {e}")
-                    # Fallback: try sending individually via copy_message
-                    for mid, *_ in chunk:
-                        try:
-                            await bot.copy_message(
+                # Fetch backup messages
+                backup_msgs = await _safe_send(
+                    lambda _ids=chunk_mids: bot.get_messages(BACKUP_GROUP_ID, _ids)
+                )
+                if backup_msgs is None:
+                    # Fallback: send each individually
+                    for mid, kind, name, size in chunk:
+                        r = await _safe_send(
+                            lambda _mid=mid: bot.copy_message(
                                 chat_id=user_id,
                                 from_chat_id=BACKUP_GROUP_ID,
-                                message_id=mid,
+                                message_id=_mid,
                             )
-                        except Exception as e2:
-                            print(f"[TeraBox] Fallback copy_message {mid} also failed: {e2}")
+                        )
+                        if r:
+                            delivered += 1
+                        await asyncio.sleep(0.5)
+                    continue
 
-        # ---------- Send: photos album first ---------------------------------
-        await _send_album_to_user(photos)
+                if not isinstance(backup_msgs, list):
+                    backup_msgs = [backup_msgs]
 
-        # ---------- Send: videos album next ----------------------------------
-        await _send_album_to_user(videos)
+                # Build media list for album
+                media_list = []
+                valid_mids = []  # track which mids made it into media_list
+                for msg in backup_msgs:
+                    if not msg or getattr(msg, "empty", False):
+                        continue
+                    if msg.photo:
+                        media_list.append(InputMediaPhoto(msg.photo.file_id))
+                        valid_mids.append(msg.id)
+                    elif msg.video:
+                        media_list.append(InputMediaVideo(msg.video.file_id))
+                        valid_mids.append(msg.id)
+                    elif msg.document:
+                        media_list.append(InputMediaDocument(msg.document.file_id))
+                        valid_mids.append(msg.id)
 
-        # ---------- Send: audio files individually ---------------------------
+                if not media_list:
+                    continue
+
+                if len(media_list) == 1:
+                    # send_media_group requires ≥2 items — send single file directly
+                    m = media_list[0]
+                    if isinstance(m, InputMediaPhoto):
+                        r = await _safe_send(lambda _m=m: bot.send_photo(user_id, _m.media))
+                    elif isinstance(m, InputMediaVideo):
+                        r = await _safe_send(lambda _m=m: bot.send_video(user_id, _m.media))
+                    else:
+                        r = await _safe_send(lambda _m=m: bot.send_document(user_id, _m.media))
+                    if r:
+                        delivered += 1
+                else:
+                    # Try sending as album
+                    r = await _safe_send(
+                        lambda _ml=media_list: bot.send_media_group(user_id, _ml)
+                    )
+                    if r:
+                        delivered += len(media_list)
+                    else:
+                        # Album failed — fallback: send each individually
+                        print(f"[TeraBox] Album send failed, falling back to individual sends")
+                        for mid in valid_mids:
+                            r2 = await _safe_send(
+                                lambda _mid=mid: bot.copy_message(
+                                    chat_id=user_id,
+                                    from_chat_id=BACKUP_GROUP_ID,
+                                    message_id=_mid,
+                                )
+                            )
+                            if r2:
+                                delivered += 1
+                            await asyncio.sleep(0.5)
+
+                # Small delay between chunks to avoid FloodWait
+                await asyncio.sleep(1)
+
+            return delivered
+
+        # 11. Separate by type for album grouping
+        photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
+        videos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
+        audios = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "audio"]
+        others = [(mid, k, n, s) for mid, k, n, s in uploaded
+                  if k not in ("photo", "video", "audio")]
+
+        sent_count = 0
+        total_to_send = len(uploaded)
+
+        # Send: photos album first
+        sent_count += await _send_album_to_user(photos)
+
+        # Send: videos album next
+        sent_count += await _send_album_to_user(videos)
+
+        # Send: audio files individually
         for mid, *_ in audios:
-            try:
-                await bot.copy_message(
+            r = await _safe_send(
+                lambda _mid=mid: bot.copy_message(
                     chat_id=user_id,
                     from_chat_id=BACKUP_GROUP_ID,
-                    message_id=mid,
-                    caption="",
+                    message_id=_mid,
                 )
-            except Exception as e:
-                print(f"[TeraBox] Failed to forward audio {mid}: {e}")
+            )
+            if r:
+                sent_count += 1
+            await asyncio.sleep(0.5)
 
-        # ---------- Send: other documents individually -----------------------
+        # Send: other documents individually
         for mid, *_ in others:
-            try:
-                await bot.copy_message(
+            r = await _safe_send(
+                lambda _mid=mid: bot.copy_message(
                     chat_id=user_id,
                     from_chat_id=BACKUP_GROUP_ID,
-                    message_id=mid,
-                    caption="",
+                    message_id=_mid,
                 )
-            except Exception as e:
-                print(f"[TeraBox] Failed to forward doc {mid}: {e}")
+            )
+            if r:
+                sent_count += 1
+            await asyncio.sleep(0.5)
 
-        await status_msg.delete()
+        # Summary
+        if sent_count < total_to_send:
+            try:
+                await status_msg.edit(
+                    f"⚠️ Selesai! {sent_count}/{total_to_send} fail berjaya dihantar."
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
     except Exception as e:
         print(f"[TeraBox] Handler error: {e}")
