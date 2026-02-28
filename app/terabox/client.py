@@ -752,12 +752,13 @@ class TeraBoxClient:
         """
         List files in a TeraBox share.
 
-        Strategy 1: Reuse the saved cookie jar + jsToken from the successful scrape.
-        Strategy 2: Fall back to regular jsToken-based API call (fresh session).
+        Passes all required share auth tokens (uk, shareid, sign, timestamp,
+        sekey) as query params AND sekey/ndus as explicit Cookie header to
+        survive cross-domain redirects.
         """
         base = f"https://{share_host}" if share_host else self.domain
 
-        params = {
+        params: Dict[str, str] = {
             "app_id": "250528",
             "web": "1",
             "channel": "dubox",
@@ -783,37 +784,54 @@ class TeraBoxClient:
             params["sign"] = self._share_sign
         if self._share_timestamp:
             params["timestamp"] = self._share_timestamp
-        if self._randsk:
-            params["sekey"] = urllib.parse.unquote(self._randsk)
 
-        # Strategy 1: Use saved share session cookies
-        if self._share_jar:
-            browser_ua = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            )
-            # Ensure randsk is in the jar for share verification
-            if self._randsk and self._share_domain:
-                self._share_jar.update_cookies(
-                    {"TSID": self._randsk, "randsk": self._randsk},
-                    yarl.URL(self._share_domain),
-                )
-            # Use the domain that actually served the share data (after redirects)
-            list_base = self._share_domain or base
-            url = f"{list_base}/share/list?" + urllib.parse.urlencode(params)
-            print(f"[TB] short_url_list(jar) → GET {url[:200]}")
+        decoded_randsk = urllib.parse.unquote(self._randsk) if self._randsk else ""
+        if decoded_randsk:
+            params["sekey"] = decoded_randsk
+
+        # Build explicit cookie string — survives any redirect
+        cookie_parts = [f"lang=en", f"ndus={self.ndus_token}"]
+        if decoded_randsk:
+            cookie_parts.append(f"TSID={decoded_randsk}")
+        cookie_str = "; ".join(cookie_parts)
+
+        browser_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
+
+        print(
+            f"[TB] short_url_list → params: uk={params.get('uk','?')} "
+            f"shareid={params.get('shareid','?')} sign={params.get('sign','?')[:8]}... "
+            f"ts={params.get('timestamp','?')} sekey_len={len(decoded_randsk)} "
+            f"dir={remote_dir!r}"
+        )
+
+        # Try multiple domains — the jar domain, the share base, and self.domain
+        domains_to_try = []
+        if self._share_domain:
+            domains_to_try.append(self._share_domain)
+        if base not in domains_to_try:
+            domains_to_try.append(base)
+
+        for try_base in domains_to_try:
+            url = f"{try_base}/share/list?" + urllib.parse.urlencode(params)
+            print(f"[TB] short_url_list → GET {try_base}/share/list (dir={remote_dir!r})")
             try:
                 connector = aiohttp.TCPConnector(ssl=None)
+                jar = self._share_jar or aiohttp.CookieJar(unsafe=True)
                 async with aiohttp.ClientSession(
                     connector=connector,
-                    cookie_jar=self._share_jar,
+                    cookie_jar=jar,
                 ) as session:
                     async with session.get(
                         url,
                         headers={
                             "User-Agent": browser_ua,
                             "Accept-Encoding": "identity",
+                            "Cookie": cookie_str,
+                            "Referer": try_base + "/",
                         },
                         allow_redirects=True,
                         timeout=aiohttp.ClientTimeout(total=20),
@@ -821,37 +839,16 @@ class TeraBoxClient:
                         data = await resp.json(content_type=None)
                         errno = data.get("errno", -1)
                         file_count = len(data.get("list", []))
-                        print(f"[TB] short_url_list(jar) ← HTTP {resp.status} | errno={errno} | files={file_count}")
+                        final = f"{resp.url.scheme}://{resp.url.host}"
+                        print(f"[TB] short_url_list ← HTTP {resp.status} | errno={errno} | files={file_count} | final={final}")
                         if errno == 0:
                             return data
-                        print(f"[TB] short_url_list(jar) → failed (errno={errno}), trying token approach")
+                        print(f"[TB] short_url_list → errno={errno}, trying next domain...")
             except Exception as e:
-                print(f"[TB] short_url_list(jar) error: {e}")
+                print(f"[TB] short_url_list error ({try_base}): {e}")
 
-        # Strategy 2: jsToken-based API call (fresh session, different cookies)
-        if not self.js_token:
-            if share_host and share_host not in self.domain:
-                await self._fetch_js_token_from(base)
-            else:
-                await self.update_app_data()
-            # Update jsToken in params
-            if self.js_token:
-                params["jsToken"] = self.js_token
-
-        url = f"{base}/share/list?" + urllib.parse.urlencode(params)
-        print(f"[TB] short_url_list(token) → GET {url[:200]}")
-        try:
-            async with self._session_for(restricted=True) as session:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=20)
-                ) as resp:
-                    data = await resp.json(content_type=None)
-                    file_count = len(data.get("list", []))
-                    print(f"[TB] short_url_list(token) ← HTTP {resp.status} | errno={data.get('errno')} | files={file_count}")
-                    return data
-        except Exception as e:
-            print(f"[TB] short_url_list(token) error: {e}")
-            return None
+        print(f"[TB] short_url_list → all domains failed")
+        return data if 'data' in dir() else None
 
     # -------------------------------------------------------- share_transfer
 
