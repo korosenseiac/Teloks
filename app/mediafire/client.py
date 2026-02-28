@@ -99,8 +99,22 @@ class MediaFireClient:
                 "Tidak dapat mengekstrak link muat turun dari halaman MediaFire."
             )
 
-        # 3. Extract filename from <title>
-        filename = self._extract_filename(html) or self._filename_from_url(direct_url)
+        # 3. Extract filename — prefer the original share URL (has extension),
+        #    then <title>, then the CDN direct-download URL.
+        filename = (
+            self._filename_from_share_url(url)
+            or self._extract_filename(html)
+            or self._filename_from_url(direct_url)
+        )
+
+        # If the title-derived name lacks an extension but the URL-derived
+        # name has one, merge them: use the title as the base name + URL ext.
+        if filename and "." not in filename:
+            url_name = self._filename_from_share_url(url) or self._filename_from_url(direct_url)
+            if url_name and "." in url_name:
+                from os.path import splitext
+                _, ext = splitext(url_name)
+                filename = filename + ext
 
         # 4. GET file size via Content-Length header (follow redirects)
         size = 0
@@ -183,6 +197,26 @@ class MediaFireClient:
                     raw = raw[: -len(suffix)].strip()
             if raw:
                 return raw
+        return None
+
+    @staticmethod
+    def _filename_from_share_url(url: str) -> Optional[str]:
+        """
+        Extract filename from a MediaFire share URL.
+
+        Typical pattern:  /file/<id>/<filename>/file
+        The filename segment (with extension) is the second-to-last part.
+        """
+        try:
+            from urllib.parse import urlparse, unquote
+            parts = [p for p in urlparse(url).path.split("/") if p]
+            # e.g. ['file', 'k7x4ekou4owf26e', 'CWL_Liya_Punk.zip', 'file']
+            if len(parts) >= 3 and parts[0] == "file":
+                candidate = unquote(parts[2])
+                if "." in candidate:  # must have an extension
+                    return candidate
+        except Exception:
+            pass
         return None
 
     @staticmethod
