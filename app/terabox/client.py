@@ -280,7 +280,10 @@ class TeraBoxClient:
     ) -> Optional[Dict[str, Any]]:
         """
         Fetch share metadata (share_id, uk, file list).
-        Mirrors TeraBoxApp#shortUrlInfo (lines 2018–2050 of api.js).
+
+        **Strategy**: First try scraping the share page HTML directly (most
+        reliable — works from datacenter IPs).  Fall back to the REST API
+        endpoint if the scrape doesn't yield data.
 
         Parameters
         ----------
@@ -288,19 +291,22 @@ class TeraBoxClient:
             The raw code from the share URL path (e.g. "12VSvUMj_3xxS35TG63_lHQ").
         share_host : str, optional
             Hostname from the original share URL (e.g. "1024terabox.com").
-            When given, the API call is made on that host rather than self.domain,
-            because TeraBox share-info endpoints are host-specific.
         """
-        # Determine the base URL to use for this call
         base = f"https://{share_host}" if share_host else self.domain
 
-        # Ensure we have jsToken for the target domain
-        if not self.js_token:
-            if share_host and share_host not in self.domain:
-                print(f"[TB] short_url_info → fetching jsToken from share host: {base}")
-                await self._fetch_js_token_from(base)
-            else:
-                await self.update_app_data()
+        # -------- Approach 1: Scrape the share page HTML --------
+        page_data = await self._scrape_share_page(base, surl)
+        if page_data and page_data.get("shareid"):
+            print(f"[TB] short_url_info → got data from share page scrape")
+            return {**page_data, "errno": 0}
+
+        # -------- Approach 2: REST API (may need domain-specific jsToken) --
+        # Always refresh jsToken for the share host
+        if share_host and share_host not in self.domain:
+            print(f"[TB] short_url_info → fetching jsToken from share host: {base}")
+            await self._fetch_js_token_from(base)
+        elif not self.js_token:
+            await self.update_app_data()
 
         params = urllib.parse.urlencode({
             "app_id": "250528",
@@ -324,6 +330,98 @@ class TeraBoxClient:
         except Exception as e:
             print(f"[TB] short_url_info error: {e}")
             return None
+
+    async def _scrape_share_page(
+        self, base_url: str, surl: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Load the share page (e.g. ``/s/12VSvUMj...``) and extract the
+        embedded JSON data that contains shareid, uk, and the file list.
+
+        TeraBox share pages embed data in ``window.__INITIAL_STATE__`` or
+        in a ``<script>`` block containing ``locals.init({...})``.
+        """
+        url = f"{base_url}/s/{surl}"
+        print(f"[TB] _scrape_share_page → GET {url}")
+        try:
+            async with self._session_for() as session:
+                async with session.get(
+                    url,
+                    allow_redirects=True,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    html = await resp.text(errors="replace")
+                    print(f"[TB] _scrape_share_page ← HTTP {resp.status} | html_len={len(html)}")
+        except Exception as e:
+            print(f"[TB] _scrape_share_page request error: {e}")
+            return None
+
+        # ---- Try multiple embedded JSON patterns ----
+
+        result: Dict[str, Any] = {}
+
+        # Pattern 1: window.__INITIAL_STATE__ = {...}
+        m = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});\s*</', html, re.DOTALL)
+        if m:
+            try:
+                state = json.loads(m.group(1))
+                print(f"[TB] _scrape_share_page → found __INITIAL_STATE__ keys={list(state.keys())[:10]}")
+                # Navigate to share data inside the state object
+                share_data = state
+                # Some structures nest under "share" or "shareInfo"
+                for key in ("shareid", "share_id"):
+                    if key in share_data:
+                        break
+                else:
+                    # Look one level deeper
+                    for k, v in share_data.items():
+                        if isinstance(v, dict) and ("shareid" in v or "share_id" in v):
+                            share_data = v
+                            break
+                result["shareid"] = share_data.get("shareid") or share_data.get("share_id", "")
+                result["uk"] = share_data.get("uk") or share_data.get("owner_id", "")
+                file_list = share_data.get("file_list") or share_data.get("list", [])
+                if isinstance(file_list, dict):
+                    file_list = file_list.get("list", [])
+                result["file_list"] = file_list
+            except json.JSONDecodeError as e:
+                print(f"[TB] _scrape_share_page → __INITIAL_STATE__ JSON parse error: {e}")
+
+        # Pattern 2: locals.init({...}) or window.locals = {...}
+        if not result.get("shareid"):
+            m = re.search(r'locals\.init\((\{.+?\})\)', html, re.DOTALL)
+            if m:
+                try:
+                    init_data = json.loads(m.group(1))
+                    print(f"[TB] _scrape_share_page → found locals.init keys={list(init_data.keys())[:10]}")
+                    result["shareid"] = init_data.get("shareid", "")
+                    result["uk"] = init_data.get("uk", "")
+                    result["file_list"] = init_data.get("file_list", [])
+                except json.JSONDecodeError:
+                    pass
+
+        # Pattern 3: Inline regex extraction as last resort
+        if not result.get("shareid"):
+            sid = re.search(r'"shareid"\s*:\s*"?(\d+)"?', html)
+            uk = re.search(r'"uk"\s*:\s*"?(\d+)"?', html)
+            if sid:
+                result["shareid"] = sid.group(1)
+            if uk:
+                result["uk"] = uk.group(1)
+            print(f"[TB] _scrape_share_page → regex fallback: shareid={result.get('shareid')!r} uk={result.get('uk')!r}")
+
+        # Also extract jsToken from the share page for future calls
+        js = self._extract_js_token(html)
+        if js:
+            self.js_token = js
+            print(f"[TB] _scrape_share_page → updated jsToken from share page")
+
+        if result.get("shareid"):
+            print(f"[TB] _scrape_share_page → success: shareid={result['shareid']} uk={result.get('uk')} files={len(result.get('file_list', []))}")
+            return result
+
+        print(f"[TB] _scrape_share_page → could not extract share data from HTML")
+        return None
 
     async def _fetch_js_token_from(self, base_url: str) -> None:
         """

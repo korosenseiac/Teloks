@@ -283,7 +283,23 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
 
         # 3. Enumerate all files (recursive for folders)
         await status_msg.edit("📂 Mengimbas fail dalam share…")
-        all_files = await _collect_files(tb, surl, share_host=share_host)
+
+        # If the share page scrape already returned a file_list, use it directly
+        scraped_files = info.get("file_list", [])
+        if scraped_files:
+            # Flatten: filter out directories (they need recursive listing)
+            all_files = [f for f in scraped_files if not f.get("isdir")]
+            dirs = [f for f in scraped_files if f.get("isdir")]
+            # Recursively enumerate subdirectories via API
+            for d in dirs:
+                sub = await _collect_files(
+                    tb, surl,
+                    remote_dir=d.get("path", d.get("server_filename", "")),
+                    share_host=share_host,
+                )
+                all_files.extend(sub)
+        else:
+            all_files = await _collect_files(tb, surl, share_host=share_host)
         print(f"[TB:handler] collected {len(all_files)} file(s)")
         if all_files:
             for f in all_files[:5]:
