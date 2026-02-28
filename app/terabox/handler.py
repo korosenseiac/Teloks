@@ -44,7 +44,7 @@ from app.terabox.streamer import TeraBoxMediaStreamer
 # ---------------------------------------------------------------------------
 
 TERABOX_LINK_PATTERN = re.compile(
-    r"https?://(?:www\.)?(?:terabox\.com|1024terabox\.com|freeterabox\.com"
+    r"https?://(?:www\.)?(terabox\.com|1024terabox\.com|freeterabox\.com"
     r"|terabox\.app|teraboxapp\.com)/s/([a-zA-Z0-9_-]+)"
 )
 
@@ -104,6 +104,7 @@ async def _collect_files(
     surl: str,
     remote_dir: str = "",
     depth: int = 0,
+    share_host: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Return a flat list of file entries from the share.
@@ -112,7 +113,7 @@ async def _collect_files(
     if depth > 5:
         return []  # Safety: don't recurse too deep
 
-    result = await tb_client.short_url_list(surl, remote_dir=remote_dir)
+    result = await tb_client.short_url_list(surl, remote_dir=remote_dir, share_host=share_host)
     if not result or result.get("errno", -1) != 0:
         return []
 
@@ -123,6 +124,7 @@ async def _collect_files(
                 tb_client, surl,
                 remote_dir=entry.get("path", entry.get("server_filename", "")),
                 depth=depth + 1,
+                share_host=share_host,
             )
             files.extend(sub)
         else:
@@ -246,8 +248,9 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
     match = TERABOX_LINK_PATTERN.search(message.text)
     if not match:
         return
-    surl = match.group(1)
-    print(f"[TB:handler] user={user_id} raw_link={message.text.strip()!r} surl={surl!r}")
+    share_host = match.group(1)   # e.g. "1024terabox.com"
+    surl = match.group(2)         # e.g. "12VSvUMj_3xxS35TG63_lHQ"
+    print(f"[TB:handler] user={user_id} raw_link={message.text.strip()!r} share_host={share_host!r} surl={surl!r}")
 
     # ---------------------------------------------------------------- Start
     active_user_processes[user_id] = True
@@ -265,7 +268,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             return
 
         # 2. Get share metadata
-        info = await tb.short_url_info(surl)
+        info = await tb.short_url_info(surl, share_host=share_host)
         print(f"[TB:handler] short_url_info full response: {info}")
         if not info or info.get("errno", -1) != 0:
             errno = info.get("errno") if info else "?"
@@ -280,7 +283,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
 
         # 3. Enumerate all files (recursive for folders)
         await status_msg.edit("📂 Mengimbas fail dalam share…")
-        all_files = await _collect_files(tb, surl)
+        all_files = await _collect_files(tb, surl, share_host=share_host)
         print(f"[TB:handler] collected {len(all_files)} file(s)")
         if all_files:
             for f in all_files[:5]:

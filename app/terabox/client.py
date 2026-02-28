@@ -140,8 +140,14 @@ class TeraBoxClient:
                     html = await resp.text(errors="replace")
                     print(f"[TB] update_app_data ← HTTP {resp.status} | html_len={len(html)}")
 
-            # Extract jsToken
-            js_token_match = re.search(r'jsToken\s*=\s*["\']([^"\']+)["\']', html)
+            # Extract jsToken — try multiple patterns
+            js_token_match = (
+                re.search(r'jsToken\s*=\s*"([^"]+)"', html)
+                or re.search(r"jsToken\s*=\s*'([^']+)'", html)
+                or re.search(r'"jsToken"\s*:\s*"([^"]+)"', html)
+                or re.search(r"js_token.{0,3}:\s*.([A-Za-z0-9_+/=%-]{20,})", html, re.IGNORECASE)
+                or re.search(r'fn\("([A-Za-z0-9_+/=%-]{20,})"\)', html)
+            )
             if js_token_match:
                 self.js_token = js_token_match.group(1)
 
@@ -177,6 +183,12 @@ class TeraBoxClient:
                 f"bds_token={'OK' if self.bds_token else 'MISSING'} "
                 f"logid={self.logid!r} csrf={self.csrf!r}"
             )
+
+            # If jsToken still missing, try fetching /disk/home page as fallback
+            if not self.js_token and not custom_path:
+                print("[TB] update_app_data → jsToken MISSING, retrying with /disk/home")
+                await self.update_app_data("disk/home")
+
             return True
 
         except Exception as e:
@@ -215,19 +227,43 @@ class TeraBoxClient:
 
     # -------------------------------------------------------- short_url_info
 
-    async def short_url_info(self, surl: str) -> Optional[Dict[str, Any]]:
+    async def short_url_info(
+        self, surl: str, share_host: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Fetch share metadata (share_id, uk, file list).
         Mirrors TeraBoxApp#shortUrlInfo (lines 2018–2050 of api.js).
-        Uses cipher-restricted TLS connector.
 
-        NOTE: surl is the raw code extracted from the share URL path (e.g. "1AbcXyz").
-        We pass it directly — do NOT prepend "1" again.
+        Parameters
+        ----------
+        surl : str
+            The raw code from the share URL path (e.g. "12VSvUMj_3xxS35TG63_lHQ").
+        share_host : str, optional
+            Hostname from the original share URL (e.g. "1024terabox.com").
+            When given, the API call is made on that host rather than self.domain,
+            because TeraBox share-info endpoints are host-specific.
         """
-        url = (
-            f"{self.domain}/api/shorturlinfo"
-            f"?shorturl={urllib.parse.quote(surl)}&root=1"
-        )
+        # Determine the base URL to use for this call
+        base = f"https://{share_host}" if share_host else self.domain
+
+        # Ensure we have jsToken for the target domain
+        if not self.js_token:
+            if share_host and share_host not in self.domain:
+                print(f"[TB] short_url_info → fetching jsToken from share host: {base}")
+                await self._fetch_js_token_from(base)
+            else:
+                await self.update_app_data()
+
+        params = urllib.parse.urlencode({
+            "app_id": "250528",
+            "web": "1",
+            "channel": "dubox",
+            "clienttype": "0",
+            "jsToken": self.js_token,
+            "shorturl": surl,
+            "root": "1",
+        })
+        url = f"{base}/api/shorturlinfo?{params}"
         print(f"[TB] short_url_info → GET {url}  (surl={surl!r})")
         try:
             async with self._session_for(restricted=True) as session:
@@ -241,18 +277,71 @@ class TeraBoxClient:
             print(f"[TB] short_url_info error: {e}")
             return None
 
+    async def _fetch_js_token_from(self, base_url: str) -> None:
+        """
+        Fetch jsToken from a specific TeraBox domain (e.g. 1024terabox.com).
+        Only updates jsToken (and bdstoken if found); does NOT change self.domain.
+        """
+        for path in ("main", "disk/home", ""):
+            try:
+                url = f"{base_url}/{path}" if path else base_url
+                print(f"[TB] _fetch_js_token_from → GET {url}")
+                async with self._session_for() as session:
+                    # Override cookie domain for this request
+                    custom_headers = {
+                        "User-Agent": self.USER_AGENT,
+                        "Cookie": f"lang=en; ndus={self.ndus_token}",
+                        "Referer": base_url + "/",
+                    }
+                    async with session.get(
+                        url,
+                        headers=custom_headers,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        html = await resp.text(errors="replace")
+                        print(f"[TB] _fetch_js_token_from ← HTTP {resp.status} | html_len={len(html)}")
+
+                js_match = (
+                    re.search(r'jsToken\s*=\s*"([^"]+)"', html)
+                    or re.search(r"jsToken\s*=\s*'([^']+)'", html)
+                    or re.search(r'"jsToken"\s*:\s*"([^"]+)"', html)
+                    or re.search(r'fn\("([^"]{20,})"\)', html)
+                )
+                if js_match:
+                    self.js_token = js_match.group(1)
+                    print(f"[TB] _fetch_js_token_from → jsToken OK (from {path or 'root'})")
+
+                bds_match = re.search(r'"bdstoken"\s*:\s*"([^"]+)"', html)
+                if bds_match and not self.bds_token:
+                    self.bds_token = bds_match.group(1)
+
+                if self.js_token:
+                    return  # Got what we need
+            except Exception as e:
+                print(f"[TB] _fetch_js_token_from error ({path}): {e}")
+
     # -------------------------------------------------------- short_url_list
 
     async def short_url_list(
-        self, surl: str, remote_dir: str = "", page: int = 1
+        self, surl: str, remote_dir: str = "", page: int = 1,
+        share_host: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         List files in a TeraBox share.
         Mirrors TeraBoxApp#shortUrlList (lines 2061–2112 of api.js).
         Fetches jsToken first if not already obtained.
+
+        share_host : str, optional
+            Hostname from the original share URL. API is called on this host.
         """
+        base = f"https://{share_host}" if share_host else self.domain
+
         if not self.js_token:
-            await self.update_app_data()
+            if share_host and share_host not in self.domain:
+                await self._fetch_js_token_from(base)
+            else:
+                await self.update_app_data()
 
         params = {
             "app_id": "250528",
@@ -270,7 +359,7 @@ class TeraBoxClient:
         if not remote_dir:
             params["root"] = "1"
 
-        url = f"{self.domain}/share/list?" + urllib.parse.urlencode(params)
+        url = f"{base}/share/list?" + urllib.parse.urlencode(params)
         print(f"[TB] short_url_list → GET {url}")
         try:
             async with self._session_for(restricted=True) as session:
