@@ -706,13 +706,16 @@ class TeraBoxClient:
         """
         List files in a TeraBox share.
 
-        Strategy 1: Reuse the saved cookie jar from the successful scrape.
-        Strategy 2: Fall back to regular jsToken-based API call.
+        Strategy 1: Reuse the saved cookie jar + jsToken from the successful scrape.
+        Strategy 2: Fall back to regular jsToken-based API call (fresh session).
         """
         base = f"https://{share_host}" if share_host else self.domain
 
         params = {
             "app_id": "250528",
+            "web": "1",
+            "channel": "dubox",
+            "clienttype": "0",
             "shorturl": surl,
             "by": "name",
             "order": "asc",
@@ -720,6 +723,8 @@ class TeraBoxClient:
             "dir": remote_dir,
             "page": str(page),
         }
+        if self.js_token:
+            params["jsToken"] = self.js_token
         if not remote_dir:
             params["root"] = "1"
 
@@ -731,7 +736,7 @@ class TeraBoxClient:
                 "Chrome/131.0.0.0 Safari/537.36"
             )
             url = f"{base}/share/list?" + urllib.parse.urlencode(params)
-            print(f"[TB] short_url_list(jar) → GET {url}")
+            print(f"[TB] short_url_list(jar) → GET {url[:200]}")
             try:
                 connector = aiohttp.TCPConnector(ssl=None)
                 async with aiohttp.ClientSession(
@@ -753,26 +758,22 @@ class TeraBoxClient:
                         print(f"[TB] short_url_list(jar) ← HTTP {resp.status} | errno={errno} | files={file_count}")
                         if errno == 0:
                             return data
-                        print(f"[TB] short_url_list(jar) → failed, trying token approach")
+                        print(f"[TB] short_url_list(jar) → failed (errno={errno}), trying token approach")
             except Exception as e:
                 print(f"[TB] short_url_list(jar) error: {e}")
 
-        # Strategy 2: jsToken-based API call
+        # Strategy 2: jsToken-based API call (fresh session, different cookies)
         if not self.js_token:
             if share_host and share_host not in self.domain:
                 await self._fetch_js_token_from(base)
             else:
                 await self.update_app_data()
+            # Update jsToken in params
+            if self.js_token:
+                params["jsToken"] = self.js_token
 
-        token_params = {
-            **params,
-            "web": "1",
-            "channel": "dubox",
-            "clienttype": "0",
-            "jsToken": self.js_token,
-        }
-        url = f"{base}/share/list?" + urllib.parse.urlencode(token_params)
-        print(f"[TB] short_url_list(token) → GET {url}")
+        url = f"{base}/share/list?" + urllib.parse.urlencode(params)
+        print(f"[TB] short_url_list(token) → GET {url[:200]}")
         try:
             async with self._session_for(restricted=True) as session:
                 async with session.get(
