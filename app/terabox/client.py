@@ -1119,11 +1119,16 @@ class TeraBoxClient:
                     url, timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
                     data = await resp.json(content_type=None)
+                    # sign data may be nested inside "data"
+                    inner = data.get("data", data) if isinstance(data.get("data"), dict) else data
+                    s1 = inner.get("sign1", "")
+                    s3 = inner.get("sign3", "")
+                    ts = inner.get("timestamp", "")
                     print(
                         f"[TB] get_home_info ← HTTP {resp.status} | errno={data.get('errno')}"
-                        f" | sign1={data.get('sign1','')[:8] if data.get('sign1') else 'EMPTY'}"
-                        f" | sign3={data.get('sign3','')[:8] if data.get('sign3') else 'EMPTY'}"
-                        f" | timestamp={data.get('timestamp','')}"
+                        f" | sign1={s1[:8] if s1 else 'EMPTY'}..."
+                        f" | sign3={s3[:8] if s3 else 'EMPTY'}..."
+                        f" | timestamp={ts}"
                     )
                     return data
         except Exception as e:
@@ -1190,7 +1195,9 @@ class TeraBoxClient:
             print(f"[TB] download: full home_info response: {home_info}")
             return {"errno": -1, "errmsg": "home/info returned no sign data", "dlink": []}
 
-        sign_b = self.sign_download(sign3, sign1)
+        # JS sign2 function: s(j=sign3, r=sign1) where j=KEY, r=DATA
+        # sign_download(s1=data, s2=key) → s1=sign1, s2=sign3
+        sign_b = self.sign_download(sign1, sign3)
 
         params = urllib.parse.urlencode(
             {
@@ -1223,8 +1230,11 @@ class TeraBoxClient:
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
                     data = await resp.json(content_type=None)
-                    link_count = len(data.get("dlink", []))
+                    dlinks = data.get("dlink", data.get("info", []))
+                    link_count = len(dlinks) if isinstance(dlinks, list) else 0
                     print(f"[TB] download ← HTTP {resp.status} | errno={data.get('errno')} | dlinks={link_count}")
+                    if data.get("errno", -1) != 0:
+                        print(f"[TB] download full response: {data}")
                     return data
         except Exception as e:
             print(f"[TB] download error: {e}")
