@@ -1071,6 +1071,7 @@ class TeraBoxClient:
                 "num": "20000",
                 "page": str(page),
                 "showempty": "0",
+                "thumb": "1",
             }
         )
         print(f"[TB] get_remote_dir → POST {url}  (dir={remote_dir})")

@@ -21,14 +21,18 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp
+
 from pyrogram import Client
 from pyrogram.raw.functions.messages import SendMedia
+from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
     DocumentAttributeFilename,
     DocumentAttributeVideo,
     DocumentAttributeAudio,
     InputMediaUploadedDocument,
     InputMediaUploadedPhoto,
+    InputFile,
     UpdateNewChannelMessage,
     UpdateNewMessage,
 )
@@ -135,6 +139,53 @@ async def _collect_own_files(
 # Helper: send one TeraBox file to backup group via raw API
 # ---------------------------------------------------------------------------
 
+async def _download_thumb_bytes(thumb_url: str, cookie_str: str) -> Optional[bytes]:
+    """Download a thumbnail image from TeraBox. Returns raw bytes or None."""
+    if not thumb_url:
+        return None
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Cookie": cookie_str,
+            "Referer": "https://www.terabox.com/",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                thumb_url, headers=headers,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    if len(data) > 100:  # sanity check
+                        return data
+    except Exception as e:
+        print(f"[TeraBox] _download_thumb_bytes error: {e}")
+    return None
+
+
+async def _upload_thumb_to_telegram(bot: Client, thumb_raw: bytes) -> Optional[InputFile]:
+    """Upload thumbnail bytes via SaveFilePart and return an InputFile."""
+    try:
+        thumb_file_id = random.randint(0, 2 ** 63 - 1)
+        await bot.invoke(
+            SaveFilePart(
+                file_id=thumb_file_id,
+                file_part=0,
+                bytes=thumb_raw,
+            )
+        )
+        return InputFile(
+            id=thumb_file_id,
+            parts=1,
+            name="thumb.jpg",
+            md5_checksum="",
+        )
+    except Exception as e:
+        print(f"[TeraBox] _upload_thumb_to_telegram error: {e}")
+    return None
+
+
 async def _upload_terabox_file_to_backup(
     bot: Client,
     tb_client,
@@ -142,6 +193,7 @@ async def _upload_terabox_file_to_backup(
     dlink: str,
     file_size: int,
     file_name: str,
+    thumb_url: str = "",
 ) -> Optional[int]:
     """
     Download from TeraBox and upload to the backup Telegram group.
@@ -157,6 +209,15 @@ async def _upload_terabox_file_to_backup(
         if kind == "photo":
             media = InputMediaUploadedPhoto(file=input_file)
         elif kind == "video":
+            # Download and upload thumbnail for video
+            thumb_input_file = None
+            if thumb_url:
+                thumb_raw = await _download_thumb_bytes(thumb_url, tb_client._cookie_str)
+                if thumb_raw:
+                    thumb_input_file = await _upload_thumb_to_telegram(bot, thumb_raw)
+                    if thumb_input_file:
+                        print(f"[TeraBox] Thumbnail uploaded for {file_name} ({len(thumb_raw)} bytes)")
+
             media = InputMediaUploadedDocument(
                 file=input_file,
                 mime_type=mime,
@@ -164,6 +225,7 @@ async def _upload_terabox_file_to_backup(
                     DocumentAttributeVideo(duration=0, w=0, h=0, supports_streaming=True),
                     DocumentAttributeFilename(file_name=file_name),
                 ],
+                thumb=thumb_input_file,
             )
         elif kind == "audio":
             media = InputMediaUploadedDocument(
@@ -354,18 +416,27 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             fid = int(item.get("fs_id", 0))
             dlink_map[fid] = item.get("dlink", "")
 
-        # Build enriched file list: {name, size, dlink, kind}
+        # Build enriched file list: {name, size, dlink, kind, thumb_url}
         enriched: List[Dict[str, Any]] = []
         for tf in all_files:
             fid = int(tf["fs_id"])
             dlink = dlink_map.get(fid, "")
             if not dlink:
                 continue
+            # Extract best thumbnail URL from TeraBox api/list thumbs
+            thumbs = tf.get("thumbs", {})
+            thumb_url = (
+                thumbs.get("url3", "")
+                or thumbs.get("url2", "")
+                or thumbs.get("url1", "")
+                or thumbs.get("icon", "")
+            ) if isinstance(thumbs, dict) else ""
             enriched.append({
                 "name": tf.get("server_filename", "file"),
                 "size": int(tf.get("size", 0)),
                 "dlink": dlink,
                 "kind": _classify(tf.get("server_filename", "file")),
+                "thumb_url": thumb_url,
             })
 
         if not enriched:
@@ -390,6 +461,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             bmid = await _upload_terabox_file_to_backup(
                 bot, tb, backup_peer,
                 entry["dlink"], entry["size"], entry["name"],
+                thumb_url=entry.get("thumb_url", ""),
             )
             if bmid:
                 uploaded.append((bmid, entry["kind"], entry["name"], entry["size"]))
