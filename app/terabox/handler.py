@@ -111,27 +111,39 @@ async def _collect_own_files(
 ) -> List[Dict[str, Any]]:
     """
     Recursively list files inside your own TeraBox directory (api/list).
-    This avoids the errno=105 issue with share/list entirely — we only
-    query our own account's files after they've been transferred in.
+    Handles pagination to ensure ALL files are collected.
     """
     if depth > 5:
         return []
 
-    result = await tb_client.get_remote_dir(remote_dir)
-    if not result or result.get("errno", -1) != 0:
-        return []
-
     files: List[Dict[str, Any]] = []
-    for entry in result.get("list", []):
-        if str(entry.get("isdir", "0")) != "0":
-            sub = await _collect_own_files(
-                tb_client,
-                remote_dir=entry.get("path", ""),
-                depth=depth + 1,
-            )
-            files.extend(sub)
-        else:
-            files.append(entry)
+    page = 1
+
+    while True:
+        result = await tb_client.get_remote_dir(remote_dir, page=page)
+        if not result or result.get("errno", -1) != 0:
+            break
+
+        entries = result.get("list", [])
+        if not entries:
+            break
+
+        for entry in entries:
+            if str(entry.get("isdir", "0")) != "0":
+                sub = await _collect_own_files(
+                    tb_client,
+                    remote_dir=entry.get("path", ""),
+                    depth=depth + 1,
+                )
+                files.extend(sub)
+            else:
+                files.append(entry)
+
+        # Check if there are more pages
+        has_more = result.get("has_more", 0)
+        if not has_more:
+            break
+        page += 1
 
     return files
 
@@ -410,28 +422,35 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             )
             return
 
-        # 6. Get dlink for each transferred file
+        # 6. Get dlink for each transferred file (batched to avoid API limits)
         await status_msg.edit("🔗 Mendapatkan link muat turun…")
         my_fs_ids = [int(f["fs_id"]) for f in all_files]
-        dl_result = await tb.download(my_fs_ids)
-        print(f"[TB:handler] download result: errno={dl_result.get('errno') if dl_result else 'None'} | dlinks={len(dl_result.get('dlink', [])) if dl_result else 0}")
-        if not dl_result or dl_result.get("errno", -1) != 0:
-            await status_msg.edit("❌ Gagal mendapatkan link muat turun.")
-            return
 
-        # Build fs_id → dlink mapping
+        DLINK_BATCH = 20  # TeraBox may limit how many dlinks per request
         dlink_map: Dict[int, str] = {}
-        for item in dl_result.get("dlink", []):
-            fid = int(item.get("fs_id", 0))
-            dlink_map[fid] = item.get("dlink", "")
 
-        # Build enriched file list: {name, size, dlink, kind, thumb_url}
+        for batch_start in range(0, len(my_fs_ids), DLINK_BATCH):
+            batch_ids = my_fs_ids[batch_start : batch_start + DLINK_BATCH]
+            dl_result = await tb.download(batch_ids)
+            if not dl_result or dl_result.get("errno", -1) != 0:
+                print(f"[TB:handler] download batch failed: errno={dl_result.get('errno') if dl_result else 'None'}")
+                continue
+            # TeraBox returns dlinks under "dlink" or "info" depending on version
+            dlink_list = dl_result.get("dlink", []) or dl_result.get("info", [])
+            if isinstance(dlink_list, list):
+                for item in dlink_list:
+                    fid = int(item.get("fs_id", 0))
+                    dl = item.get("dlink", "")
+                    if fid and dl:
+                        dlink_map[fid] = dl
+
+        print(f"[TB:handler] dlink_map has {len(dlink_map)} entries for {len(my_fs_ids)} files")
+
+        # Build enriched file list: {name, size, dlink, kind, thumb_url, fs_id}
         enriched: List[Dict[str, Any]] = []
         for tf in all_files:
             fid = int(tf["fs_id"])
             dlink = dlink_map.get(fid, "")
-            if not dlink:
-                continue
             # Extract best thumbnail URL from TeraBox api/list thumbs
             thumbs = tf.get("thumbs", {})
             thumb_url = (
@@ -446,10 +465,11 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 "dlink": dlink,
                 "kind": _classify(tf.get("server_filename", "file")),
                 "thumb_url": thumb_url,
+                "fs_id": fid,
             })
 
         if not enriched:
-            await status_msg.edit("❌ Tiada link muat turun yang sah.")
+            await status_msg.edit("❌ Tiada fail untuk dimuat naik.")
             return
 
         # 9. Resolve backup group peer
@@ -458,10 +478,24 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             await status_msg.edit("❌ Backup group tidak dijumpai.")
             return
 
+        # Helper: fetch a fresh dlink for a single fs_id
+        async def _refresh_dlink(fs_id: int) -> str:
+            """Re-fetch a single dlink (handles expiry)."""
+            try:
+                r = await tb.download([fs_id])
+                if r and r.get("errno", -1) == 0:
+                    items = r.get("dlink", []) or r.get("info", [])
+                    if items and isinstance(items, list):
+                        return items[0].get("dlink", "")
+            except Exception as e:
+                print(f"[TeraBox] _refresh_dlink error for fs_id={fs_id}: {e}")
+            return ""
+
         # 10. Upload all files to backup group one by one
         # Collect: (backup_msg_id, kind, name, size)
         uploaded: List[Tuple[int, str, str, int]] = []
         total_up = len(enriched)
+        MAX_RETRIES = 2
 
         for idx, entry in enumerate(enriched, 1):
             # Create and start progress tracker for this file
@@ -474,12 +508,35 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             )
             tracker.start()
 
-            bmid = await _upload_terabox_file_to_backup(
-                bot, tb, backup_peer,
-                entry["dlink"], entry["size"], entry["name"],
-                thumb_url=entry.get("thumb_url", ""),
-                tracker=tracker,
-            )
+            bmid = None
+            dlink = entry["dlink"]
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                # Ensure we have a dlink (may be missing from initial batch or expired)
+                if not dlink:
+                    print(f"[TeraBox] No dlink for {entry['name']}, fetching fresh one (attempt {attempt})")
+                    dlink = await _refresh_dlink(entry["fs_id"])
+                    if not dlink:
+                        print(f"[TeraBox] Still no dlink for {entry['name']}")
+                        break  # give up on this file
+
+                bmid = await _upload_terabox_file_to_backup(
+                    bot, tb, backup_peer,
+                    dlink, entry["size"], entry["name"],
+                    thumb_url=entry.get("thumb_url", ""),
+                    tracker=tracker,
+                )
+                if bmid:
+                    break  # success
+
+                # Failed — dlink may have expired, refresh and retry
+                print(f"[TeraBox] Upload failed for {entry['name']} (attempt {attempt}/{MAX_RETRIES}), refreshing dlink")
+                dlink = await _refresh_dlink(entry["fs_id"])
+                # Reset tracker counters for retry
+                tracker.downloaded = 0
+                tracker.uploaded = 0
+                tracker._dl_samples.clear()
+                tracker._ul_samples.clear()
 
             await tracker.stop()
             if bmid:
@@ -512,28 +569,31 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             """Fetch backup msgs and forward as album to the user."""
             if not items:
                 return
-            # Build media list — Telegram caps groups at 10
+            # Telegram caps media groups at 10
             CHUNK = 10
             for i in range(0, len(items), CHUNK):
                 chunk = items[i : i + CHUNK]
-                media_list = []
-                backup_msgs = await bot.get_messages(
-                    BACKUP_GROUP_ID, [mid for mid, *_ in chunk]
-                )
-                if not isinstance(backup_msgs, list):
-                    backup_msgs = [backup_msgs]
-                for msg in backup_msgs:
-                    if not msg:
+                try:
+                    media_list = []
+                    backup_msgs = await bot.get_messages(
+                        BACKUP_GROUP_ID, [mid for mid, *_ in chunk]
+                    )
+                    if not isinstance(backup_msgs, list):
+                        backup_msgs = [backup_msgs]
+                    for msg in backup_msgs:
+                        if not msg or msg.empty:
+                            continue
+                        if msg.photo:
+                            media_list.append(InputMediaPhoto(msg.photo.file_id))
+                        elif msg.video:
+                            media_list.append(InputMediaVideo(msg.video.file_id))
+                        elif msg.document:
+                            media_list.append(InputMediaDocument(msg.document.file_id))
+
+                    if not media_list:
                         continue
-                    if msg.photo:
-                        media_list.append(InputMediaPhoto(msg.photo.file_id))
-                    elif msg.video:
-                        media_list.append(InputMediaVideo(msg.video.file_id))
-                    elif msg.document:
-                        media_list.append(InputMediaDocument(msg.document.file_id))
-                if media_list:
+
                     if len(media_list) == 1:
-                        # send_media_group requires ≥2 items
                         m = media_list[0]
                         if isinstance(m, InputMediaPhoto):
                             await bot.send_photo(user_id, m.media)
@@ -543,6 +603,18 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                             await bot.send_document(user_id, m.media)
                     else:
                         await bot.send_media_group(user_id, media_list)
+                except Exception as e:
+                    print(f"[TeraBox] _send_album_to_user chunk error: {e}")
+                    # Fallback: try sending individually via copy_message
+                    for mid, *_ in chunk:
+                        try:
+                            await bot.copy_message(
+                                chat_id=user_id,
+                                from_chat_id=BACKUP_GROUP_ID,
+                                message_id=mid,
+                            )
+                        except Exception as e2:
+                            print(f"[TeraBox] Fallback copy_message {mid} also failed: {e2}")
 
         # ---------- Send: photos album first ---------------------------------
         await _send_album_to_user(photos)
