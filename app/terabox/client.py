@@ -101,6 +101,8 @@ class TeraBoxClient:
         self._share_id: str = ""
         self._share_sign: str = ""
         self._share_timestamp: str = ""
+        # Verified sekey from share/verify (needed for share/list)
+        self._verified_sekey: str = ""
 
     # ---------------------------------------------------------------- helpers
 
@@ -779,6 +781,77 @@ class TeraBoxClient:
 
     # -------------------------------------------------------- short_url_list
 
+    async def _share_verify(
+        self, surl: str, domain: str, cookie_str: str, ua: str,
+    ) -> Optional[str]:
+        """
+        Call POST /share/verify to obtain a verified sekey cookie.
+
+        TeraBox requires this step even for non-password shares.
+        Returns the sekey value on success, or None.
+        """
+        verify_params = {
+            "surl": surl,
+            "t": str(int(__import__("time").time() * 1000)),
+            "channel": "dubox",
+            "web": "1",
+            "app_id": "250528",
+            "clienttype": "0",
+        }
+        if self.js_token:
+            verify_params["jsToken"] = self.js_token
+        if self.bds_token:
+            verify_params["bdstoken"] = self.bds_token
+
+        verify_url = f"{domain}/share/verify?" + urllib.parse.urlencode(verify_params)
+        print(f"[TB] share_verify → POST {domain}/share/verify (surl={surl})")
+
+        try:
+            connector = aiohttp.TCPConnector(ssl=None)
+            jar = self._share_jar or aiohttp.CookieJar(unsafe=True)
+            async with aiohttp.ClientSession(
+                connector=connector,
+                cookie_jar=jar,
+            ) as session:
+                async with session.post(
+                    verify_url,
+                    data={"pwd": ""},  # empty password for non-password shares
+                    headers={
+                        "User-Agent": ua,
+                        "Accept-Encoding": "identity",
+                        "Cookie": cookie_str,
+                        "Referer": f"{domain}/",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    allow_redirects=True,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    errno = data.get("errno", -1)
+                    final = f"{resp.url.scheme}://{resp.url.host}"
+                    print(f"[TB] share_verify ← HTTP {resp.status} | errno={errno} | final={final} | body={data}")
+
+                    if errno == 0:
+                        # Extract sekey from response or from updated jar cookies
+                        sekey = data.get("sekey", "")
+                        if not sekey:
+                            # Check if server set a new sekey/TSID cookie
+                            for c in jar:
+                                if c.key in ("sekey", "TSID"):
+                                    sekey = c.value
+                                    print(f"[TB] share_verify → got sekey from cookie {c.key} (len={len(sekey)})")
+                                    break
+                        else:
+                            print(f"[TB] share_verify → got sekey from response (len={len(sekey)})")
+                        # Update share jar with any new cookies
+                        self._share_jar = jar
+                        return sekey or None
+                    else:
+                        print(f"[TB] share_verify → failed errno={errno}")
+        except Exception as e:
+            print(f"[TB] share_verify error: {e}")
+        return None
+
     async def short_url_list(
         self, surl: str, remote_dir: str = "", page: int = 1,
         share_host: Optional[str] = None,
@@ -786,12 +859,49 @@ class TeraBoxClient:
         """
         List files in a TeraBox share.
 
-        Passes all required share auth tokens (uk, shareid, sign, timestamp,
-        sekey) as query params AND sekey/ndus as explicit Cookie header to
-        survive cross-domain redirects.
+        Calls share/verify first to obtain a verified sekey, then
+        passes all required tokens to share/list.
         """
         base = f"https://{share_host}" if share_host else self.domain
 
+        browser_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
+
+        # Build cookie string from ALL jar cookies
+        cookie_map: Dict[str, str] = {}
+        if self._share_jar:
+            for c in self._share_jar:
+                cookie_map[c.key] = c.value
+        cookie_map.setdefault("lang", "en")
+        cookie_map["ndus"] = self.ndus_token
+        cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_map.items())
+
+        # Determine which domain to use
+        domain = self._share_domain or base
+
+        # ---------- Step 1: share/verify to get sekey ----------
+        if not self._verified_sekey:
+            sekey = await self._share_verify(surl, domain, cookie_str, browser_ua)
+            if sekey:
+                self._verified_sekey = sekey
+                # Rebuild cookie string with updated jar
+                cookie_map = {}
+                if self._share_jar:
+                    for c in self._share_jar:
+                        cookie_map[c.key] = c.value
+                cookie_map.setdefault("lang", "en")
+                cookie_map["ndus"] = self.ndus_token
+                cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_map.items())
+
+        # Use the verified sekey, fall back to decoded randsk
+        sekey_value = self._verified_sekey or (
+            urllib.parse.unquote(self._randsk) if self._randsk else ""
+        )
+
+        # ---------- Step 2: share/list ----------
         params: Dict[str, str] = {
             "app_id": "250528",
             "web": "1",
@@ -808,8 +918,6 @@ class TeraBoxClient:
             params["jsToken"] = self.js_token
         if not remote_dir:
             params["root"] = "1"
-
-        # Include share auth tokens from shorturlinfo response
         if self._share_uk:
             params["uk"] = self._share_uk
         if self._share_id:
@@ -818,38 +926,18 @@ class TeraBoxClient:
             params["sign"] = self._share_sign
         if self._share_timestamp:
             params["timestamp"] = self._share_timestamp
-
-        decoded_randsk = urllib.parse.unquote(self._randsk) if self._randsk else ""
-        if decoded_randsk:
-            params["sekey"] = decoded_randsk
-
-        # Build explicit cookie string from ALL jar cookies — the explicit
-        # Cookie header overrides the jar so we must include everything.
-        cookie_map: Dict[str, str] = {}
-        if self._share_jar:
-            for c in self._share_jar:
-                cookie_map[c.key] = c.value
-        # Ensure essential cookies are present — but DON'T overwrite
-        # the server-set TSID; it's the correct share verification token.
-        cookie_map.setdefault("lang", "en")
-        cookie_map["ndus"] = self.ndus_token
-        cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_map.items())
-
-        browser_ua = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        )
+        if sekey_value:
+            params["sekey"] = sekey_value
 
         print(
             f"[TB] short_url_list → params: uk={params.get('uk','?')} "
             f"shareid={params.get('shareid','?')} sign={params.get('sign','?')[:8]}... "
-            f"ts={params.get('timestamp','?')} sekey_len={len(decoded_randsk)} "
-            f"dir={remote_dir!r} | cookies={list(cookie_map.keys())} "
-            f"| TSID={cookie_map.get('TSID', '??')[:20]}..."
+            f"ts={params.get('timestamp','?')} sekey_len={len(sekey_value)} "
+            f"sekey_src={'verify' if self._verified_sekey else 'randsk'} "
+            f"dir={remote_dir!r} | cookies={list(cookie_map.keys())}"
         )
 
-        # Try multiple domains — the jar domain, the share base, and self.domain
+        # Try multiple domains
         domains_to_try = []
         if self._share_domain:
             domains_to_try.append(self._share_domain)
@@ -884,7 +972,6 @@ class TeraBoxClient:
                         print(f"[TB] short_url_list ← HTTP {resp.status} | errno={errno} | files={file_count} | final={final}")
                         if errno == 0:
                             return data
-                        # Log full response for debugging auth failures
                         print(f"[TB] short_url_list → errno={errno} body={data}")
                         print(f"[TB] short_url_list → trying next domain...")
             except Exception as e:
