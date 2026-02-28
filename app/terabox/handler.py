@@ -426,7 +426,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         await status_msg.edit("🔗 Mendapatkan link muat turun…")
         my_fs_ids = [int(f["fs_id"]) for f in all_files]
 
-        DLINK_BATCH = 20  # TeraBox may limit how many dlinks per request
+        DLINK_BATCH = 5  # TeraBox may limit how many dlinks per request
         dlink_map: Dict[int, str] = {}
 
         for batch_start in range(0, len(my_fs_ids), DLINK_BATCH):
