@@ -92,6 +92,10 @@ class TeraBoxClient:
         self._session: Optional[aiohttp.ClientSession] = None
         # Saved cookie jar from successful share-page scrape
         self._share_jar: Optional[aiohttp.CookieJar] = None
+        # randsk token from share verification (needed as cookie for share/list)
+        self._randsk: str = ""
+        # Domain that actually served the share data (after redirects)
+        self._share_domain: str = ""
 
     # ---------------------------------------------------------------- helpers
 
@@ -309,6 +313,7 @@ class TeraBoxClient:
         page_data = await self._scrape_share_page(base, surl)
         if page_data and page_data.get("shareid"):
             print(f"[TB] short_url_info → got data from scrape")
+            self._apply_randsk(page_data)
             return {**page_data, "errno": 0}
 
         # -------- Strategy 2: REST API with multiple configs --------
@@ -365,6 +370,20 @@ class TeraBoxClient:
 
         print(f"[TB] short_url_info → all strategies exhausted")
         return last_data
+
+    def _apply_randsk(self, data: Dict[str, Any]) -> None:
+        """Extract randsk from an API response and inject into cookie jar."""
+        randsk = data.get("randsk", "")
+        if not randsk:
+            return
+        self._randsk = randsk
+        print(f"[TB] _apply_randsk → stored randsk (len={len(randsk)})")
+        if self._share_jar and self._share_domain:
+            self._share_jar.update_cookies(
+                {"TSID": randsk, "randsk": randsk},
+                yarl.URL(self._share_domain),
+            )
+            print(f"[TB] _apply_randsk → injected into jar for {self._share_domain}")
 
     async def _scrape_share_page(
         self, base_url: str, surl: str
@@ -483,6 +502,7 @@ class TeraBoxClient:
                             timeout=aiohttp.ClientTimeout(total=25),
                         ) as resp:
                             html = await resp.text(errors="replace")
+                            resp_domain = f"{resp.url.scheme}://{resp.url.host}"
                             print(
                                 f"[TB]   {desc} ← HTTP {resp.status} | len={len(html)} "
                                 f"| final={resp.url}"
@@ -504,6 +524,7 @@ class TeraBoxClient:
                     if result and result.get("shareid"):
                         print(f"[TB]   {desc} → SUCCESS shareid={result['shareid']}")
                         self._share_jar = jar
+                        self._share_domain = resp_domain
                         return result
 
                 # ------ Step 3: Try the REST API with accumulated session cookies ------
@@ -524,9 +545,12 @@ class TeraBoxClient:
                     ) as resp:
                         data = await resp.json(content_type=None)
                         errno = data.get("errno", -1)
-                        print(f"[TB]   API ← HTTP {resp.status} | errno={errno}")
+                        final_domain = f"{resp.url.scheme}://{resp.url.host}"
+                        print(f"[TB]   API ← HTTP {resp.status} | errno={errno} | final={final_domain}")
                         if errno == 0:
                             self._share_jar = jar
+                            self._share_domain = final_domain
+                            self._apply_randsk(data)
                             return data
                 except Exception as e:
                     print(f"[TB]   API error: {e}")
@@ -735,7 +759,15 @@ class TeraBoxClient:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/131.0.0.0 Safari/537.36"
             )
-            url = f"{base}/share/list?" + urllib.parse.urlencode(params)
+            # Ensure randsk is in the jar for share verification
+            if self._randsk and self._share_domain:
+                self._share_jar.update_cookies(
+                    {"TSID": self._randsk, "randsk": self._randsk},
+                    yarl.URL(self._share_domain),
+                )
+            # Use the domain that actually served the share data (after redirects)
+            list_base = self._share_domain or base
+            url = f"{list_base}/share/list?" + urllib.parse.urlencode(params)
             print(f"[TB] short_url_list(jar) → GET {url[:200]}")
             try:
                 connector = aiohttp.TCPConnector(ssl=None)
