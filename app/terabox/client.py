@@ -114,6 +114,47 @@ class TeraBoxClient:
             await self._session.close()
             self._session = None
 
+    # --------------------------------------------------------- _extract_js_token
+
+    @staticmethod
+    def _extract_js_token(html: str) -> str:
+        """
+        Extract the actual jsToken value from an HTML page.
+
+        TeraBox embeds jsToken in two known formats:
+          1. jsToken = "HEXSTRING"                     → direct value
+          2. jsToken = "function fn(a){...};fn(\"HEXSTRING\")"  → wrapped in fn()
+
+        In case (2) the first regex captures the whole wrapper.  We detect
+        that and extract the fn() argument instead.
+        """
+        # Step 1: Try the fn("...") pattern first — this is the cleanest.
+        fn_match = re.search(r'fn\(\\?"([A-Fa-f0-9]{32,})\\?"\)', html)
+        if fn_match:
+            return fn_match.group(1)
+
+        # Step 2: Broad capture of jsToken = "..." (may include the fn wrapper)
+        m = (
+            re.search(r'jsToken\s*=\s*"([^"]+)"', html)
+            or re.search(r"jsToken\s*=\s*'([^']+)'", html)
+            or re.search(r'"jsToken"\s*:\s*"([^"]+)"', html)
+        )
+        if not m:
+            return ""
+
+        raw = m.group(1)
+
+        # Step 3: If the captured value contains fn(), extract just the argument.
+        inner = re.search(r'fn\(\\?"([A-Fa-f0-9]{32,})\\?"\)', raw)
+        if inner:
+            return inner.group(1)
+
+        # Step 4: If it looks like code / not a token, reject it.
+        if "function" in raw or "{" in raw:
+            return ""
+
+        return raw
+
     # -------------------------------------------------------- update_app_data
 
     async def update_app_data(self, custom_path: Optional[str] = None) -> bool:
@@ -141,15 +182,7 @@ class TeraBoxClient:
                     print(f"[TB] update_app_data ← HTTP {resp.status} | html_len={len(html)}")
 
             # Extract jsToken — try multiple patterns
-            js_token_match = (
-                re.search(r'jsToken\s*=\s*"([^"]+)"', html)
-                or re.search(r"jsToken\s*=\s*'([^']+)'", html)
-                or re.search(r'"jsToken"\s*:\s*"([^"]+)"', html)
-                or re.search(r"js_token.{0,3}:\s*.([A-Za-z0-9_+/=%-]{20,})", html, re.IGNORECASE)
-                or re.search(r'fn\("([A-Za-z0-9_+/=%-]{20,})"\)', html)
-            )
-            if js_token_match:
-                self.js_token = js_token_match.group(1)
+            self.js_token = self._extract_js_token(html)
 
             # Extract templateData JSON blob
             template_match = re.search(
@@ -302,14 +335,9 @@ class TeraBoxClient:
                         html = await resp.text(errors="replace")
                         print(f"[TB] _fetch_js_token_from ← HTTP {resp.status} | html_len={len(html)}")
 
-                js_match = (
-                    re.search(r'jsToken\s*=\s*"([^"]+)"', html)
-                    or re.search(r"jsToken\s*=\s*'([^']+)'", html)
-                    or re.search(r'"jsToken"\s*:\s*"([^"]+)"', html)
-                    or re.search(r'fn\("([^"]{20,})"\)', html)
-                )
+                js_match = self._extract_js_token(html)
                 if js_match:
-                    self.js_token = js_match.group(1)
+                    self.js_token = js_match
                     print(f"[TB] _fetch_js_token_from → jsToken OK (from {path or 'root'})")
 
                 bds_match = re.search(r'"bdstoken"\s*:\s*"([^"]+)"', html)
