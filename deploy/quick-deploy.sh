@@ -53,7 +53,7 @@ echo -e "${BLUE}Running fresh installation...${NC}"
 
 # Install dependencies
 apt update
-apt install -y python3.12 python3.12-venv python3-pip
+apt install -y python3.12 python3.12-venv python3-pip unrar
 
 # Create user
 if ! id "$BOT_USER" &>/dev/null; then

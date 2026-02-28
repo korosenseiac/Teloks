@@ -84,6 +84,10 @@ async def handle_main_menu_callback(client: Client, callback_query: CallbackQuer
             "2️⃣ **Dapatkan Link** - Copy mesej link dari private channel/group. Contohnya:\n"
             "`https://t.me/c/1234567890/123`\n\n"
             "3️⃣ **Send Link** - Paste link yang korang copy kat sini. Nanti bot akan forward contentnya\n\n"
+            "📦 **MediaFire** - Boleh juga hantar link MediaFire:\n"
+            "`https://www.mediafire.com/file/abc123/file.zip/file`\n"
+            "Bot akan muat turun dan hantar media (foto/video). "
+            "Kalau fail ZIP/RAR, bot akan extract dan hantar media sahaja.\n\n"
         )
         existing_session = await get_user_session(user_id)
         is_logged_in = existing_session is not None

@@ -59,50 +59,13 @@ TERABOX_LINK_PATTERN = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# File classification helpers
+# File classification helpers (delegated to shared module)
 # ---------------------------------------------------------------------------
 
-PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".ts"}
-AUDIO_EXTS = {".mp3", ".flac", ".aac", ".ogg", ".m4a", ".wav", ".opus"}
-
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
-
-
-def _ext(name: str) -> str:
-    return os.path.splitext(name)[1].lower()
-
-
-def _classify(name: str) -> str:
-    """Return 'photo', 'video', 'audio', or 'document'."""
-    e = _ext(name)
-    if e in PHOTO_EXTS:
-        return "photo"
-    if e in VIDEO_EXTS:
-        return "video"
-    if e in AUDIO_EXTS:
-        return "audio"
-    return "document"
-
-
-def _mime(name: str, category: int = 0) -> str:
-    """Best-effort MIME type from extension / TeraBox category code."""
-    e = _ext(name)
-    mapping = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png", ".webp": "image/webp",
-        ".gif": "image/gif", ".mp4": "video/mp4",
-        ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
-        ".mov": "video/quicktime", ".webm": "video/webm",
-        ".flv": "video/x-flv", ".m4v": "video/x-m4v",
-        ".ts": "video/mp2t", ".mp3": "audio/mpeg",
-        ".flac": "audio/flac", ".aac": "audio/aac",
-        ".ogg": "audio/ogg", ".m4a": "audio/x-m4a",
-        ".wav": "audio/wav", ".opus": "audio/opus",
-        ".pdf": "application/pdf",
-        ".zip": "application/zip",
-    }
-    return mapping.get(e, "application/octet-stream")
+from app.utils.media import (
+    PHOTO_EXTS, VIDEO_EXTS, AUDIO_EXTS, MAX_FILE_SIZE,
+    ext as _ext, classify as _classify, mime as _mime,
+)
 
 
 # ---------------------------------------------------------------------------
