@@ -37,6 +37,9 @@ from pyrogram.raw.types import (
     InputFile,
     UpdateNewChannelMessage,
     UpdateNewMessage,
+    UpdateShort,
+    UpdateShortSentMessage,
+    UpdateMessageID,
 )
 from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 
@@ -275,9 +278,54 @@ async def _upload_terabox_file_to_backup(
             )
         )
 
-        for update in updates.updates:
-            if isinstance(update, (UpdateNewMessage, UpdateNewChannelMessage)):
-                return update.message.id
+        # Extract message_id from various response types
+        msg_id = None
+
+        # Case 1: UpdateShortSentMessage — has .id directly
+        if isinstance(updates, UpdateShortSentMessage):
+            msg_id = updates.id
+
+        # Case 2: UpdateShort — has .update (singular)
+        elif isinstance(updates, UpdateShort):
+            upd = updates.update
+            if isinstance(upd, (UpdateNewMessage, UpdateNewChannelMessage)):
+                msg_id = upd.message.id
+
+        # Case 3: Updates / UpdatesCombined — has .updates (list)
+        elif hasattr(updates, "updates"):
+            for upd in updates.updates:
+                if isinstance(upd, (UpdateNewMessage, UpdateNewChannelMessage)):
+                    msg_id = upd.message.id
+                    break
+
+        if msg_id:
+            return msg_id
+
+        # Fallback: scan recent messages in the backup group
+        print(f"[TeraBox] WARNING: Could not extract msg_id from SendMedia response type={type(updates).__name__} for {file_name}")
+        print(f"[TeraBox] Response: {updates}")
+
+        # Try to find the just-uploaded message by searching recent messages
+        try:
+            recent = await bot.get_messages(
+                BACKUP_GROUP_ID, list(range(-1, -4, -1))  # last 3 messages
+            )
+            if not isinstance(recent, list):
+                recent = [recent]
+            for msg in recent:
+                if msg and not getattr(msg, "empty", False):
+                    fname = None
+                    if msg.document:
+                        fname = msg.document.file_name
+                    elif msg.video:
+                        fname = msg.video.file_name
+                    elif msg.audio:
+                        fname = msg.audio.file_name
+                    if fname == file_name:
+                        print(f"[TeraBox] Fallback: found msg_id={msg.id} for {file_name}")
+                        return msg.id
+        except Exception as fb_err:
+            print(f"[TeraBox] Fallback search failed: {fb_err}")
 
         return None
 
