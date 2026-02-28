@@ -153,7 +153,7 @@ class MediaFireClient:
     async def download_stream(
         self,
         direct_url: str,
-        chunk_size: int = 2 * 1024 * 1024,
+        chunk_size: int = 1024 * 1024,
     ) -> AsyncGenerator[bytes, None]:
         """
         Async generator that yields *chunk_size* byte chunks from *direct_url*.

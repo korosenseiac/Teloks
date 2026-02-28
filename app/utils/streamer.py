@@ -143,7 +143,7 @@ async def upload_stream(client: Client, streamer, file_name: str, on_upload_chun
     total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
 
     # --- Concurrent upload machinery ----------------------------------------
-    UPLOAD_WORKERS = 8 if is_big else 1
+    UPLOAD_WORKERS = 3 if is_big else 1  # Low worker count to limit memory on small VPS
     sem = asyncio.Semaphore(UPLOAD_WORKERS)
     pending: list = []
 
@@ -198,8 +198,8 @@ async def upload_stream(client: Client, streamer, file_name: str, on_upload_chun
             bytes_uploaded += len(part_data)
             part_count += 1
 
-            # Housekeeping: collect finished tasks periodically to cap memory
-            if len(pending) >= UPLOAD_WORKERS * 3:
+            # Housekeeping: collect finished tasks aggressively to free memory
+            if len(pending) >= UPLOAD_WORKERS * 2:
                 done, still_pending = await asyncio.wait(
                     pending, return_when=asyncio.FIRST_COMPLETED
                 )

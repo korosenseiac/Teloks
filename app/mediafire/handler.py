@@ -17,6 +17,7 @@ Flow
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import random
 import re
@@ -58,7 +59,7 @@ from app.utils.media import (
 )
 from app.mediafire.client import MediaFireClient
 from app.mediafire.streamer import MediaFireStreamer, FileStreamer
-from app.mediafire.archive import extract_media_from_archive
+from app.mediafire.archive import extract_media_from_archive, iter_extract_media, count_media_in_archive
 from app.terabox.progress import ProgressTracker
 
 # ---------------------------------------------------------------------------
@@ -779,7 +780,17 @@ async def _handle_archive(
     filename: str,
     file_size: int,
 ) -> None:
-    """Download archive, extract media, upload each, send albums to user."""
+    """Download archive, extract media ONE AT A TIME, upload each, send albums to user.
+
+    Memory-efficient approach for low-RAM VPS:
+    1. Stream-download the archive to disk.
+    2. Count media files inside (metadata scan, no extraction).
+    3. Extract one file → upload it → delete it → next file.
+    4. Delete the archive after all files are processed.
+    5. Send albums to user.
+    """
+    import gc
+
     temp_dir = tempfile.mkdtemp(prefix="mf_archive_")
 
     try:
@@ -805,52 +816,47 @@ async def _handle_archive(
 
         await dl_tracker.stop()
 
-        # ----- Phase 2: Extract media files -----
-        await status_msg.edit("📂 Mengekstrak fail media dari arkib…")
+        # Close the MediaFire HTTP session early to free resources
+        await mf_client.close()
 
-        extract_dir = os.path.join(temp_dir, "extracted")
-        os.makedirs(extract_dir, exist_ok=True)
+        # ----- Phase 2: Count media files (metadata only, no extraction) -----
+        await status_msg.edit("📂 Mengimbas fail media dalam arkib…")
 
-        try:
-            media_files = await extract_media_from_archive(archive_path, extract_dir)
-        except ValueError as e:
-            await status_msg.edit(f"❌ {e}")
-            return
+        loop = asyncio.get_running_loop()
+        total_files = await loop.run_in_executor(
+            None, count_media_in_archive, archive_path
+        )
 
-        if not media_files:
+        if total_files == 0:
             await status_msg.edit(
                 "❌ Tiada fail media (foto/video) dijumpai dalam arkib."
             )
             return
 
-        # Delete the archive to free disk space
-        try:
-            os.remove(archive_path)
-        except OSError:
-            pass
+        extract_dir = os.path.join(temp_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
 
-        # Validate individual file sizes
-        oversized = [f for f in media_files if f["size"] > MAX_FILE_SIZE]
-        if oversized:
-            names = "\n".join(
-                f"• `{f['name']}` ({_format_size(f['size'])})"
-                for f in oversized
-            )
-            await status_msg.edit(
-                f"❌ **{len(oversized)} fail melebihi had 2 GB:**\n\n{names}"
-            )
-            return
-
-        total_files = len(media_files)
         await status_msg.edit(
             f"📤 Memuat naik {total_files} fail media ke Telegram…"
         )
 
-        # ----- Phase 3: Upload each extracted media file -----
+        # ----- Phase 3: Extract & upload ONE AT A TIME -----
         uploaded: List[Tuple[int, str, str, int]] = []
         MAX_RETRIES = 3
+        idx = 0
 
-        for idx, mf in enumerate(media_files, 1):
+        async for mf in iter_extract_media(archive_path, extract_dir):
+            idx += 1
+
+            # Validate individual file size
+            if mf["size"] > MAX_FILE_SIZE:
+                print(f"[MediaFire] Skipping oversized file: {mf['name']} ({_format_size(mf['size'])})")
+                try:
+                    os.remove(mf["path"])
+                except OSError:
+                    pass
+                continue
+
             # Generate thumbnail & metadata for videos (ffmpeg)
             thumb_raw = None
             video_meta = None
@@ -909,15 +915,28 @@ async def _handle_archive(
             else:
                 print(f"[MediaFire] Skipping {mf['name']} — upload failed after {MAX_RETRIES} attempts.")
 
-            # Delete extracted file after upload to free space incrementally
+            # Delete extracted file IMMEDIATELY after upload to free disk/memory
             try:
                 os.remove(mf["path"])
             except OSError:
                 pass
 
+            # Release thumbnail memory
+            thumb_raw = None
+            video_meta = None
+
+            # Hint garbage collector to reclaim memory between files
+            gc.collect()
+
             # Delay between uploads to avoid Telegram rate limits
             if idx < total_files:
                 await asyncio.sleep(2)
+
+        # Delete the archive now that all files are processed
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
 
         if not uploaded:
             await status_msg.edit("❌ Semua fail gagal dimuat naik.")
@@ -932,3 +951,4 @@ async def _handle_archive(
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
             print(f"[MediaFire] Failed to clean temp dir {temp_dir}: {e}")
+        gc.collect()

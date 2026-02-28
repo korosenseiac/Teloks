@@ -43,7 +43,7 @@ class MediaFireStreamer:
         Progress callback invoked with byte count after each chunk.
     """
 
-    CHUNK_SIZE: int = 2 * 1024 * 1024  # 2 MB
+    CHUNK_SIZE: int = 1024 * 1024  # 1 MB — keep low for 2GB RAM VPS
 
     def __init__(
         self,
@@ -59,7 +59,8 @@ class MediaFireStreamer:
         self.name = file_name
         self.on_download_chunk = on_download_chunk
 
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=32)
+        # Keep queue small to limit memory: 4 * 2MB = 8MB max buffered
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=4)
         self.current_offset: int = 0
         self.download_task: Optional[asyncio.Task] = None
         self.is_downloading: bool = True
@@ -134,7 +135,7 @@ class FileStreamer:
         Progress callback (called as chunks are read from disk).
     """
 
-    CHUNK_SIZE: int = 2 * 1024 * 1024  # 2 MB
+    CHUNK_SIZE: int = 1024 * 1024  # 1 MB — keep low for 2GB RAM VPS
 
     def __init__(
         self,
@@ -147,7 +148,8 @@ class FileStreamer:
         self.name = file_name
         self.on_download_chunk = on_download_chunk
 
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=16)
+        # Keep queue small to limit memory: 4 * 2MB = 8MB max buffered
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=4)
         self.current_offset: int = 0
         self.download_task: Optional[asyncio.Task] = None
         self.is_downloading: bool = True
@@ -161,25 +163,30 @@ class FileStreamer:
     # ----------------------------------------------------------------- reader
 
     async def _reader(self) -> None:
-        """Read the file in chunks and enqueue them."""
+        """Read the file in chunks and enqueue them one at a time.
+
+        IMPORTANT: We read one chunk at a time via run_in_executor
+        instead of loading the whole file into a list. This keeps
+        memory usage bounded to (queue_maxsize * CHUNK_SIZE).
+        """
         loop = asyncio.get_running_loop()
         try:
-            # Use run_in_executor to avoid blocking the event loop on disk I/O
-            def _blocking_read():
-                chunks = []
-                with open(self.file_path, "rb") as f:
-                    while True:
-                        data = f.read(self.CHUNK_SIZE)
-                        if not data:
-                            break
-                        chunks.append(data)
-                return chunks
-
-            chunks = await loop.run_in_executor(None, _blocking_read)
-            for chunk in chunks:
-                await self.queue.put(chunk)
-                if self.on_download_chunk:
-                    self.on_download_chunk(len(chunk))
+            # Open file handle once, read chunks one at a time
+            fh = await loop.run_in_executor(
+                None, lambda: open(self.file_path, "rb")
+            )
+            try:
+                while True:
+                    data = await loop.run_in_executor(
+                        None, fh.read, self.CHUNK_SIZE
+                    )
+                    if not data:
+                        break
+                    await self.queue.put(data)
+                    if self.on_download_chunk:
+                        self.on_download_chunk(len(data))
+            finally:
+                await loop.run_in_executor(None, fh.close)
         except Exception as e:
             print(f"[FileStreamer] Read error: {e}")
         finally:
