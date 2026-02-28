@@ -90,6 +90,8 @@ class TeraBoxClient:
         self.account_id: str = ""
         # Shared aiohttp session (created lazily)
         self._session: Optional[aiohttp.ClientSession] = None
+        # Saved cookie jar from successful share-page scrape
+        self._share_jar: Optional[aiohttp.CookieJar] = None
 
     # ---------------------------------------------------------------- helpers
 
@@ -130,6 +132,14 @@ class TeraBoxClient:
         In case (2) the value is URL-encoded inside the quotes, so we
         URL-decode it first, then extract the fn() argument.
         """
+        # Step 0: Handle eval(decodeURIComponent(`...jsToken...`))
+        duri_match = re.search(r'decodeURIComponent\(`([^`]*jsToken[^`]*)`\)', html)
+        if duri_match:
+            decoded_block = urllib.parse.unquote(duri_match.group(1))
+            inner = re.search(r'fn\("([A-Fa-f0-9]{32,})"\)', decoded_block)
+            if inner:
+                return inner.group(1)
+
         # Step 1: Try fn("HEX") directly in the raw HTML (unlikely but free)
         fn_match = re.search(r'fn\(\\?"([A-Fa-f0-9]{32,})\\?"\)', html)
         if fn_match:
@@ -484,13 +494,16 @@ class TeraBoxClient:
                         print(f"[TB]   {desc} error: {e}")
                         continue
 
+                    # Always extract jsToken from every fetched page
+                    js = self._extract_js_token(html)
+                    if js:
+                        self.js_token = js
+                        print(f"[TB]   {desc} → got jsToken")
+
                     result = self._parse_share_html(html)
                     if result and result.get("shareid"):
                         print(f"[TB]   {desc} → SUCCESS shareid={result['shareid']}")
-                        # Bonus: grab jsToken from this page
-                        js = self._extract_js_token(html)
-                        if js:
-                            self.js_token = js
+                        self._share_jar = jar
                         return result
 
                 # ------ Step 3: Try the REST API with accumulated session cookies ------
@@ -513,6 +526,7 @@ class TeraBoxClient:
                         errno = data.get("errno", -1)
                         print(f"[TB]   API ← HTTP {resp.status} | errno={errno}")
                         if errno == 0:
+                            self._share_jar = jar
                             return data
                 except Exception as e:
                     print(f"[TB]   API error: {e}")
@@ -691,26 +705,14 @@ class TeraBoxClient:
     ) -> Optional[Dict[str, Any]]:
         """
         List files in a TeraBox share.
-        Mirrors TeraBoxApp#shortUrlList (lines 2061–2112 of api.js).
-        Fetches jsToken first if not already obtained.
 
-        share_host : str, optional
-            Hostname from the original share URL. API is called on this host.
+        Strategy 1: Reuse the saved cookie jar from the successful scrape.
+        Strategy 2: Fall back to regular jsToken-based API call.
         """
         base = f"https://{share_host}" if share_host else self.domain
 
-        if not self.js_token:
-            if share_host and share_host not in self.domain:
-                await self._fetch_js_token_from(base)
-            else:
-                await self.update_app_data()
-
         params = {
             "app_id": "250528",
-            "web": "1",
-            "channel": "dubox",
-            "clienttype": "0",
-            "jsToken": self.js_token,
             "shorturl": surl,
             "by": "name",
             "order": "asc",
@@ -721,8 +723,56 @@ class TeraBoxClient:
         if not remote_dir:
             params["root"] = "1"
 
-        url = f"{base}/share/list?" + urllib.parse.urlencode(params)
-        print(f"[TB] short_url_list → GET {url}")
+        # Strategy 1: Use saved share session cookies
+        if self._share_jar:
+            browser_ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            )
+            url = f"{base}/share/list?" + urllib.parse.urlencode(params)
+            print(f"[TB] short_url_list(jar) → GET {url}")
+            try:
+                connector = aiohttp.TCPConnector(ssl=None)
+                async with aiohttp.ClientSession(
+                    connector=connector,
+                    cookie_jar=self._share_jar,
+                ) as session:
+                    async with session.get(
+                        url,
+                        headers={
+                            "User-Agent": browser_ua,
+                            "Accept-Encoding": "identity",
+                        },
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                        errno = data.get("errno", -1)
+                        file_count = len(data.get("list", []))
+                        print(f"[TB] short_url_list(jar) ← HTTP {resp.status} | errno={errno} | files={file_count}")
+                        if errno == 0:
+                            return data
+                        print(f"[TB] short_url_list(jar) → failed, trying token approach")
+            except Exception as e:
+                print(f"[TB] short_url_list(jar) error: {e}")
+
+        # Strategy 2: jsToken-based API call
+        if not self.js_token:
+            if share_host and share_host not in self.domain:
+                await self._fetch_js_token_from(base)
+            else:
+                await self.update_app_data()
+
+        token_params = {
+            **params,
+            "web": "1",
+            "channel": "dubox",
+            "clienttype": "0",
+            "jsToken": self.js_token,
+        }
+        url = f"{base}/share/list?" + urllib.parse.urlencode(token_params)
+        print(f"[TB] short_url_list(token) → GET {url}")
         try:
             async with self._session_for(restricted=True) as session:
                 async with session.get(
@@ -730,10 +780,10 @@ class TeraBoxClient:
                 ) as resp:
                     data = await resp.json(content_type=None)
                     file_count = len(data.get("list", []))
-                    print(f"[TB] short_url_list ← HTTP {resp.status} | errno={data.get('errno')} | files={file_count}")
+                    print(f"[TB] short_url_list(token) ← HTTP {resp.status} | errno={data.get('errno')} | files={file_count}")
                     return data
         except Exception as e:
-            print(f"[TB] short_url_list error: {e}")
+            print(f"[TB] short_url_list(token) error: {e}")
             return None
 
     # -------------------------------------------------------- share_transfer

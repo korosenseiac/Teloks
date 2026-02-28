@@ -285,11 +285,11 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         await status_msg.edit("📂 Mengimbas fail dalam share…")
 
         # If the share page scrape already returned a file_list, use it directly
-        scraped_files = info.get("file_list", [])
+        scraped_files = info.get("file_list") or info.get("list", [])
         if scraped_files:
             # Flatten: filter out directories (they need recursive listing)
-            all_files = [f for f in scraped_files if not f.get("isdir")]
-            dirs = [f for f in scraped_files if f.get("isdir")]
+            all_files = [f for f in scraped_files if str(f.get("isdir", "0")) == "0"]
+            dirs = [f for f in scraped_files if str(f.get("isdir", "0")) != "0"]
             # Recursively enumerate subdirectories via API
             for d in dirs:
                 sub = await _collect_files(
