@@ -232,14 +232,31 @@ async def _upload_terabox_file_to_backup(
                 attributes=[DocumentAttributeFilename(file_name=file_name)],
             )
 
-        updates = await bot.invoke(
-            SendMedia(
-                peer=backup_peer,
-                media=media,
-                message="",
-                random_id=random.randint(0, 2 ** 63 - 1),
-            )
-        )
+        # Retry SendMedia with FloodWait handling
+        SEND_RETRIES = 5
+        updates = None
+        for send_attempt in range(1, SEND_RETRIES + 1):
+            try:
+                updates = await bot.invoke(
+                    SendMedia(
+                        peer=backup_peer,
+                        media=media,
+                        message="",
+                        random_id=random.randint(0, 2 ** 63 - 1),
+                    )
+                )
+                break  # success
+            except FloodWait as fw:
+                wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 15)
+                print(f"[TeraBox] FloodWait {wait}s on SendMedia for {file_name} (attempt {send_attempt}/{SEND_RETRIES})")
+                if send_attempt < SEND_RETRIES:
+                    await asyncio.sleep(wait + 2)
+                else:
+                    print(f"[TeraBox] SendMedia exhausted retries for {file_name}")
+                    return None
+
+        if updates is None:
+            return None
 
         # Extract message_id from various response types
         msg_id = None
@@ -508,7 +525,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # Collect: (backup_msg_id, kind, name, size)
         uploaded: List[Tuple[int, str, str, int]] = []
         total_up = len(enriched)
-        MAX_RETRIES = 2
+        MAX_RETRIES = 5
 
         for idx, entry in enumerate(enriched, 1):
             # Create and start progress tracker for this file
@@ -552,6 +569,10 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 tracker._ul_samples.clear()
 
             await tracker.stop()
+
+            # Small delay between files to reduce FloodWait pressure
+            await asyncio.sleep(1.5)
+
             if bmid:
                 uploaded.append((bmid, entry["kind"], entry["name"], entry["size"]))
                 # Log each upload
