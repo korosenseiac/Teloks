@@ -96,6 +96,11 @@ class TeraBoxClient:
         self._randsk: str = ""
         # Domain that actually served the share data (after redirects)
         self._share_domain: str = ""
+        # Share auth tokens from shorturlinfo (needed for share/list)
+        self._share_uk: str = ""
+        self._share_id: str = ""
+        self._share_sign: str = ""
+        self._share_timestamp: str = ""
 
     # ---------------------------------------------------------------- helpers
 
@@ -372,18 +377,35 @@ class TeraBoxClient:
         return last_data
 
     def _apply_randsk(self, data: Dict[str, Any]) -> None:
-        """Extract randsk from an API response and inject into cookie jar."""
+        """Extract share auth tokens from an API response and store them."""
         randsk = data.get("randsk", "")
-        if not randsk:
-            return
-        self._randsk = randsk
-        print(f"[TB] _apply_randsk → stored randsk (len={len(randsk)})")
-        if self._share_jar and self._share_domain:
-            self._share_jar.update_cookies(
-                {"TSID": randsk, "randsk": randsk},
-                yarl.URL(self._share_domain),
-            )
-            print(f"[TB] _apply_randsk → injected into jar for {self._share_domain}")
+        if randsk:
+            self._randsk = randsk
+            print(f"[TB] _apply_share_tokens → stored randsk (len={len(randsk)})")
+            if self._share_jar and self._share_domain:
+                decoded_randsk = urllib.parse.unquote(randsk)
+                self._share_jar.update_cookies(
+                    {"TSID": decoded_randsk, "randsk": decoded_randsk},
+                    yarl.URL(self._share_domain),
+                )
+                print(f"[TB] _apply_share_tokens → injected into jar for {self._share_domain}")
+
+        # Store share identifiers needed for share/list
+        for src, attr in [
+            ("uk", "_share_uk"), ("uk_str", "_share_uk"),
+            ("shareid", "_share_id"),
+            ("sign", "_share_sign"),
+            ("timestamp", "_share_timestamp"),
+        ]:
+            val = data.get(src)
+            if val and not getattr(self, attr, ""):
+                setattr(self, attr, str(val))
+
+        print(
+            f"[TB] _apply_share_tokens → uk={self._share_uk} "
+            f"shareid={self._share_id} sign={self._share_sign[:8] if self._share_sign else '?'}... "
+            f"ts={self._share_timestamp}"
+        )
 
     async def _scrape_share_page(
         self, base_url: str, surl: str
@@ -751,6 +773,18 @@ class TeraBoxClient:
             params["jsToken"] = self.js_token
         if not remote_dir:
             params["root"] = "1"
+
+        # Include share auth tokens from shorturlinfo response
+        if self._share_uk:
+            params["uk"] = self._share_uk
+        if self._share_id:
+            params["shareid"] = self._share_id
+        if self._share_sign:
+            params["sign"] = self._share_sign
+        if self._share_timestamp:
+            params["timestamp"] = self._share_timestamp
+        if self._randsk:
+            params["sekey"] = urllib.parse.unquote(self._randsk)
 
         # Strategy 1: Use saved share session cookies
         if self._share_jar:
