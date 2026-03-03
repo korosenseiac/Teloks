@@ -473,10 +473,44 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 )
                 return
 
-        # 4. List OUR temp folder recursively (api/list, not share/list)
+        # 4. Wait for async transfer task to complete, then list files
+        task_id = transfer_result.get("task_id") if transfer_result else None
+        if task_id:
+            await status_msg.edit("⏳ Menunggu pemindahan selesai…")
+            print(f"[TB:handler] async task_id={task_id}, polling…")
+            for poll_i in range(60):                       # max ~120 s
+                await asyncio.sleep(2)
+                task_resp = await tb.query_share_task(str(task_id))
+                if task_resp:
+                    t_status = task_resp.get("status", -1)
+                    t_errno  = task_resp.get("errno", -1)
+                    print(f"[TB:handler] task poll #{poll_i+1}: status={t_status} errno={t_errno}")
+                    # status == 2 ⇒ completed (or errno==0 && no status field)
+                    if t_status == 2 or (t_status == -1 and t_errno == 0):
+                        print(f"[TB:handler] task completed on poll #{poll_i+1}")
+                        break
+                    if t_status == 3:            # failed
+                        print(f"[TB:handler] task FAILED: {task_resp}")
+                        await status_msg.edit("❌ Pemindahan gagal di sisi TeraBox.")
+                        return
+            else:
+                print("[TB:handler] task polling timed out after 120s")
+
+        # Give TeraBox a moment to finalise the listing
+        await asyncio.sleep(1)
+
         await status_msg.edit("📂 Mengimbas fail yang dipindahkan…")
-        all_files = await _collect_own_files(tb, temp_folder)
-        print(f"[TB:handler] collected {len(all_files)} file(s) from own dir")
+
+        # Retry _collect_own_files a few times in case listing is delayed
+        all_files: List[Dict[str, Any]] = []
+        for list_attempt in range(5):
+            all_files = await _collect_own_files(tb, temp_folder)
+            print(f"[TB:handler] collected {len(all_files)} file(s) from own dir (attempt {list_attempt+1})")
+            if all_files:
+                break
+            print(f"[TB:handler] no files yet, retrying in 3s…")
+            await asyncio.sleep(3)
+
         if all_files:
             for f in all_files[:5]:
                 print(f"  └ {f.get('server_filename')} size={f.get('size')} fs_id={f.get('fs_id')}")

@@ -1001,6 +1001,45 @@ class TeraBoxClient:
             continue
         return None
 
+    # -------------------------------------------------------- query_share_task
+
+    async def query_share_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Poll the status of an async share_transfer task.
+
+        Returns the raw JSON.  Typical fields:
+          - ``status``: 0 = pending, 1 = running, 2 = completed, 3 = failed
+          - ``errno``: 0 on success
+          - ``progress``: percentage (0-100) for some tasks
+        """
+        if not self.js_token or not self.bds_token:
+            await self.update_app_data()
+
+        params = urllib.parse.urlencode(
+            {
+                "taskid": task_id,
+                "app_id": "250528",
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "0",
+                "jsToken": self.js_token,
+                "bdstoken": self.bds_token,
+            }
+        )
+        url = f"{self.domain}/share/taskquery?{params}"
+        print(f"[TB] query_share_task → GET {url}")
+        try:
+            async with self._session_for() as session:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    print(f"[TB] query_share_task ← HTTP {resp.status} | {data}")
+                    return data
+        except Exception as e:
+            print(f"[TB] query_share_task error: {e}")
+            return None
+
     # --------------------------------------------------------------- create_dir
 
     async def create_dir(self, remote_dir: str) -> Optional[Dict[str, Any]]:
