@@ -101,7 +101,13 @@ def _extract_terabox_info(text: str) -> Optional[Tuple[str, str]]:
         normalized,
     )
     if m:
-        return m.group(1), m.group(2)
+        surl = m.group(2)
+        # The /s/ URL format is /s/1{surl} — the leading "1" is a share-type
+        # prefix that TeraBox strips in sharing/link.  The API shorturl param
+        # requires this prefix, so add it back when it's missing.
+        if not surl.startswith("1"):
+            surl = "1" + surl
+        return m.group(1), surl
 
     return None
 

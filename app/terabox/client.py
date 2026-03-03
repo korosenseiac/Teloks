@@ -344,34 +344,45 @@ class TeraBoxClient:
             ({"clienttype": "5"}, browser_ua, "mobile_ct"),
         ]
 
+        # Build alternative surl variants to try
+        # /s/CODE  → CODE includes a 1-char type prefix (usually '1')
+        # sharing/link?surl=CODE → CODE does NOT include the prefix
+        # API shorturl param needs the prefix.  Try both variants.
+        surl_variants = [surl]
+        if surl.startswith("1") and len(surl) > 1:
+            surl_variants.append(surl[1:])   # also try without '1' prefix
+        else:
+            surl_variants.append("1" + surl)  # also try with '1' prefix
+
         last_data = None
-        for extra, ua, desc in api_configs:
-            params = {"app_id": "250528", "shorturl": surl, "root": "1", **extra}
-            url = f"{base}/api/shorturlinfo?" + urllib.parse.urlencode(params)
-            print(f"[TB] short_url_info({desc}) → GET {url}")
-            try:
-                req_headers = {
-                    "User-Agent": ua,
-                    "Cookie": self._cookie_str,
-                    "Referer": base + "/",
-                    "Accept-Encoding": "identity",
-                }
-                async with self._session_for(restricted=True) as session:
-                    async with session.get(
-                        url, headers=req_headers,
-                        timeout=aiohttp.ClientTimeout(total=20),
-                    ) as resp:
-                        data = await resp.json(content_type=None)
-                        errno = data.get("errno", -1)
-                        print(f"[TB] short_url_info({desc}) ← HTTP {resp.status} | errno={errno} | keys={list(data.keys())}")
-                        if errno == 0:
-                            return data
-                        last_data = data
-                        if errno != 400210:
-                            return data  # Non-verify error, stop trying
-            except Exception as e:
-                print(f"[TB] short_url_info({desc}) error: {e}")
-                continue
+        for try_surl in surl_variants:
+            for extra, ua, desc in api_configs:
+                params = {"app_id": "250528", "shorturl": try_surl, "root": "1", **extra}
+                url = f"{base}/api/shorturlinfo?" + urllib.parse.urlencode(params)
+                print(f"[TB] short_url_info({desc}, surl={try_surl!r}) → GET {url}")
+                try:
+                    req_headers = {
+                        "User-Agent": ua,
+                        "Cookie": self._cookie_str,
+                        "Referer": base + "/",
+                        "Accept-Encoding": "identity",
+                    }
+                    async with self._session_for(restricted=True) as session:
+                        async with session.get(
+                            url, headers=req_headers,
+                            timeout=aiohttp.ClientTimeout(total=20),
+                        ) as resp:
+                            data = await resp.json(content_type=None)
+                            errno = data.get("errno", -1)
+                            print(f"[TB] short_url_info({desc}) ← HTTP {resp.status} | errno={errno} | keys={list(data.keys())}")
+                            if errno == 0:
+                                return data
+                            last_data = data
+                            if errno not in (400210, -6):
+                                return data  # Non-verify error, stop trying
+                except Exception as e:
+                    print(f"[TB] short_url_info({desc}) error: {e}")
+                    continue
 
         print(f"[TB] short_url_info → all strategies exhausted")
         return last_data
@@ -516,13 +527,17 @@ class TeraBoxClient:
                     print(f"[TB]   warmup error: {e}")
 
                 # ------ Step 2: Try share-page endpoints ------
+                # Build surl variants for page scraping
+                surl_no_prefix = surl[1:] if surl.startswith("1") and len(surl) > 1 else surl
+                surl_with_prefix = surl if surl.startswith("1") else ("1" + surl)
+
                 endpoints = [
                     # WAP mobile endpoint — usually server-side rendered
                     (f"{domain}/wap/share/filelist?surl={surl}", mobile_ua, "WAP"),
-                    # sharing/link desktop page
-                    (f"{domain}/sharing/link?surl={surl}&root=1&path=%2F", browser_ua, "sharing"),
-                    # Original /s/ page
-                    (f"{domain}/s/{surl}", browser_ua, "/s/"),
+                    # sharing/link desktop page (uses surl without type prefix)
+                    (f"{domain}/sharing/link?surl={surl_no_prefix}&root=1&path=%2F", browser_ua, "sharing"),
+                    # Original /s/ page (always has type prefix, usually '1')
+                    (f"{domain}/s/{surl_with_prefix}", browser_ua, "/s/"),
                 ]
 
                 # Collect redirect-target domains seen during page visits
@@ -577,39 +592,47 @@ class TeraBoxClient:
                 cookie_str = "; ".join(f"{k}={v}" for k, v in all_cookies.items())
                 print(f"[TB]   jar cookies: {list(all_cookies.keys())}")
 
-                api_params: Dict[str, str] = {
-                    "app_id": "250528",
-                    "shorturl": surl,
-                    "root": "1",
-                }
-                if self.js_token:
-                    api_params["jsToken"] = self.js_token
+                # Try API with both surl variants (with/without '1' prefix)
+                surl_api_variants = [surl]
+                if surl.startswith("1") and len(surl) > 1:
+                    surl_api_variants.append(surl[1:])
+                else:
+                    surl_api_variants.append("1" + surl)
 
-                for api_domain in api_domains:
-                    api_url = f"{api_domain}/api/shorturlinfo"
-                    print(f"[TB]   try API → {api_url}")
-                    try:
-                        async with session.get(
-                            api_url,
-                            params=api_params,
-                            headers={
-                                "User-Agent": browser_ua,
-                                "Cookie": cookie_str,
-                                "Referer": f"{api_domain}/",
-                            },
-                            timeout=aiohttp.ClientTimeout(total=20),
-                        ) as resp:
-                            data = await resp.json(content_type=None)
-                            errno = data.get("errno", -1)
-                            final_domain = f"{resp.url.scheme}://{resp.url.host}"
-                            print(f"[TB]   API ← HTTP {resp.status} | errno={errno} | final={final_domain}")
-                            if errno == 0:
-                                self._share_jar = jar
-                                self._share_domain = final_domain
-                                self._apply_randsk(data)
-                                return data
-                    except Exception as e:
-                        print(f"[TB]   API error ({api_domain}): {e}")
+                for try_surl in surl_api_variants:
+                    api_params: Dict[str, str] = {
+                        "app_id": "250528",
+                        "shorturl": try_surl,
+                        "root": "1",
+                    }
+                    if self.js_token:
+                        api_params["jsToken"] = self.js_token
+
+                    for api_domain in api_domains:
+                        api_url = f"{api_domain}/api/shorturlinfo"
+                        print(f"[TB]   try API → {api_url} (surl={try_surl!r})")
+                        try:
+                            async with session.get(
+                                api_url,
+                                params=api_params,
+                                headers={
+                                    "User-Agent": browser_ua,
+                                    "Cookie": cookie_str,
+                                    "Referer": f"{api_domain}/",
+                                },
+                                timeout=aiohttp.ClientTimeout(total=20),
+                            ) as resp:
+                                data = await resp.json(content_type=None)
+                                errno = data.get("errno", -1)
+                                final_domain = f"{resp.url.scheme}://{resp.url.host}"
+                                print(f"[TB]   API ← HTTP {resp.status} | errno={errno} | final={final_domain}")
+                                if errno == 0:
+                                    self._share_jar = jar
+                                    self._share_domain = final_domain
+                                    self._apply_randsk(data)
+                                    return data
+                        except Exception as e:
+                            print(f"[TB]   API error ({api_domain}): {e}")
 
         except Exception as e:
             print(f"[TB] _scrape_one_domain session error: {e}")
