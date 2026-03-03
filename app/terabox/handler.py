@@ -491,11 +491,15 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                     t_status = task_resp.get("status", -1)
                     t_errno  = task_resp.get("errno", -1)
                     print(f"[TB:handler] task poll #{poll_i+1}: status={t_status} errno={t_errno}")
-                    # status == 2 ⇒ completed (or errno==0 && no status field)
-                    if t_status == 2 or (t_status == -1 and t_errno == 0):
+                    # API returns status as string "success"/"failed" or int 2/3
+                    done = (
+                        t_status in (2, "success")
+                        or (t_status == -1 and t_errno == 0)
+                    )
+                    if done:
                         print(f"[TB:handler] task completed on poll #{poll_i+1}")
                         break
-                    if t_status == 3:            # failed
+                    if t_status in (3, "failed"):
                         print(f"[TB:handler] task FAILED: {task_resp}")
                         await status_msg.edit("❌ Pemindahan gagal di sisi TeraBox.")
                         return
