@@ -163,9 +163,10 @@ async def get_backup_group_peer(client: Client):
 
     return None
 
-# Regex to extract chat_id and message_id from private links
-# https://t.me/c/1234567890/123
-LINK_PATTERN = re.compile(r"https://t\.me/c/(\d+)/(\d+)")
+# Regex to extract chat_id and message_id from Telegram links
+# Private: https://t.me/c/1234567890/123
+# Public:  https://t.me/username/123
+LINK_PATTERN = re.compile(r"https://t\.me/(?:c/(\d+)|([a-zA-Z][a-zA-Z0-9_]{3,}))/(\d+)")
 
 # Handler to cache any group the bot is in (runs on ANY message in groups)
 @app.on_message(filters.group, group=-1)
@@ -338,8 +339,9 @@ async def start_handler(client: Client, message: Message):
             "👋 **Hye!**\n\n"
             "✅ Dah login. Follow @telokschannel. Kalau bot kena remove, admin akan update baru disitu.\n\n"
             "**Cara guna:**\n"
-            "Copy dan paste mesej link dari private channel/group. Contohnya:\n"
-            "`https://t.me/c/1234567890/123`\n\n"
+            "Copy dan paste mesej link dari channel/group. Contohnya:\n"
+            "`https://t.me/c/1234567890/123` (private)\n"
+            "`https://t.me/contoh/14720` (public)\n\n"
             "Nanti bot akan forward contentnya."
         )
     else:
@@ -447,10 +449,20 @@ async def link_handler(client: Client, message: Message):
     if not match:
         return
 
-    chat_id = int("-100" + match.group(1)) # Private channel IDs usually start with -100 when accessed via API
-    msg_id = int(match.group(2))
+    # Determine chat_id based on link type
+    if match.group(1):
+        # Private channel link: t.me/c/<channel_id>/<msg_id>
+        chat_id = int("-100" + match.group(1))
+        is_public_link = False
+        print(f"DEBUG: Private Link ID: {match.group(1)} -> Chat ID: {chat_id}")
+    else:
+        # Public channel/group link: t.me/<username>/<msg_id>
+        chat_id = match.group(2)  # Use username string directly
+        is_public_link = True
+        print(f"DEBUG: Public Link Username: @{chat_id}")
+    msg_id = int(match.group(3))
 
-    print(f"DEBUG: Link ID: {match.group(1)} -> Chat ID: {chat_id}")
+    print(f"DEBUG: Message ID: {msg_id}")
     print(f"DEBUG: Backup Group ID: {BACKUP_GROUP_ID}")
 
     # Mark user as having an active process
@@ -470,39 +482,48 @@ async def link_handler(client: Client, message: Message):
         try:
             target_msg = await user_client.get_messages(chat_id, msg_id)
         except Exception as e:
-            await status_msg.edit(f"🔄 Scanning... ({e})")
-            
-            found_chat = None
-            debug_ids = []
-            try:
-                async for dialog in user_client.get_dialogs():
-                    d_id = dialog.chat.id
-                    if len(debug_ids) < 5:
-                        debug_ids.append(str(d_id))
-                    
-                    # Check exact match
-                    if d_id == chat_id:
-                        found_chat = dialog.chat
-                        break
-                    
-                    # Check loose match (if ID format differs)
-                    # e.g. if d_id is -100123 and raw_id is 123
-                    raw_id = int(str(chat_id).replace("-100", ""))
-                    if str(d_id).endswith(str(raw_id)):
-                        found_chat = dialog.chat
-                        chat_id = d_id # Update chat_id to the one found
-                        break
-                
-                if not found_chat:
-                    ids_sample = ", ".join(debug_ids)
-                    await status_msg.edit(f"❌ Chat {chat_id} tidak dijumpai. First 5 IDs: {ids_sample}")
+            if is_public_link:
+                # For public links, try resolving with @ prefix
+                try:
+                    await status_msg.edit(f"🔄 Resolving @{chat_id}...")
+                    target_msg = await user_client.get_messages(f"@{chat_id}", msg_id)
+                except Exception as e2:
+                    await status_msg.edit(f"❌ Tidak dapat akses @{chat_id}: {e2}")
                     return
+            else:
+                await status_msg.edit(f"🔄 Scanning... ({e})")
+                
+                found_chat = None
+                debug_ids = []
+                try:
+                    async for dialog in user_client.get_dialogs():
+                        d_id = dialog.chat.id
+                        if len(debug_ids) < 5:
+                            debug_ids.append(str(d_id))
+                        
+                        # Check exact match
+                        if d_id == chat_id:
+                            found_chat = dialog.chat
+                            break
+                        
+                        # Check loose match (if ID format differs)
+                        # e.g. if d_id is -100123 and raw_id is 123
+                        raw_id = int(str(chat_id).replace("-100", ""))
+                        if str(d_id).endswith(str(raw_id)):
+                            found_chat = dialog.chat
+                            chat_id = d_id # Update chat_id to the one found
+                            break
+                    
+                    if not found_chat:
+                        ids_sample = ", ".join(debug_ids)
+                        await status_msg.edit(f"❌ Chat {chat_id} tidak dijumpai. First 5 IDs: {ids_sample}")
+                        return
 
-                # Try again with the found chat_id
-                target_msg = await user_client.get_messages(chat_id, msg_id)
-            except Exception as e2:
-                await status_msg.edit(f"❌ Error: {e2}")
-                return
+                    # Try again with the found chat_id
+                    target_msg = await user_client.get_messages(chat_id, msg_id)
+                except Exception as e2:
+                    await status_msg.edit(f"❌ Error: {e2}")
+                    return
         
         if not target_msg or not target_msg.media:
             await status_msg.edit("❌ Bukan media/file.")
