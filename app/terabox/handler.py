@@ -53,10 +53,57 @@ from app.terabox.progress import ProgressTracker
 # Multi-domain regex for TeraBox share links
 # ---------------------------------------------------------------------------
 
-TERABOX_LINK_PATTERN = re.compile(
-    r"https?://(?:www\.)?(terabox\.com|1024terabox\.com|freeterabox\.com"
-    r"|terabox\.app|teraboxapp\.com)/s/([a-zA-Z0-9_-]+)"
+_TERABOX_DOMAINS = (
+    r"terabox\.com|1024terabox\.com|1024tera\.com|freeterabox\.com"
+    r"|terabox\.app|teraboxapp\.com"
 )
+
+# Broad pattern used as a Pyrogram message filter — matches both
+# /s/CODE and /sharing/link?surl=CODE formats, with or without scheme.
+TERABOX_LINK_PATTERN = re.compile(
+    r"(?:https?://)?"                       # scheme is optional
+    r"(?:[\w-]+\.)*"                        # any subdomains (www., dm., etc.)
+    r"(?:" + _TERABOX_DOMAINS + r")"
+    r"(?:/s/[a-zA-Z0-9_-]+"                 # /s/CODE format
+    r"|/sharing/link\?[^\s]*surl=[a-zA-Z0-9_-]+)"  # /sharing/link?surl=CODE
+)
+
+
+def _extract_terabox_info(text: str) -> Optional[Tuple[str, str]]:
+    """
+    Extract (share_host, surl) from a TeraBox link in *text*.
+
+    Supports:
+      - https://1024terabox.com/s/CODE
+      - https://dm.1024tera.com/sharing/link?surl=CODE&...
+      - Links without http/https prefix
+
+    Returns ``None`` when no valid link is found.
+    """
+    # Normalise: ensure a scheme is present so the regexes work uniformly
+    normalized = text.strip()
+    if not re.match(r"https?://", normalized, re.IGNORECASE):
+        normalized = "https://" + normalized
+
+    # Try /s/CODE format
+    m = re.search(
+        r"https?://(?:[\w-]+\.)*"
+        r"(" + _TERABOX_DOMAINS + r")/s/([a-zA-Z0-9_-]+)",
+        normalized,
+    )
+    if m:
+        return m.group(1), m.group(2)
+
+    # Try /sharing/link?surl=CODE format
+    m = re.search(
+        r"https?://(?:[\w-]+\.)*"
+        r"(" + _TERABOX_DOMAINS + r")/sharing/link\?[^\s]*?surl=([a-zA-Z0-9_-]+)",
+        normalized,
+    )
+    if m:
+        return m.group(1), m.group(2)
+
+    return None
 
 # ---------------------------------------------------------------------------
 # File classification helpers (delegated to shared module)
@@ -356,11 +403,10 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         return
 
     # ---------------------------------------------------------------- Parse link
-    match = TERABOX_LINK_PATTERN.search(message.text)
-    if not match:
+    parsed = _extract_terabox_info(message.text)
+    if not parsed:
         return
-    share_host = match.group(1)   # e.g. "1024terabox.com"
-    surl = match.group(2)         # e.g. "12VSvUMj_3xxS35TG63_lHQ"
+    share_host, surl = parsed     # e.g. ("1024tera.com", "ZwBiS4hI1209mq7eGN6OXA")
     print(f"[TB:handler] user={user_id} raw_link={message.text.strip()!r} share_host={share_host!r} surl={surl!r}")
 
     # ---------------------------------------------------------------- Start
