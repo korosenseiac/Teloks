@@ -31,6 +31,25 @@ import asyncio
 # Track active processes per user (user_id: True if processing)
 active_user_processes = {}
 
+# Cancellation events per user (user_id: asyncio.Event)
+cancel_events = {}
+
+def is_cancelled(user_id: int) -> bool:
+    """Check if the user's process has been cancelled."""
+    event = cancel_events.get(user_id)
+    return event.is_set() if event else False
+
+def reset_cancel(user_id: int):
+    """Reset/clear the cancellation event for a user."""
+    if user_id in cancel_events:
+        cancel_events[user_id].clear()
+
+def request_cancel(user_id: int):
+    """Request cancellation for a user's running process."""
+    if user_id not in cancel_events:
+        cancel_events[user_id] = asyncio.Event()
+    cancel_events[user_id].set()
+
 # File size limit (2GB in bytes)
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 
@@ -368,6 +387,19 @@ async def login_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("cancel"))
 async def cancel_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+
+    # Check if user has an active process (terabox/mediafire/forwarding)
+    if active_user_processes.get(user_id):
+        request_cancel(user_id)
+        await message.reply_text(
+            "🚫 **Membatalkan proses...**\n\n"
+            "Proses akan dibatalkan selepas operasi semasa selesai.\n"
+            "💾 Folder sementara akan dibersihkan."
+        )
+        return
+
+    # Otherwise, try to cancel login flow
     await cancel_login(client, message)
 
 @app.on_callback_query(filters.regex(r"^login_"))
@@ -467,6 +499,7 @@ async def link_handler(client: Client, message: Message):
 
     # Mark user as having an active process
     active_user_processes[user_id] = True
+    reset_cancel(user_id)
 
     status_msg = await message.reply_text(f"🔄 Sedang Diproses..")
 
@@ -575,6 +608,11 @@ async def link_handler(client: Client, message: Message):
             uploaded_media = []  # List of (file_id, media_type, file_size, metadata)
             
             for idx, msg_to_process in enumerate(messages_to_process, 1):
+                # Check for cancellation
+                if is_cancelled(user_id):
+                    await status_msg.edit("🚫 **Proses dibatalkan!**")
+                    return
+
                 await status_msg.edit(f"⬇️ Memuat naik {idx}/{total_files}...")
                 
                 # Upload each file and get file_id
@@ -659,6 +697,11 @@ async def link_handler(client: Client, message: Message):
         else:
             # Process single file individually
             for idx, msg_to_process in enumerate(messages_to_process, 1):
+                # Check for cancellation
+                if is_cancelled(user_id):
+                    await status_msg.edit("🚫 **Proses dibatalkan!**")
+                    return
+
                 await status_msg.edit(f"⬇️ Memproses {idx}/{total_files}...")
                 
                 # Process single media file
@@ -700,6 +743,7 @@ async def link_handler(client: Client, message: Message):
     finally:
         # Always clear the active process flag when done
         active_user_processes.pop(user_id, None)
+        reset_cancel(user_id)
 
 
 async def upload_single_media_for_group(client: Client, user_client: Client, target_msg: Message,

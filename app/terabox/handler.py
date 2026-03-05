@@ -375,7 +375,7 @@ async def _upload_terabox_file_to_backup(
 async def terabox_link_handler(bot: Client, message: Message) -> None:
     """Handler called when a user sends a TeraBox share link."""
     # -- Import here to avoid circular import (app.bot.main imports this file)
-    from app.bot.main import active_user_processes, get_backup_group_peer
+    from app.bot.main import active_user_processes, get_backup_group_peer, is_cancelled, reset_cancel
     from app.terabox import get_terabox_client
 
     user_id = message.from_user.id
@@ -417,6 +417,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
 
     # ---------------------------------------------------------------- Start
     active_user_processes[user_id] = True
+    reset_cancel(user_id)
     status_msg = await message.reply_text("🔍 Parsing share link…")
 
     temp_folder: Optional[str] = None
@@ -485,6 +486,11 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             await status_msg.edit("⏳ Menunggu pemindahan selesai…")
             print(f"[TB:handler] async task_id={task_id}, polling…")
             for poll_i in range(60):                       # max ~120 s
+                # Check for cancellation during polling
+                if is_cancelled(user_id):
+                    await status_msg.edit("\ud83d\udeab **Proses dibatalkan!**\n\n\ud83d\udcbe Folder sementara sedang dibersihkan...")
+                    return
+
                 await asyncio.sleep(2)
                 task_resp = await tb.query_share_task(str(task_id))
                 if task_resp:
@@ -618,6 +624,11 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         MAX_RETRIES = 5
 
         for idx, entry in enumerate(enriched, 1):
+            # Check for cancellation before each file
+            if is_cancelled(user_id):
+                await status_msg.edit("\ud83d\udeab **Proses dibatalkan!**\n\n\ud83d\udcbe Folder sementara sedang dibersihkan...")
+                return
+
             # Create and start progress tracker for this file
             tracker = ProgressTracker(
                 status_msg=status_msg,
@@ -879,3 +890,4 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 print(f"[TeraBox] Failed to delete temp folder {temp_folder}: {e}")
 
         active_user_processes.pop(user_id, None)
+        reset_cancel(user_id)

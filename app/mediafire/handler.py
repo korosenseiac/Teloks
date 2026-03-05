@@ -576,7 +576,7 @@ def _append_bytes(path: str, data: bytes) -> None:
 
 async def mediafire_link_handler(bot: Client, message: Message) -> None:
     """Handler called when a user sends a MediaFire file link."""
-    from app.bot.main import active_user_processes, get_backup_group_peer
+    from app.bot.main import active_user_processes, get_backup_group_peer, is_cancelled, reset_cancel
 
     user_id = message.from_user.id
 
@@ -628,6 +628,7 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
 
     # ---------------------------------------------------------------- Start
     active_user_processes[user_id] = True
+    reset_cancel(user_id)
     status_msg = await message.reply_text("🔍 Menyelesaikan link MediaFire…")
 
     temp_dir: Optional[str] = None
@@ -659,6 +660,11 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
             return
 
         # 3. Resolve backup group peer
+        # Check for cancellation after resolve
+        if is_cancelled(user_id):
+            await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+            return
+
         backup_peer = await get_backup_group_peer(bot)
         if not backup_peer:
             await status_msg.edit("❌ Backup group tidak dijumpai.")
@@ -696,6 +702,7 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
     finally:
         await mf_client.close()
         active_user_processes.pop(user_id, None)
+        reset_cancel(user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +722,13 @@ async def _handle_direct_media(
     file_size: int,
 ) -> None:
     """Stream a single media file from MediaFire → backup group → user."""
+    from app.bot.main import is_cancelled
+
+    # Check for cancellation before starting upload
+    if is_cancelled(user_id):
+        await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+        return
+
     await status_msg.edit(
         f"📥 Memuat turun & memuat naik: `{filename}`\n"
         f"📦 Saiz: {_format_size(file_size)}"
@@ -816,6 +830,12 @@ async def _handle_archive(
 
         await dl_tracker.stop()
 
+        # Check for cancellation after download
+        from app.bot.main import is_cancelled
+        if is_cancelled(user_id):
+            await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+            return
+
         # Close the MediaFire HTTP session early to free resources
         await mf_client.close()
 
@@ -847,6 +867,11 @@ async def _handle_archive(
 
         async for mf in iter_extract_media(archive_path, extract_dir):
             idx += 1
+
+            # Check for cancellation before each file
+            if is_cancelled(user_id):
+                await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+                return
 
             # Validate individual file size
             if mf["size"] > MAX_FILE_SIZE:
