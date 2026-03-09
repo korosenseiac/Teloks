@@ -860,102 +860,179 @@ async def _handle_archive(
             f"📤 Memuat naik {total_files} fail media ke Telegram…"
         )
 
-        # ----- Phase 3: Extract & upload ONE AT A TIME -----
+        # ----- Phase 3: Extract & upload (photos parallel, videos sequential) -----
         uploaded: List[Tuple[int, str, str, int]] = []
         MAX_RETRIES = 3
         idx = 0
 
+        # Batch settings for concurrent photo uploads
+        _PHOTO_BATCH = 5
+        _PHOTO_WORKERS = 3
+        _photo_batch: List[Dict[str, Any]] = []
+        _photo_counter = {"done": 0}
+        _photo_lock = asyncio.Lock()
+
+        async def _flush_photo_batch():
+            """Upload accumulated photos concurrently then clean up."""
+            if not _photo_batch:
+                return
+            batch = list(_photo_batch)
+            _photo_batch.clear()
+
+            _sem = asyncio.Semaphore(_PHOTO_WORKERS)
+
+            async def _upload_one_photo(mf_entry):
+                async with _sem:
+                    if is_cancelled(user_id):
+                        return None
+
+                    if mf_entry["size"] > MAX_FILE_SIZE:
+                        print(f"[MediaFire] Skipping oversized photo: {mf_entry['name']} ({_format_size(mf_entry['size'])})")
+                        return None
+
+                    _bmid = None
+                    for _att in range(1, MAX_RETRIES + 1):
+                        streamer = FileStreamer(mf_entry["path"], mf_entry["name"])
+                        _bmid = await _upload_file_to_backup(
+                            bot, backup_peer, streamer,
+                            mf_entry["name"], mf_entry["size"],
+                        )
+                        if _bmid:
+                            break
+                        print(f"[MediaFire] Photo upload failed for {mf_entry['name']} (attempt {_att}/{MAX_RETRIES})")
+                        if _att < MAX_RETRIES:
+                            await asyncio.sleep(1)
+
+                    # Delete extracted file immediately
+                    try:
+                        os.remove(mf_entry["path"])
+                    except OSError:
+                        pass
+
+                    _photo_counter["done"] += 1
+                    async with _photo_lock:
+                        try:
+                            await status_msg.edit(
+                                f"\U0001f5bc\ufe0f Foto: {_photo_counter['done']} dimuat naik\n"
+                                f"\U0001f4ca Jumlah fail media: {total_files}"
+                            )
+                        except Exception:
+                            pass
+
+                    await asyncio.sleep(0.3)
+                    if _bmid:
+                        return (_bmid, mf_entry["kind"], mf_entry["name"], mf_entry["size"])
+                    return None
+
+            results = await asyncio.gather(
+                *[_upload_one_photo(mf_e) for mf_e in batch],
+                return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, Exception):
+                    print(f"[MediaFire] Photo batch exception: {r}")
+                    import traceback; traceback.print_exc()
+                    continue
+                if r:
+                    uploaded.append(r)
+                    _b, _k, _n, _s = r
+                    _cid = str(BACKUP_GROUP_ID).replace("-100", "")
+                    _lnk = f"https://t.me/c/{_cid}/{_b}"
+                    await log_forward(
+                        message.from_user.username, _b, _s,
+                        f"MediaFire/{filename}/{_n}", _lnk,
+                    )
+            gc.collect()
+
         async for mf in iter_extract_media(archive_path, extract_dir):
             idx += 1
 
-            # Check for cancellation before each file
             if is_cancelled(user_id):
-                await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+                await status_msg.edit("\U0001f6ab **Proses dibatalkan!**\n\n\U0001f4be Folder sementara sedang dibersihkan...")
                 return
 
-            # Validate individual file size
-            if mf["size"] > MAX_FILE_SIZE:
-                print(f"[MediaFire] Skipping oversized file: {mf['name']} ({_format_size(mf['size'])})")
+            if mf["kind"] == "photo":
+                # Collect photos for batch concurrent upload
+                _photo_batch.append(mf)
+                if len(_photo_batch) >= _PHOTO_BATCH:
+                    await _flush_photo_batch()
+            else:
+                # Flush pending photos before processing a non-photo file
+                await _flush_photo_batch()
+
+                # --- Process video/document sequentially with full progress ---
+                if mf["size"] > MAX_FILE_SIZE:
+                    print(f"[MediaFire] Skipping oversized file: {mf['name']} ({_format_size(mf['size'])})")
+                    try:
+                        os.remove(mf["path"])
+                    except OSError:
+                        pass
+                    continue
+
+                thumb_raw = None
+                video_meta = None
+                if mf["kind"] == "video":
+                    thumb_raw = await _generate_video_thumb(mf["path"])
+                    video_meta = await _get_video_metadata(mf["path"])
+
+                tracker = ProgressTracker(
+                    status_msg=status_msg,
+                    file_name=mf["name"],
+                    file_size=mf["size"],
+                    file_index=idx,
+                    file_total=total_files,
+                )
+                tracker.start()
+
+                bmid = None
+                for attempt in range(1, MAX_RETRIES + 1):
+                    streamer = FileStreamer(
+                        mf["path"], mf["name"],
+                        on_download_chunk=tracker.add_downloaded,
+                    )
+                    bmid = await _upload_file_to_backup(
+                        bot, backup_peer, streamer,
+                        mf["name"], mf["size"],
+                        tracker=tracker,
+                        thumb_raw=thumb_raw,
+                        video_meta=video_meta,
+                    )
+                    if bmid:
+                        break
+                    print(f"[MediaFire] Upload failed for {mf['name']} (attempt {attempt}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES:
+                        tracker.downloaded = 0
+                        tracker.uploaded = 0
+                        tracker._dl_samples.clear()
+                        tracker._ul_samples.clear()
+                        await asyncio.sleep(3)
+
+                await tracker.stop()
+
+                if bmid:
+                    uploaded.append((bmid, mf["kind"], mf["name"], mf["size"]))
+                    channel_id_str = str(BACKUP_GROUP_ID).replace("-100", "")
+                    link = f"https://t.me/c/{channel_id_str}/{bmid}"
+                    await log_forward(
+                        message.from_user.username, bmid, mf["size"],
+                        f"MediaFire/{filename}/{mf['name']}", link,
+                    )
+                else:
+                    print(f"[MediaFire] Skipping {mf['name']} \u2014 upload failed after {MAX_RETRIES} attempts.")
+
                 try:
                     os.remove(mf["path"])
                 except OSError:
                     pass
-                continue
+                thumb_raw = None
+                video_meta = None
+                gc.collect()
 
-            # Generate thumbnail & metadata for videos (ffmpeg)
-            thumb_raw = None
-            video_meta = None
-            if mf["kind"] == "video":
-                thumb_raw = await _generate_video_thumb(mf["path"])
-                video_meta = await _get_video_metadata(mf["path"])
+                if idx < total_files:
+                    await asyncio.sleep(2)
 
-            tracker = ProgressTracker(
-                status_msg=status_msg,
-                file_name=mf["name"],
-                file_size=mf["size"],
-                file_index=idx,
-                file_total=total_files,
-            )
-            tracker.start()
-
-            bmid = None
-            for attempt in range(1, MAX_RETRIES + 1):
-                streamer = FileStreamer(
-                    mf["path"], mf["name"],
-                    on_download_chunk=tracker.add_downloaded,
-                )
-
-                bmid = await _upload_file_to_backup(
-                    bot, backup_peer, streamer,
-                    mf["name"], mf["size"],
-                    tracker=tracker,
-                    thumb_raw=thumb_raw,
-                    video_meta=video_meta,
-                )
-                if bmid:
-                    break
-
-                print(
-                    f"[MediaFire] Upload failed for {mf['name']} "
-                    f"(attempt {attempt}/{MAX_RETRIES})"
-                )
-                if attempt < MAX_RETRIES:
-                    # Reset tracker counters for retry
-                    tracker.downloaded = 0
-                    tracker.uploaded = 0
-                    tracker._dl_samples.clear()
-                    tracker._ul_samples.clear()
-                    await asyncio.sleep(3)
-
-            await tracker.stop()
-
-            if bmid:
-                uploaded.append((bmid, mf["kind"], mf["name"], mf["size"]))
-                channel_id_str = str(BACKUP_GROUP_ID).replace("-100", "")
-                link = f"https://t.me/c/{channel_id_str}/{bmid}"
-                await log_forward(
-                    message.from_user.username, bmid, mf["size"],
-                    f"MediaFire/{filename}/{mf['name']}", link,
-                )
-            else:
-                print(f"[MediaFire] Skipping {mf['name']} — upload failed after {MAX_RETRIES} attempts.")
-
-            # Delete extracted file IMMEDIATELY after upload to free disk/memory
-            try:
-                os.remove(mf["path"])
-            except OSError:
-                pass
-
-            # Release thumbnail memory
-            thumb_raw = None
-            video_meta = None
-
-            # Hint garbage collector to reclaim memory between files
-            gc.collect()
-
-            # Delay between uploads to avoid Telegram rate limits
-            if idx < total_files:
-                await asyncio.sleep(2)
+        # Flush any remaining photos in the last batch
+        await _flush_photo_batch()
 
         # Delete the archive now that all files are processed
         try:

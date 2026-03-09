@@ -617,24 +617,88 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 print(f"[TeraBox] _refresh_dlink error for fs_id={fs_id}: {e}")
             return ""
 
-        # 10. Upload all files to backup group one by one
-        # Collect: (backup_msg_id, kind, name, size)
+        # 10. Upload files to backup group (photos concurrent, others sequential)
         uploaded: List[Tuple[int, str, str, int]] = []
         total_up = len(enriched)
         MAX_RETRIES = 5
 
-        for idx, entry in enumerate(enriched, 1):
-            # Check for cancellation before each file
+        _photo_entries = [e for e in enriched if e["kind"] == "photo"]
+        _non_photo_entries = [e for e in enriched if e["kind"] != "photo"]
+
+        # --- Phase A: Upload photos concurrently (small files, fast) ---
+        if _photo_entries:
+            _PHOTO_WORKERS = 3
+            _photo_sem = asyncio.Semaphore(_PHOTO_WORKERS)
+            _photo_counter = {"done": 0, "total": len(_photo_entries)}
+            _photo_lock = asyncio.Lock()
+
+            async def _update_photo_status():
+                async with _photo_lock:
+                    try:
+                        await status_msg.edit(
+                            f"\U0001f5bc\ufe0f Memuat naik foto: {_photo_counter['done']}/{_photo_counter['total']} \u2705\n"
+                            f"\U0001f4ca Jumlah fail: {total_up}"
+                        )
+                    except Exception:
+                        pass
+
+            await _update_photo_status()
+
+            async def _upload_one_photo(_pe):
+                async with _photo_sem:
+                    if is_cancelled(user_id):
+                        return None
+                    _bmid = None
+                    _dlink = _pe["dlink"]
+                    for _att in range(1, MAX_RETRIES + 1):
+                        if not _dlink:
+                            print(f"[TeraBox] No dlink for {_pe['name']}, fetching fresh (attempt {_att})")
+                            _dlink = await _refresh_dlink(_pe["fs_id"])
+                            if not _dlink:
+                                print(f"[TeraBox] Still no dlink for {_pe['name']}")
+                                break
+                        _bmid = await _upload_terabox_file_to_backup(
+                            bot, tb, backup_peer,
+                            _dlink, _pe["size"], _pe["name"],
+                            thumb_url=_pe.get("thumb_url", ""),
+                        )
+                        if _bmid:
+                            break
+                        print(f"[TeraBox] Photo upload failed for {_pe['name']} (attempt {_att}/{MAX_RETRIES}), refreshing dlink")
+                        _dlink = await _refresh_dlink(_pe["fs_id"])
+                    _photo_counter["done"] += 1
+                    await _update_photo_status()
+                    await asyncio.sleep(0.3)
+                    if _bmid:
+                        return (_bmid, _pe["kind"], _pe["name"], _pe["size"])
+                    return None
+
+            _photo_results = await asyncio.gather(
+                *[_upload_one_photo(pe) for pe in _photo_entries],
+                return_exceptions=True,
+            )
+            for _pr in _photo_results:
+                if isinstance(_pr, Exception):
+                    print(f"[TeraBox] Photo upload exception: {_pr}")
+                    import traceback; traceback.print_exc()
+                    continue
+                if _pr:
+                    uploaded.append(_pr)
+                    _b, _k, _n, _s = _pr
+                    _cid = str(BACKUP_GROUP_ID).replace("-100", "")
+                    await log_forward(message.from_user.username, _b, _s, f"TeraBox/{surl}", f"https://t.me/c/{_cid}/{_b}")
+
+        # --- Phase B: Upload non-photos sequentially with full progress ---
+        for _seq_idx, entry in enumerate(_non_photo_entries, 1):
             if is_cancelled(user_id):
-                await status_msg.edit("\ud83d\udeab **Proses dibatalkan!**\n\n\ud83d\udcbe Folder sementara sedang dibersihkan...")
+                await status_msg.edit("\U0001f6ab **Proses dibatalkan!**\n\n\U0001f4be Folder sementara sedang dibersihkan...")
                 return
 
-            # Create and start progress tracker for this file
             tracker = ProgressTracker(
                 status_msg=status_msg,
                 file_name=entry["name"],
                 file_size=entry["size"],
-                file_index=idx,
+                file_index=len(_photo_entries) + _seq_idx,
                 file_total=total_up,
             )
             tracker.start()
@@ -643,13 +707,12 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             dlink = entry["dlink"]
 
             for attempt in range(1, MAX_RETRIES + 1):
-                # Ensure we have a dlink (may be missing from initial batch or expired)
                 if not dlink:
                     print(f"[TeraBox] No dlink for {entry['name']}, fetching fresh one (attempt {attempt})")
                     dlink = await _refresh_dlink(entry["fs_id"])
                     if not dlink:
                         print(f"[TeraBox] Still no dlink for {entry['name']}")
-                        break  # give up on this file
+                        break
 
                 bmid = await _upload_terabox_file_to_backup(
                     bot, tb, backup_peer,
@@ -658,25 +721,20 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                     tracker=tracker,
                 )
                 if bmid:
-                    break  # success
+                    break
 
-                # Failed — dlink may have expired, refresh and retry
                 print(f"[TeraBox] Upload failed for {entry['name']} (attempt {attempt}/{MAX_RETRIES}), refreshing dlink")
                 dlink = await _refresh_dlink(entry["fs_id"])
-                # Reset tracker counters for retry
                 tracker.downloaded = 0
                 tracker.uploaded = 0
                 tracker._dl_samples.clear()
                 tracker._ul_samples.clear()
 
             await tracker.stop()
-
-            # Small delay between files to reduce FloodWait pressure
             await asyncio.sleep(1.5)
 
             if bmid:
                 uploaded.append((bmid, entry["kind"], entry["name"], entry["size"]))
-                # Log each upload
                 channel_id_str = str(BACKUP_GROUP_ID).replace("-100", "")
                 link = f"https://t.me/c/{channel_id_str}/{bmid}"
                 await log_forward(
@@ -684,7 +742,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                     f"TeraBox/{surl}", link
                 )
             else:
-                print(f"[TeraBox] Skipping {entry['name']} — upload failed.")
+                print(f"[TeraBox] Skipping {entry['name']} \u2014 upload failed.")
 
         if not uploaded:
             await status_msg.edit("❌ Semua fail gagal dimuat naik.")
