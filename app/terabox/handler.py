@@ -629,20 +629,75 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         if _photo_entries:
             _PHOTO_WORKERS = 3
             _photo_sem = asyncio.Semaphore(_PHOTO_WORKERS)
-            _photo_counter = {"done": 0, "total": len(_photo_entries)}
+            _photo_total_size = sum(e["size"] for e in _photo_entries)
+            _photo_state = {
+                "done": 0, "total": len(_photo_entries),
+                "downloaded": 0, "uploaded": 0,
+                "_dl_samples": [], "_ul_samples": [],
+            }
             _photo_lock = asyncio.Lock()
+            _photo_stopped = {"v": False}
+            import time as _time
+            _photo_start = _time.monotonic()
 
-            async def _update_photo_status():
-                async with _photo_lock:
+            def _photo_add_dl(n: int):
+                now = _time.monotonic()
+                _photo_state["downloaded"] += n
+                _photo_state["_dl_samples"].append((now, _photo_state["downloaded"]))
+                if len(_photo_state["_dl_samples"]) > 60:
+                    _photo_state["_dl_samples"] = _photo_state["_dl_samples"][-60:]
+
+            def _photo_add_ul(n: int):
+                now = _time.monotonic()
+                _photo_state["uploaded"] += n
+                _photo_state["_ul_samples"].append((now, _photo_state["uploaded"]))
+                if len(_photo_state["_ul_samples"]) > 60:
+                    _photo_state["_ul_samples"] = _photo_state["_ul_samples"][-60:]
+
+            def _rolling_speed(samples, window=8.0):
+                if len(samples) < 2:
+                    return 0.0
+                now = samples[-1][0]
+                cutoff = now - window
+                for i, (t, _) in enumerate(samples):
+                    if t >= cutoff:
+                        t0, b0 = samples[i]
+                        t1, b1 = samples[-1]
+                        dt = t1 - t0
+                        return (b1 - b0) / dt if dt > 0 else 0.0
+                return 0.0
+
+            from app.terabox.progress import _human_bytes, _human_speed, _bar, _eta
+
+            async def _photo_updater_loop():
+                while not _photo_stopped["v"]:
+                    await asyncio.sleep(2.5)
+                    if _photo_stopped["v"]:
+                        break
                     try:
-                        await status_msg.edit(
-                            f"\U0001f5bc\ufe0f Memuat naik foto: {_photo_counter['done']}/{_photo_counter['total']} \u2705\n"
-                            f"\U0001f4ca Jumlah fail: {total_up}"
+                        dl_frac = _photo_state["downloaded"] / _photo_total_size if _photo_total_size else 0
+                        ul_frac = _photo_state["uploaded"] / _photo_total_size if _photo_total_size else 0
+                        dl_speed = _rolling_speed(_photo_state["_dl_samples"])
+                        ul_speed = _rolling_speed(_photo_state["_ul_samples"])
+                        dl_rem = max(0, _photo_total_size - _photo_state["downloaded"])
+                        ul_rem = max(0, _photo_total_size - _photo_state["uploaded"])
+                        elapsed = _time.monotonic() - _photo_start
+                        mins, secs = divmod(int(elapsed), 60)
+                        text = (
+                            f"\U0001f5bc\ufe0f **Foto {_photo_state['done']}/{_photo_state['total']}** "
+                            f"(\U0001f4ca {total_up} jumlah fail)\n"
+                            f"\U0001f4e6 {_human_bytes(_photo_total_size)}\n\n"
+                            f"\u2b07\ufe0f Muat Turun  {_bar(dl_frac)}  {dl_frac*100:.0f}%\n"
+                            f"    {_human_bytes(_photo_state['downloaded'])} \u2022 {_human_speed(dl_speed)} \u2022 ETA {_eta(dl_rem, dl_speed)}\n\n"
+                            f"\u2b06\ufe0f Muat Naik   {_bar(ul_frac)}  {ul_frac*100:.0f}%\n"
+                            f"    {_human_bytes(_photo_state['uploaded'])} \u2022 {_human_speed(ul_speed)} \u2022 ETA {_eta(ul_rem, ul_speed)}\n\n"
+                            f"\u23f1 Masa: {mins}m {secs}s"
                         )
+                        await status_msg.edit(text)
                     except Exception:
                         pass
 
-            await _update_photo_status()
+            _photo_updater_task = asyncio.create_task(_photo_updater_loop())
 
             async def _upload_one_photo(_pe):
                 async with _photo_sem:
@@ -661,13 +716,16 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                             bot, tb, backup_peer,
                             _dlink, _pe["size"], _pe["name"],
                             thumb_url=_pe.get("thumb_url", ""),
+                            tracker=type("_Proxy", (), {
+                                "add_downloaded": staticmethod(_photo_add_dl),
+                                "add_uploaded": staticmethod(_photo_add_ul),
+                            })(),
                         )
                         if _bmid:
                             break
                         print(f"[TeraBox] Photo upload failed for {_pe['name']} (attempt {_att}/{MAX_RETRIES}), refreshing dlink")
                         _dlink = await _refresh_dlink(_pe["fs_id"])
-                    _photo_counter["done"] += 1
-                    await _update_photo_status()
+                    _photo_state["done"] += 1
                     await asyncio.sleep(0.3)
                     if _bmid:
                         return (_bmid, _pe["kind"], _pe["name"], _pe["size"])
@@ -677,6 +735,14 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 *[_upload_one_photo(pe) for pe in _photo_entries],
                 return_exceptions=True,
             )
+
+            _photo_stopped["v"] = True
+            _photo_updater_task.cancel()
+            try:
+                await _photo_updater_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
             for _pr in _photo_results:
                 if isinstance(_pr, Exception):
                     print(f"[TeraBox] Photo upload exception: {_pr}")

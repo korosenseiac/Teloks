@@ -869,8 +869,76 @@ async def _handle_archive(
         _PHOTO_BATCH = 5
         _PHOTO_WORKERS = 3
         _photo_batch: List[Dict[str, Any]] = []
-        _photo_counter = {"done": 0}
-        _photo_lock = asyncio.Lock()
+
+        import time as _time
+        from app.terabox.progress import _human_bytes, _human_speed, _bar, _eta
+        _batch_state = {
+            "done": 0, "downloaded": 0, "uploaded": 0,
+            "_dl_samples": [], "_ul_samples": [],
+            "batch_total_size": 0, "batch_count": 0,
+        }
+        _batch_stopped = {"v": False}
+        _batch_start = _time.monotonic()
+
+        def _batch_add_dl(n: int):
+            now = _time.monotonic()
+            _batch_state["downloaded"] += n
+            _batch_state["_dl_samples"].append((now, _batch_state["downloaded"]))
+            if len(_batch_state["_dl_samples"]) > 60:
+                _batch_state["_dl_samples"] = _batch_state["_dl_samples"][-60:]
+
+        def _batch_add_ul(n: int):
+            now = _time.monotonic()
+            _batch_state["uploaded"] += n
+            _batch_state["_ul_samples"].append((now, _batch_state["uploaded"]))
+            if len(_batch_state["_ul_samples"]) > 60:
+                _batch_state["_ul_samples"] = _batch_state["_ul_samples"][-60:]
+
+        def _rolling_speed(samples, window=8.0):
+            if len(samples) < 2:
+                return 0.0
+            now = samples[-1][0]
+            cutoff = now - window
+            for i, (t, _) in enumerate(samples):
+                if t >= cutoff:
+                    t0, b0 = samples[i]
+                    t1, b1 = samples[-1]
+                    dt = t1 - t0
+                    return (b1 - b0) / dt if dt > 0 else 0.0
+            return 0.0
+
+        async def _batch_updater_loop():
+            while not _batch_stopped["v"]:
+                await asyncio.sleep(2.5)
+                if _batch_stopped["v"]:
+                    break
+                try:
+                    ts = _batch_state["batch_total_size"]
+                    if ts <= 0:
+                        continue
+                    dl_frac = _batch_state["downloaded"] / ts
+                    ul_frac = _batch_state["uploaded"] / ts
+                    dl_speed = _rolling_speed(_batch_state["_dl_samples"])
+                    ul_speed = _rolling_speed(_batch_state["_ul_samples"])
+                    dl_rem = max(0, ts - _batch_state["downloaded"])
+                    ul_rem = max(0, ts - _batch_state["uploaded"])
+                    elapsed = _time.monotonic() - _batch_start
+                    mins, secs = divmod(int(elapsed), 60)
+                    text = (
+                        f"\U0001f5bc\ufe0f **Foto {_batch_state['done']}/{_batch_state['batch_count']}** "
+                        f"(\U0001f4ca {total_files} jumlah fail)\n"
+                        f"\U0001f4e6 {_human_bytes(ts)}\n\n"
+                        f"\u2b07\ufe0f Muat Turun  {_bar(dl_frac)}  {dl_frac*100:.0f}%\n"
+                        f"    {_human_bytes(_batch_state['downloaded'])} \u2022 {_human_speed(dl_speed)} \u2022 ETA {_eta(dl_rem, dl_speed)}\n\n"
+                        f"\u2b06\ufe0f Muat Naik   {_bar(ul_frac)}  {ul_frac*100:.0f}%\n"
+                        f"    {_human_bytes(_batch_state['uploaded'])} \u2022 {_human_speed(ul_speed)} \u2022 ETA {_eta(ul_rem, ul_speed)}\n\n"
+                        f"\u23f1 Masa: {mins}m {secs}s"
+                    )
+                    await status_msg.edit(text)
+                except Exception:
+                    pass
+
+        _batch_updater_task = asyncio.create_task(_batch_updater_loop())
 
         async def _flush_photo_batch():
             """Upload accumulated photos concurrently then clean up."""
@@ -879,7 +947,17 @@ async def _handle_archive(
             batch = list(_photo_batch)
             _photo_batch.clear()
 
+            # Update batch state for progress tracking
+            _batch_state["batch_total_size"] += sum(e["size"] for e in batch)
+            _batch_state["batch_count"] += len(batch)
+
             _sem = asyncio.Semaphore(_PHOTO_WORKERS)
+
+            # Proxy for upload tracking only (download tracked via FileStreamer callback)
+            _ul_proxy = type("_Proxy", (), {
+                "add_downloaded": staticmethod(lambda n: None),
+                "add_uploaded": staticmethod(_batch_add_ul),
+            })()
 
             async def _upload_one_photo(mf_entry):
                 async with _sem:
@@ -892,10 +970,14 @@ async def _handle_archive(
 
                     _bmid = None
                     for _att in range(1, MAX_RETRIES + 1):
-                        streamer = FileStreamer(mf_entry["path"], mf_entry["name"])
+                        streamer = FileStreamer(
+                            mf_entry["path"], mf_entry["name"],
+                            on_download_chunk=_batch_add_dl,
+                        )
                         _bmid = await _upload_file_to_backup(
                             bot, backup_peer, streamer,
                             mf_entry["name"], mf_entry["size"],
+                            tracker=_ul_proxy,
                         )
                         if _bmid:
                             break
@@ -909,16 +991,7 @@ async def _handle_archive(
                     except OSError:
                         pass
 
-                    _photo_counter["done"] += 1
-                    async with _photo_lock:
-                        try:
-                            await status_msg.edit(
-                                f"\U0001f5bc\ufe0f Foto: {_photo_counter['done']} dimuat naik\n"
-                                f"\U0001f4ca Jumlah fail media: {total_files}"
-                            )
-                        except Exception:
-                            pass
-
+                    _batch_state["done"] += 1
                     await asyncio.sleep(0.3)
                     if _bmid:
                         return (_bmid, mf_entry["kind"], mf_entry["name"], mf_entry["size"])
@@ -1033,6 +1106,14 @@ async def _handle_archive(
 
         # Flush any remaining photos in the last batch
         await _flush_photo_batch()
+
+        # Stop the batch progress updater
+        _batch_stopped["v"] = True
+        _batch_updater_task.cancel()
+        try:
+            await _batch_updater_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
         # Delete the archive now that all files are processed
         try:
