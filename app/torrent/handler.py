@@ -59,7 +59,8 @@ from app.utils.media import (
 )
 from app.torrent.client import Aria2Error
 from app.torrent.streamer import TorrentFileStreamer
-from app.terabox.progress import ProgressTracker
+from app.torrent.trackers import get_tracker_count
+from app.terabox.progress import ProgressTracker, _human_bytes, _human_speed, _bar, _eta
 
 # ---------------------------------------------------------------------------
 # Link patterns
@@ -760,7 +761,10 @@ async def _process_torrent(
     print(f"[Torrent] Download started: gid={gid} type={link_type}")
 
     # 3. Wait for metadata (for magnet links, aria2 first fetches metadata)
-    await status_msg.edit("🔍 Mendapatkan maklumat torrent…")
+    await status_msg.edit(
+        f"🔍 Mendapatkan maklumat torrent…\n"
+        f"📡 {get_tracker_count()} public trackers dimuatkan"
+    )
 
     # Give aria2 a moment to resolve metadata
     await asyncio.sleep(2)
@@ -778,30 +782,91 @@ async def _process_torrent(
     except Exception:
         torrent_name = "Unknown"
 
-    # 4. Create progress tracker for download phase
-    # We'll update it during polling
-    download_tracker = ProgressTracker(
-        status_msg=status_msg,
-        file_name=torrent_name[:30] if len(torrent_name) > 30 else torrent_name,
-        file_size=1,  # Will be updated once we know total size
-        file_index=1,
-        file_total=1,
-    )
+    # 4. Custom download progress with seeders/peers info
+    # We use a custom updater instead of ProgressTracker so we can show
+    # seeders, connections, and tracker count in the download phase.
+    import time as _time
 
-    total_known = False
+    _dl_state = {
+        "completed": 0, "total": 0, "speed": 0,
+        "seeders": 0, "connections": 0,
+        "_samples": [],
+    }
+    _dl_start = _time.monotonic()
+    _dl_stopped = {"v": False}
 
-    def _on_progress(completed: int, total: int, speed: int):
-        nonlocal total_known
-        if total > 0 and not total_known:
-            download_tracker.file_size = total
-            total_known = True
-        if total > 0:
-            # Manually set downloaded bytes (not additive — aria2 gives absolute values)
-            delta = completed - download_tracker.downloaded
-            if delta > 0:
-                download_tracker.add_downloaded(delta)
+    def _on_progress(completed: int, total: int, speed: int, seeders: int = 0, connections: int = 0):
+        _dl_state["completed"] = completed
+        _dl_state["total"] = total
+        _dl_state["speed"] = speed
+        _dl_state["seeders"] = seeders
+        _dl_state["connections"] = connections
+        now = _time.monotonic()
+        _dl_state["_samples"].append((now, completed))
+        if len(_dl_state["_samples"]) > 30:
+            _dl_state["_samples"] = _dl_state["_samples"][-30:]
 
-    download_tracker.start()
+    async def _dl_updater_loop():
+        """Background task that edits the status message every 2.5s."""
+        tracker_count = get_tracker_count()
+        while not _dl_stopped["v"]:
+            await asyncio.sleep(2.5)
+            if _dl_stopped["v"]:
+                break
+            try:
+                s = _dl_state
+                total = s["total"]
+                if total <= 0:
+                    # Still fetching metadata
+                    elapsed = _time.monotonic() - _dl_start
+                    mins, secs = divmod(int(elapsed), 60)
+                    await status_msg.edit(
+                        f"🔍 Mendapatkan metadata torrent…\n\n"
+                        f"📡 **Trackers:** {tracker_count} dimuatkan\n"
+                        f"👥 **Peers:** {s['connections']} | 🌱 **Seeders:** {s['seeders']}\n"
+                        f"⏱ Masa: {mins}m {secs}s"
+                    )
+                    continue
+
+                frac = s["completed"] / total
+                remaining = max(0, total - s["completed"])
+                spd = s["speed"]
+
+                # Truncate name
+                dname = torrent_name
+                if len(dname) > 30:
+                    dname = dname[:27] + "…"
+
+                # Pick icon
+                if frac >= 1.0:
+                    icon = "✅"
+                elif frac > 0.6:
+                    icon = "🚀"
+                elif frac > 0.3:
+                    icon = "⚡"
+                else:
+                    icon = "📡"
+
+                elapsed = _time.monotonic() - _dl_start
+                mins, secs = divmod(int(elapsed), 60)
+
+                lines = [
+                    f"{icon} **Muat Turun Torrent**",
+                    f"📄 `{dname}`",
+                    f"📦 {_human_bytes(total)}",
+                    "",
+                    f"📡 **Trackers:** {tracker_count} | 👥 **Peers:** {s['connections']} | 🌱 **Seeders:** {s['seeders']}",
+                    "",
+                    f"⬇️ Muat Turun  {_bar(frac)}  {frac*100:.0f}%",
+                    f"    {_human_bytes(s['completed'])} • {_human_speed(spd)} • ETA {_eta(remaining, spd)}",
+                    "",
+                    f"⏱ Masa: {mins}m {secs}s",
+                ]
+                await status_msg.edit("\n".join(lines))
+            except Exception:
+                pass
+
+    _dl_updater_task = asyncio.create_task(_dl_updater_loop())
 
     try:
         # 5. Wait for download to complete
@@ -812,14 +877,16 @@ async def _process_torrent(
             cancel_check=lambda: is_cancelled(user_id),
         )
     except Aria2Error as e:
-        await download_tracker.stop()
+        _dl_stopped["v"] = True
+        _dl_updater_task.cancel()
         if "cancelled" in str(e).lower():
             await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
         else:
             raise
         return
 
-    await download_tracker.stop()
+    _dl_stopped["v"] = True
+    _dl_updater_task.cancel()
 
     # Check total size against limit
     total_size = int(final_status.get("totalLength", 0))
