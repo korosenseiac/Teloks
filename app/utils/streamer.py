@@ -137,10 +137,18 @@ async def upload_stream(client: Client, streamer, file_name: str, on_upload_chun
     file_id = random.randint(0, 1000000000)
     file_size = streamer.file_size
     is_big = file_size > 10 * 1024 * 1024
-    chunk_size = 512 * 1024  # 512KB — Telegram max part size
+
+    # Telegram limits file_total_parts to ~4000 (premium ~8000).
+    # Dynamically choose chunk_size so we never exceed 3999 parts.
+    MAX_PARTS = 3999
+    MIN_CHUNK = 512 * 1024   # 512 KB — Telegram minimum for big files
+    chunk_size = max(MIN_CHUNK, math.ceil(file_size / MAX_PARTS))
+    # Round up to the nearest 1 KB (Telegram requirement)
+    chunk_size = ((chunk_size + 1023) // 1024) * 1024
 
     # Calculate total parts from file_size (required for SaveBigFilePart)
     total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
+    print(f"[Upload] file_size={file_size}, chunk_size={chunk_size}, total_parts={total_parts}, is_big={is_big}")
 
     # --- Concurrent upload machinery ----------------------------------------
     UPLOAD_WORKERS = 3 if is_big else 1  # Low worker count to limit memory on small VPS
@@ -190,7 +198,7 @@ async def upload_stream(client: Client, streamer, file_name: str, on_upload_chun
 
         buffer += chunk
 
-        # Split buffer into complete 512 KB parts and dispatch concurrently
+        # Split buffer into complete parts and dispatch concurrently
         while len(buffer) >= chunk_size:
             part_data = buffer[:chunk_size]
             buffer = buffer[chunk_size:]
