@@ -26,6 +26,11 @@ from app.bot.auth import handle_login_command, handle_auth_message, handle_login
 from app.bot.states import user_profile_states, ProfileStep
 from app.terabox.handler import terabox_link_handler, TERABOX_LINK_PATTERN
 from app.mediafire.handler import mediafire_link_handler, MEDIAFIRE_LINK_PATTERN
+from app.torrent.handler import (
+    torrent_link_handler, torrent_file_handler,
+    MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
+)
+from app.utils.media import is_torrent
 import asyncio
 
 # Track active processes per user (user_id: True if processing)
@@ -436,6 +441,28 @@ async def terabox_handler(client: Client, message: Message):
 @app.on_message(filters.regex(MEDIAFIRE_LINK_PATTERN) & filters.private)
 async def mediafire_handler(client: Client, message: Message):
     await mediafire_link_handler(client, message)
+
+
+@app.on_message(filters.regex(MAGNET_LINK_PATTERN) & filters.private)
+async def torrent_magnet_handler(client: Client, message: Message):
+    await torrent_link_handler(client, message)
+
+
+@app.on_message(filters.regex(TORRENT_URL_PATTERN) & filters.private)
+async def torrent_url_handler(client: Client, message: Message):
+    await torrent_link_handler(client, message)
+
+
+@app.on_message(filters.document & filters.private, group=2)
+async def torrent_file_upload_handler(client: Client, message: Message):
+    """Handle uploaded .torrent files."""
+    doc = message.document
+    if not doc:
+        return
+    fname = getattr(doc, "file_name", "") or ""
+    mime = getattr(doc, "mime_type", "") or ""
+    if is_torrent(fname) or mime == "application/x-bittorrent":
+        await torrent_file_handler(client, message)
 
 
 @app.on_message(filters.regex(LINK_PATTERN) & filters.private)

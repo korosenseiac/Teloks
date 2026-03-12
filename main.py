@@ -10,6 +10,10 @@ from pyrogram.raw.functions.messages import SendMessage
 from pyrogram.raw.types import InputPeerChannel
 from app.bot.main import app as bot_app, get_backup_group_peer
 from app.config import BACKUP_GROUP_ID
+from app.torrent import cleanup_orphaned_torrent_dirs
+
+# Clean up any leftover torrent temp dirs from previous crashes
+cleanup_orphaned_torrent_dirs()
 
 async def start_services():
     # Start the Bot

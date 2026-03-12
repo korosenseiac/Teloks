@@ -16,6 +16,7 @@ PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".ts"}
 AUDIO_EXTS = {".mp3", ".flac", ".aac", ".ogg", ".m4a", ".wav", ".opus"}
 ARCHIVE_EXTS = {".zip", ".rar"}
+TORRENT_EXTS = {".torrent"}
 MEDIA_EXTS = PHOTO_EXTS | VIDEO_EXTS
 
 # ---------------------------------------------------------------------------
@@ -75,3 +76,8 @@ def is_media(name: str) -> bool:
 def is_archive(name: str) -> bool:
     """Return True if the filename has an archive extension (.zip / .rar)."""
     return ext(name) in ARCHIVE_EXTS
+
+
+def is_torrent(name: str) -> bool:
+    """Return True if the filename has a .torrent extension."""
+    return ext(name) in TORRENT_EXTS

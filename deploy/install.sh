@@ -60,7 +60,7 @@ print_info() {
 echo ""
 echo -e "${BLUE}Step 1: Installing system dependencies...${NC}"
 apt update && apt upgrade -y
-apt install -y python3.12 python3.12-venv python3-pip git curl wget unrar ffmpeg
+apt install -y python3.12 python3.12-venv python3-pip git curl wget unrar ffmpeg aria2
 
 print_status "System dependencies installed"
 
