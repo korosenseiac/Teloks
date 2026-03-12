@@ -28,7 +28,6 @@ from app.config import (
     ARIA2_RPC_SECRET,
     TORRENT_DOWNLOAD_DIR,
 )
-from app.torrent.trackers import get_tracker_string, get_tracker_count
 
 
 class Aria2Error(Exception):
@@ -63,52 +62,26 @@ class Aria2Client:
         download_dir = TORRENT_DOWNLOAD_DIR
         os.makedirs(download_dir, exist_ok=True)
 
-        # Build tracker list for maximum peer discovery
-        tracker_str = get_tracker_string()
-        tracker_count = get_tracker_count()
-        print(f"[Torrent] Loading {tracker_count} public trackers")
-
         cmd = [
             aria2c_bin,
             "--enable-rpc",
             f"--rpc-listen-port={self.port}",
             "--rpc-listen-all=false",
-            # --- Torrent settings ---
             "--seed-time=0",
-            "--max-concurrent-downloads=3",
+            "--max-concurrent-downloads=2",
             "--max-overall-download-limit=0",
-            "--max-connection-per-server=16",
-            "--min-split-size=1M",
-            "--split=16",
-            # --- Memory management ---
             "--file-allocation=none",
-            "--disk-cache=32M",
-            "--optimize-concurrent-downloads=true",
-            # --- Peer discovery (key for speed) ---
-            "--bt-max-peers=100",
-            "--bt-request-peer-speed-limit=0",
-            "--bt-stop-timeout=600",
+            "--disk-cache=16M",
+            "--bt-stop-timeout=600",         # stop stalled torrents after 10 min
             "--bt-tracker-connect-timeout=10",
             "--bt-tracker-timeout=10",
-            "--enable-dht=true",
-            "--enable-dht6=true",
-            "--dht-listen-port=6881-6999",
-            "--enable-peer-exchange=true",
-            "--bt-enable-lpd=true",
-            # --- Public trackers for max peer discovery ---
-            f"--bt-tracker={tracker_str}",
-            # --- Misc ---
-            "--follow-torrent=mem",
-            "--summary-interval=0",
+            "--summary-interval=0",          # no periodic console output
             "--auto-save-interval=0",
             "--console-log-level=warn",
             f"--dir={download_dir}",
             "--allow-overwrite=true",
             "--auto-file-renaming=false",
             "--check-integrity=false",
-            "--bt-save-metadata=false",
-            "--bt-detach-seed-only=true",
-            "--realtime-chunk-checksum=false",
         ]
 
         if self.secret:
@@ -233,7 +206,7 @@ class Aria2Client:
         keys = [
             "status", "totalLength", "completedLength", "downloadSpeed",
             "uploadSpeed", "files", "bittorrent", "errorCode", "errorMessage",
-            "followedBy", "dir", "gid", "numSeeders", "connections",
+            "followedBy", "dir", "gid",
         ]
         return await self._rpc("aria2.tellStatus", [gid, keys])
 
@@ -264,16 +237,15 @@ class Aria2Client:
         gid: str,
         *,
         poll_interval: float = 2.0,
-        on_progress: Optional[Any] = None,  # callable(completed, total, speed, seeders, connections)
+        on_progress: Optional[Any] = None,  # callable(completed, total, speed)
         cancel_check: Optional[Any] = None,  # callable() -> bool
     ) -> Dict[str, Any]:
         """Poll until download completes, errors, or is cancelled.
 
         Parameters
         ----------
-        on_progress : callable(completed, total, speed, seeders, connections) | None
-            Called each poll with bytes completed, total, download speed,
-            number of seeders, and total connections.
+        on_progress : callable(completed: int, total: int, speed: int) | None
+            Called each poll with bytes completed, total, and download speed.
         cancel_check : callable() -> bool | None
             If returns True, the download is force-cancelled.
 
@@ -301,11 +273,9 @@ class Aria2Client:
             total = int(status.get("totalLength", 0))
             completed = int(status.get("completedLength", 0))
             speed = int(status.get("downloadSpeed", 0))
-            seeders = int(status.get("numSeeders", 0))
-            connections = int(status.get("connections", 0))
 
             if on_progress and total > 0:
-                on_progress(completed, total, speed, seeders, connections)
+                on_progress(completed, total, speed)
 
             if state == "complete":
                 # Magnet links first resolve metadata, then spawn a
