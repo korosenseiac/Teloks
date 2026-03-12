@@ -1,0 +1,497 @@
+"""
+direct/handler.py — Handler for direct HTTP/HTTPS link downloads.
+
+Processes direct-link downloads to Telegram using the same streaming
+and upload pipeline as other handlers (mediafire, terabox, torrent).
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import random
+import re
+from typing import Dict, List, Optional, Tuple
+
+from pyrogram import Client
+from pyrogram.types import Message
+from pyrogram.raw.functions.messages import SendMedia
+from pyrogram.raw.functions.upload import SaveFilePart
+from pyrogram.raw.types import (
+    InputMediaUploadedDocument,
+    InputMediaUploadedPhoto,
+    DocumentAttributeFilename,
+    DocumentAttributeVideo,
+    InputFile,
+    UpdateShortSentMessage,
+    UpdateShort,
+    UpdateNewMessage,
+    UpdateNewChannelMessage,
+)
+from pyrogram.errors import FloodWait
+
+from app.config import BACKUP_GROUP_ID
+from app.database.db import (
+    save_backup_group_cache,
+    get_backup_group_cache,
+    get_user_session,
+    get_user_profile,
+    log_forward,
+)
+from app.bot.session_manager import manager
+from app.utils.streamer import upload_stream
+from app.utils.media import classify as _classify, mime as _mime, MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM
+from app.direct.client import DirectLinkClient
+from app.direct.streamer import DirectLinkStreamer
+
+# ---------------------------------------------------------------------------
+# Pattern matching for direct links
+# ---------------------------------------------------------------------------
+
+# Match HTTP(S) URLs that are not known services
+# Excluded: mediafire.com, terabox.com, t.me, magnet, .torrent URLs
+EXCLUSIVE_DOMAINS = {
+    "mediafire.com",
+    "1drv.ms",
+    "mega.nz",
+    "cloud.mail.ru",
+    "terabox.com",
+    "freeterabox.com",
+    "1024terabox.com",
+    "t.me",
+    "telegram.me",
+}
+
+DIRECT_LINK_PATTERN = re.compile(
+    r"https?://(?!(?:" + "|".join(re.escape(d) for d in EXCLUSIVE_DOMAINS) + r"))"
+    r"[^\s<>\"']+",
+    re.IGNORECASE
+)
+
+# ---------------------------------------------------------------------------
+# Tracking
+# ---------------------------------------------------------------------------
+
+_direct_client = DirectLinkClient()
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+
+async def _get_backup_group_peer():
+    """Get the backup group peer, caching if needed."""
+    # Try cache first
+    cache = await get_backup_group_cache()
+    if cache and cache.get("group_id"):
+        from pyrogram.raw.types import InputPeerChannel
+        return InputPeerChannel(
+            channel_id=int(str(cache["group_id"]).replace("-100", "")),
+            access_hash=cache.get("access_hash", 0),
+        )
+
+    # Fallback to direct ID
+    from pyrogram.raw.types import InputPeerChannel
+    channel_id = int(str(BACKUP_GROUP_ID).replace("-100", ""))
+    return InputPeerChannel(channel_id=channel_id, access_hash=0)
+
+
+async def _generate_video_thumb(video_path: str) -> Optional[bytes]:
+    """Generate a thumbnail for a video file using ffmpeg."""
+    try:
+        thumb_path = video_path + ".thumb.jpg"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-ss", "1",
+            "-frames:v", "1",
+            "-q:v", "5",
+            "-vf", "scale='min(320,iw)':-2",
+            thumb_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        if proc.returncode == 0 and os.path.exists(thumb_path):
+            with open(thumb_path, "rb") as f:
+                data = f.read()
+            os.remove(thumb_path)
+            if len(data) > 100:
+                return data
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
+    except Exception as e:
+        print(f"[DirectLink] Error generating thumbnail: {e}")
+    return None
+
+
+async def _get_video_metadata(video_path: str) -> Dict[str, int]:
+    """Get video duration, width, height using ffprobe."""
+    meta = {"duration": 0, "width": 0, "height": 0}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0:s=,",
+            video_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0 and stdout:
+            lines = stdout.decode().strip().splitlines()
+            if lines:
+                parts = lines[0].split(",")
+                if len(parts) >= 2:
+                    try:
+                        meta["width"] = int(parts[0])
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        meta["height"] = int(parts[1])
+                    except (ValueError, TypeError):
+                        pass
+                    if len(parts) >= 3:
+                        try:
+                            meta["duration"] = int(float(parts[2]))
+                        except (ValueError, TypeError):
+                            pass
+                if meta["duration"] == 0 and len(lines) > 1:
+                    try:
+                        meta["duration"] = int(float(lines[1].strip().rstrip(",")))
+                    except (ValueError, TypeError):
+                        pass
+    except Exception as e:
+        print(f"[DirectLink] Error getting video metadata: {e}")
+    return meta
+
+
+async def _upload_thumb_to_telegram(bot: Client, thumb_raw: bytes) -> Optional[InputFile]:
+    """Upload thumbnail bytes and return InputFile."""
+    try:
+        thumb_file_id = random.randint(0, 2 ** 63 - 1)
+        await bot.invoke(
+            SaveFilePart(
+                file_id=thumb_file_id,
+                file_part=0,
+                bytes=thumb_raw,
+            )
+        )
+        return InputFile(
+            id=thumb_file_id,
+            parts=1,
+            name="thumb.jpg",
+            md5_checksum="",
+        )
+    except Exception as e:
+        print(f"[DirectLink] Error uploading thumbnail: {e}")
+    return None
+
+
+async def _upload_file_to_backup(
+    bot: Client,
+    backup_peer,
+    streamer,
+    file_name: str,
+    file_size: int,
+) -> Optional[int]:
+    """Upload file to backup group and return message_id."""
+    try:
+        input_file = await upload_stream(bot, streamer, file_name)
+        kind = _classify(file_name)
+        mime_type = _mime(file_name)
+
+        if kind == "photo":
+            media = InputMediaUploadedPhoto(file=input_file)
+        elif kind == "video":
+            # For videos, try to get metadata and thumbnail
+            thumb_raw = None
+            video_meta = {"duration": 0, "width": 0, "height": 0}
+            # Note: We don't have the file locally, so skip ffprobe
+            
+            media = InputMediaUploadedDocument(
+                file=input_file,
+                mime_type=mime_type,
+                attributes=[
+                    DocumentAttributeVideo(
+                        duration=video_meta.get("duration", 0),
+                        w=video_meta.get("width", 0),
+                        h=video_meta.get("height", 0),
+                        supports_streaming=True,
+                    ),
+                    DocumentAttributeFilename(file_name=file_name),
+                ],
+                thumb=None,
+            )
+        else:
+            media = InputMediaUploadedDocument(
+                file=input_file,
+                mime_type=mime_type,
+                attributes=[DocumentAttributeFilename(file_name=file_name)],
+            )
+
+        # Send to backup group with FloodWait handling
+        for attempt in range(1, 4):
+            try:
+                updates = await bot.invoke(
+                    SendMedia(
+                        peer=backup_peer,
+                        media=media,
+                        message="",
+                        random_id=random.randint(0, 2 ** 63 - 1),
+                    )
+                )
+                break
+            except FloodWait as fw:
+                wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 10)
+                print(f"[DirectLink] FloodWait {wait}s (attempt {attempt}/3)")
+                await asyncio.sleep(wait + 1)
+        else:
+            print(f"[DirectLink] SendMedia failed after retries: {file_name}")
+            return None
+
+        # Extract message_id
+        msg_id = _extract_msg_id(updates)
+        if msg_id:
+            return msg_id
+
+        # Fallback: search recent messages
+        print(f"[DirectLink] WARNING: Could not extract msg_id, searching recent messages")
+        try:
+            recent = await bot.get_messages(BACKUP_GROUP_ID, list(range(-1, -4, -1)))
+            if not isinstance(recent, list):
+                recent = [recent]
+            for msg in recent:
+                if msg and not getattr(msg, "empty", False):
+                    fname = None
+                    if msg.document:
+                        fname = msg.document.file_name
+                    elif msg.video:
+                        fname = msg.video.file_name
+                    if fname == file_name:
+                        return msg.id
+        except Exception as e:
+            print(f"[DirectLink] Fallback search failed: {e}")
+
+        return None
+    except Exception as e:
+        print(f"[DirectLink] Upload error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _extract_msg_id(updates) -> Optional[int]:
+    """Extract message_id from Telegram response."""
+    if isinstance(updates, UpdateShortSentMessage):
+        return updates.id
+    if isinstance(updates, UpdateShort):
+        upd = updates.update
+        if isinstance(upd, (UpdateNewMessage, UpdateNewChannelMessage)):
+            return upd.message.id
+    if hasattr(updates, "updates"):
+        for upd in updates.updates:
+            if isinstance(upd, (UpdateNewMessage, UpdateNewChannelMessage)):
+                return upd.message.id
+    return None
+
+
+async def _safe_send(coro_factory, retries: int = 3):
+    """Call coro_factory() with FloodWait handling."""
+    for attempt in range(1, retries + 1):
+        try:
+            return await coro_factory()
+        except FloodWait as fw:
+            wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 10)
+            print(f"[DirectLink] FloodWait {wait}s (attempt {attempt}/{retries})")
+            await asyncio.sleep(wait + 1)
+        except Exception as e:
+            print(f"[DirectLink] Error (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                await asyncio.sleep(2)
+    return None
+
+
+async def _send_to_user(
+    bot: Client,
+    user_id: int,
+    backup_msg_id: int,
+) -> bool:
+    """Copy message from backup group to user."""
+    try:
+        r = await _safe_send(
+            lambda: bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=BACKUP_GROUP_ID,
+                message_id=backup_msg_id,
+            ),
+            retries=3,
+        )
+        return r is not None
+    except Exception as e:
+        print(f"[DirectLink] Failed to send to user: {e}")
+        return False
+
+
+
+
+# ---------------------------------------------------------------------------
+# Main handler
+# ---------------------------------------------------------------------------
+
+
+async def direct_link_handler(bot: Client, message: Message) -> None:
+    """
+    Handler for direct HTTP/HTTPS link downloads.
+    
+    Flow:
+    1. Parse URL from message
+    2. Resolve metadata (file size, filename)
+    3. Validate size limits (based on premium status)
+    4. Stream download from URL
+    5. Upload to backup group
+    6. Copy/send to user
+    """
+    # Avoid circular import by importing here
+    from app.bot.main import active_user_processes, reset_cancel, is_cancelled
+    
+    user_id = message.from_user.id
+
+    # Guard: check if user already has active process
+    if active_user_processes.get(user_id):
+        await message.reply_text(
+            "⚠️ **Ada proses yang sedang berjalan!**\n\n"
+            "Sila tunggu proses sebelumnya selesai sebelum menghantar link baru."
+        )
+        return
+
+    # Check if user is logged in
+    user_session = await get_user_session(user_id)
+    if not user_session:
+        await message.reply_text("❌ Belum login. Sila /start untuk login.")
+        return
+
+    # Check if user has completed profile setup
+    user_profile = await get_user_profile(user_id)
+    if not user_profile:
+        await message.reply_text(
+            "⚠️ **Profile belum lengkap!**\n\n"
+            "Sila set profile anda terlebih dahulu.\n\n"
+            "👇 **Pilih jantina anda:**"
+        )
+        return
+
+    # Extract URL from message
+    match = DIRECT_LINK_PATTERN.search(message.text)
+    if not match:
+        await message.reply_text("❌ Tidak dapat mengesan URL yang sah.")
+        return
+
+    url = match.group(0).strip()
+
+    # Mark user as active
+    active_user_processes[user_id] = True
+    reset_cancel(user_id)
+
+    status_msg = await message.reply_text("🔄 Sedang Diproses..")
+
+    try:
+        # Resolve URL metadata
+        await status_msg.edit("🔍 Mengekstrak metadata URL...")
+        try:
+            metadata = await _direct_client.resolve(url)
+        except Exception as e:
+            await status_msg.edit(f"❌ Tidak dapat mengakses URL: {e}")
+            return
+
+        file_size = metadata.get("size", 0)
+        file_name = metadata.get("filename", "unknown_file")
+        final_url = metadata.get("url", url)
+
+        # Check file size limit
+        is_premium = getattr(message.from_user, "is_premium", False) or False
+        size_limit = MAX_FILE_SIZE_PREMIUM if is_premium else MAX_FILE_SIZE
+
+        if file_size > size_limit:
+            limit_gb = size_limit / (1024 * 1024 * 1024)
+            actual_gb = file_size / (1024 * 1024 * 1024)
+            user_type = "Premium" if is_premium else "Biasa"
+            await status_msg.edit(
+                f"❌ **Fail terlalu besar!**\n\n"
+                f"User {user_type}: Max {limit_gb:.1f} GB\n"
+                f"Fail ini: {actual_gb:.2f} GB"
+            )
+            return
+
+        # Get backup group peer
+        try:
+            backup_peer = await _get_backup_group_peer()
+        except Exception as e:
+            await status_msg.edit(f"❌ Gagal mendapat backup group: {e}")
+            return
+
+        # Create streamer and upload
+        await status_msg.edit(
+            f"📥 Memuat turun: {file_name}\n"
+            f"Saiz: {file_size / (1024*1024):.2f} MB"
+        )
+
+        streamer = DirectLinkStreamer(
+            _direct_client,
+            final_url,
+            file_size,
+            file_name,
+        )
+
+        # Upload to backup group
+        await status_msg.edit("⬆️ Memuat naik ke grup sandaran...")
+        backup_msg_id = await _upload_file_to_backup(
+            bot, backup_peer, streamer, file_name, file_size
+        )
+
+        if not backup_msg_id:
+            await status_msg.edit("❌ Gagal memuat naik ke grup sandaran.")
+            return
+
+        # Send to user
+        await status_msg.edit("⬆️ Menghantar ke anda…")
+        delivered = await _send_to_user(bot, user_id, backup_msg_id)
+
+        if delivered:
+            # Log the upload
+            try:
+                file_size_mb = file_size / (1024 * 1024)
+                await log_forward(
+                    username=message.from_user.username or "Unknown",
+                    backup_message_id=backup_msg_id,
+                    file_size=f"{file_size_mb:.2f} MB",
+                    source_name=f"DirectLink/{file_name}",
+                    backup_message_link=f"https://t.me/c/{abs(BACKUP_GROUP_ID) - 100}/.../{backup_msg_id}",
+                )
+            except Exception as e:
+                print(f"[DirectLink] Logging error: {e}")
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        else:
+            await status_msg.edit("⚠️ Selesai! Fail telah dimuat naik ke grup sandaran tetapi gagal dihantar.")
+
+    except asyncio.CancelledError:
+        await status_msg.edit("❌ Dibatalkan oleh pengguna.")
+    except Exception as e:
+        print(f"[DirectLink] Handler error: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await status_msg.edit(f"❌ Ralat: {e}")
+        except Exception:
+            pass
+    finally:
+        active_user_processes.pop(user_id, None)
+        await _direct_client.close()

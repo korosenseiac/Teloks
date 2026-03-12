@@ -30,6 +30,7 @@ from app.torrent.handler import (
     torrent_link_handler, torrent_file_handler,
     MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
 )
+from app.direct.handler import direct_link_handler, DIRECT_LINK_PATTERN
 from app.utils.media import is_torrent
 import asyncio
 
@@ -463,6 +464,11 @@ async def torrent_file_upload_handler(client: Client, message: Message):
     mime = getattr(doc, "mime_type", "") or ""
     if is_torrent(fname) or mime == "application/x-bittorrent":
         await torrent_file_handler(client, message)
+
+
+@app.on_message(filters.regex(DIRECT_LINK_PATTERN) & filters.private)
+async def direct_link_message_handler(client: Client, message: Message):
+    await direct_link_handler(client, message)
 
 
 @app.on_message(filters.regex(LINK_PATTERN) & filters.private)
