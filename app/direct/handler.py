@@ -42,6 +42,7 @@ from app.utils.streamer import upload_stream
 from app.utils.media import classify as _classify, mime as _mime, MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM
 from app.direct.client import DirectLinkClient
 from app.direct.streamer import DirectLinkStreamer
+from app.terabox.progress import ProgressTracker
 
 # ---------------------------------------------------------------------------
 # Pattern matching for direct links
@@ -198,10 +199,12 @@ async def _upload_file_to_backup(
     streamer,
     file_name: str,
     file_size: int,
+    tracker: Optional[ProgressTracker] = None,
 ) -> Optional[int]:
     """Upload file to backup group and return message_id."""
     try:
-        input_file = await upload_stream(bot, streamer, file_name)
+        on_ul = tracker.add_uploaded if tracker else None
+        input_file = await upload_stream(bot, streamer, file_name, on_upload_chunk=on_ul)
         kind = _classify(file_name)
         mime_type = _mime(file_name)
 
@@ -360,6 +363,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
     from app.bot.main import active_user_processes, reset_cancel, is_cancelled
     
     user_id = message.from_user.id
+    tracker: Optional[ProgressTracker] = None
 
     # Guard: check if user already has active process
     if active_user_processes.get(user_id):
@@ -434,12 +438,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             await status_msg.edit(f"❌ Gagal mendapat backup group: {e}")
             return
 
-        # Create streamer and upload
-        await status_msg.edit(
-            f"📥 Memuat turun: {file_name}\n"
-            f"Saiz: {file_size / (1024*1024):.2f} MB"
-        )
-
+        # Create streamer
         streamer = DirectLinkStreamer(
             _direct_client,
             final_url,
@@ -447,18 +446,24 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             file_name,
         )
 
+        # Create progress tracker
+        tracker = ProgressTracker(status_msg, file_name, file_size)
+        tracker.start()
+
+        # Set download progress callback
+        streamer.on_download_chunk = tracker.add_downloaded
+
         # Upload to backup group
-        await status_msg.edit("⬆️ Memuat naik ke grup sandaran...")
         backup_msg_id = await _upload_file_to_backup(
-            bot, backup_peer, streamer, file_name, file_size
+            bot, backup_peer, streamer, file_name, file_size, tracker=tracker
         )
 
         if not backup_msg_id:
-            await status_msg.edit("❌ Gagal memuat naik ke grup sandaran.")
+            await tracker.stop("❌ Gagal memuat naik ke grup sandaran.")
             return
 
         # Send to user
-        await status_msg.edit("⬆️ Menghantar ke anda…")
+        await tracker.stop("⬆️ Menghantar ke anda…")
         delivered = await _send_to_user(bot, user_id, backup_msg_id)
 
         if delivered:
@@ -483,15 +488,24 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             await status_msg.edit("⚠️ Selesai! Fail telah dimuat naik ke grup sandaran tetapi gagal dihantar.")
 
     except asyncio.CancelledError:
-        await status_msg.edit("❌ Dibatalkan oleh pengguna.")
+        if tracker:
+            await tracker.stop("❌ Dibatalkan oleh pengguna.")
+        else:
+            await status_msg.edit("❌ Dibatalkan oleh pengguna.")
     except Exception as e:
         print(f"[DirectLink] Handler error: {e}")
         import traceback
         traceback.print_exc()
-        try:
-            await status_msg.edit(f"❌ Ralat: {e}")
-        except Exception:
-            pass
+        if tracker:
+            await tracker.stop(f"❌ Ralat: {e}")
+        else:
+            try:
+                await status_msg.edit(f"❌ Ralat: {e}")
+            except Exception:
+                pass
     finally:
+        if tracker:
+            await tracker.stop()
         active_user_processes.pop(user_id, None)
         await _direct_client.close()
+
