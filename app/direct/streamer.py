@@ -67,19 +67,51 @@ class DirectLinkStreamer:
     # ---------------------------------------------------------------- download
 
     async def _downloader(self) -> None:
-        """Download the file in chunks and put them in the queue."""
-        try:
-            async for chunk in self.client.download_stream(
-                self.url, chunk_size=self.CHUNK_SIZE
-            ):
-                await self.queue.put(chunk)
-                if self.on_download_chunk:
-                    self.on_download_chunk(len(chunk))
-        except Exception as e:
-            print(f"[DirectLink] Download error: {e}")
-        finally:
-            self.is_downloading = False
-            await self.queue.put(None)  # EOF sentinel
+        """Download the file in chunks and put them in the queue.
+        Handles network reconnects internally via start_offset."""
+        retries = 3
+        offset = 0
+
+        while retries > 0 and self.is_downloading:
+            try:
+                async for chunk in self.client.download_stream(
+                    self.url, chunk_size=self.CHUNK_SIZE, start_offset=offset
+                ):
+                    await self.queue.put(chunk)
+                    offset += len(chunk)
+                    if self.on_download_chunk:
+                        self.on_download_chunk(len(chunk))
+                
+                # If we get here, the stream finished successfully
+                break
+
+            except Exception as e:
+                import aiohttp
+                if isinstance(e, (aiohttp.ClientError, ValueError)):
+                    print(f"[DirectLink] Download stream dropped (offset {offset}): {e}. Retries left: {retries - 1}")
+                    retries -= 1
+                    if retries > 0:
+                        await asyncio.sleep(2)  # wait before retry
+                        continue
+                print(f"[DirectLink] Unrecoverable download error: {e}")
+                break
+        
+        self.is_downloading = False
+        await self.queue.put(None)  # EOF sentinel
+
+    # ------------------------------------------------------------------- close
+
+    async def close(self) -> None:
+        """Cancel the background reader task if it exists."""
+        if self.download_task is not None and not self.download_task.done():
+            self.download_task.cancel()
+            try:
+                await self.download_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"[DirectLinkStreamer] close error: {e}")
+        self.download_task = None
 
     # ------------------------------------------------------------------- read
 

@@ -116,3 +116,17 @@ class TorrentFileStreamer:
 
     def seek(self, offset: int, whence: int = 0) -> None:
         pass  # streaming — no arbitrary seeking
+
+    # ------------------------------------------------------------------ close
+
+    async def close(self) -> None:
+        """Cancel the background reader task if it exists."""
+        if self.download_task is not None and not self.download_task.done():
+            self.download_task.cancel()
+            try:
+                await self.download_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"[TorrentFileStreamer] close error: {e}")
+        self.download_task = None

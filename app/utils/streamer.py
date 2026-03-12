@@ -227,6 +227,10 @@ async def upload_stream(client: Client, streamer, file_name: str, on_upload_chun
                 raise r
 
     # Verify we uploaded the expected number of parts
+    if bytes_uploaded != file_size:
+        print(f"WARNING: Stream aborted prematurely! Expected {file_size} bytes, got {bytes_uploaded}. File size: {file_size}, uploaded: {bytes_uploaded}")
+        raise ValueError(f"Stream ended prematurely. Uploaded {bytes_uploaded} / {file_size} bytes")
+
     if part_count != total_parts:
         print(f"WARNING: Part count mismatch! Expected {total_parts}, got {part_count}. File size: {file_size}, uploaded: {bytes_uploaded}")
 

@@ -219,11 +219,33 @@ async def _download_video_to_temp(
         f"direct_link_{random.randint(100000, 999999)}_{file_name}"
     )
     loop = asyncio.get_running_loop()
-    async for chunk in client.download_stream(url):
-        # Write chunk to file via executor to avoid blocking the event loop
-        await loop.run_in_executor(None, _append_bytes, temp_file, chunk)
-        if on_download_chunk:
-            on_download_chunk(len(chunk))
+    
+    retries = 3
+    offset = 0
+
+    while retries > 0:
+        try:
+            async for chunk in client.download_stream(url, start_offset=offset):
+                # Write chunk to file via executor to avoid blocking the event loop
+                await loop.run_in_executor(None, _append_bytes, temp_file, chunk)
+                offset += len(chunk)
+                if on_download_chunk:
+                    on_download_chunk(len(chunk))
+            
+            # Successfully downloaded
+            break
+            
+        except Exception as e:
+            import aiohttp
+            if isinstance(e, (aiohttp.ClientError, ValueError)):
+                print(f"[DirectLink] Temp video download dropped (offset {offset}): {e}. Retries config left: {retries - 1}")
+                retries -= 1
+                if retries > 0:
+                    await asyncio.sleep(2)
+                    continue
+            print(f"[DirectLink] Unrecoverable temp video download error: {e}")
+            raise e
+
     return temp_file
 
 
@@ -542,6 +564,9 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             thumb_raw=thumb_raw,
             video_meta=video_meta
         )
+
+        if hasattr(streamer, "close"):
+            await streamer.close()
 
         # Clean up temp video file if created
         if temp_video_path and os.path.exists(temp_video_path):

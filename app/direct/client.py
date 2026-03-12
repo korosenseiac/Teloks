@@ -130,7 +130,7 @@ class DirectLinkClient:
     # --------------------------------------------------------- stream download
 
     async def download_stream(
-        self, url: str, chunk_size: int = 1024 * 1024
+        self, url: str, chunk_size: int = 1024 * 1024, start_offset: int = 0
     ) -> AsyncGenerator[bytes, None]:
         """
         Stream download the file from the URL.
@@ -141,6 +141,8 @@ class DirectLinkClient:
             The HTTP/HTTPS URL to download.
         chunk_size : int
             Size of chunks to yield (default 1 MB).
+        start_offset : int
+            Offset in bytes to start downloading from.
 
         Yields
         ------
@@ -153,8 +155,13 @@ class DirectLinkClient:
         """
         session = await self._get_session()
 
+        headers = {}
+        if start_offset > 0:
+            headers["Range"] = f"bytes={start_offset}-"
+
         async with session.get(
             url,
+            headers=headers,
             timeout=_STREAM_TIMEOUT,
             allow_redirects=True,
             ssl=False,

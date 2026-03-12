@@ -955,6 +955,9 @@ async def _process_torrent(
         else:
             print(f"[Torrent] Skipping {file_name} — upload failed after {MAX_RETRIES} attempts.")
 
+        if hasattr(streamer, "close"):
+            await streamer.close()
+
         # Delete the file from disk immediately after upload
         try:
             os.remove(file_path)
