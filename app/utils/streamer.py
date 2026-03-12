@@ -138,13 +138,17 @@ async def upload_stream(client: Client, streamer, file_name: str, on_upload_chun
     file_size = streamer.file_size
     is_big = file_size > 10 * 1024 * 1024
 
-    # Telegram limits file_total_parts to ~4000 (premium ~8000).
-    # Dynamically choose chunk_size so we never exceed 3999 parts.
-    MAX_PARTS = 3999
+    # Telegram limits file_total_parts to ~8000 (Premium).
+    # chunk_size is hard-capped at 512 KB — Telegram's absolute per-part limit.
+    # Using more parts (up to 8000) is always safer than exceeding the size cap.
+    MAX_PARTS = 8000
+    MAX_CHUNK = 512 * 1024   # Telegram hard limit per part — must never exceed
     MIN_CHUNK = 512 * 1024   # 512 KB — Telegram minimum for big files
     chunk_size = max(MIN_CHUNK, math.ceil(file_size / MAX_PARTS))
     # Round up to the nearest 1 KB (Telegram requirement)
     chunk_size = ((chunk_size + 1023) // 1024) * 1024
+    # Hard cap: never send a part larger than 512 KB regardless of file size
+    chunk_size = min(chunk_size, MAX_CHUNK)
 
     # Calculate total parts from file_size (required for SaveBigFilePart)
     total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
