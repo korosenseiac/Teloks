@@ -54,7 +54,7 @@ from app.database.db import log_forward, get_user_session, get_user_profile
 from app.utils.streamer import upload_stream
 from app.utils.media import (
     PHOTO_EXTS, VIDEO_EXTS, AUDIO_EXTS,
-    MAX_FILE_SIZE,
+    MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM,
     ext as _ext, classify as _classify, mime as _mime,
 )
 from app.torrent.client import Aria2Error
@@ -850,12 +850,16 @@ async def _process_torrent(
         )
         return
 
-    # Filter out files exceeding Telegram's limit (2GB for regular, 4GB for premium)
-    # We use MAX_FILE_SIZE from utils/media.py (2GB)
+    # Filter out files exceeding Telegram's limit
+    # 4 GB for Premium users, 2 GB for regular users
+    is_premium = getattr(message.from_user, "is_premium", False) or False
+    size_limit = MAX_FILE_SIZE_PREMIUM if is_premium else MAX_FILE_SIZE
+    print(f"[Torrent] User premium={is_premium}, size_limit={_format_size(size_limit)}")
+
     skipped = []
     valid_files = []
     for f in files:
-        if f["size"] > MAX_FILE_SIZE:
+        if f["size"] > size_limit:
             skipped.append(f)
         else:
             valid_files.append(f)
@@ -868,7 +872,7 @@ async def _process_torrent(
 
     if not valid_files:
         await status_msg.edit(
-            f"❌ Semua {len(files)} fail melebihi had saiz Telegram ({_format_size(MAX_FILE_SIZE)}).\n\n"
+            f"❌ Semua {len(files)} fail melebihi had saiz Telegram ({_format_size(size_limit)}).\n\n"
             f"Fail terbesar: {files[0]['name']} ({_format_size(files[0]['size'])})"
         )
         return
@@ -971,7 +975,7 @@ async def _process_torrent(
 
     # 9. Send to user
     if skipped:
-        skip_msg = f"\n\n⚠️ {len(skipped)} fail dilangkau (melebihi {_format_size(MAX_FILE_SIZE)})"
+        skip_msg = f"\n\n⚠️ {len(skipped)} fail dilangkau (melebihi {_format_size(size_limit)})"
     else:
         skip_msg = ""
 
@@ -982,7 +986,7 @@ async def _process_torrent(
         try:
             skip_text = (
                 f"⚠️ **{len(skipped)} fail dilangkau** kerana melebihi had saiz "
-                f"Telegram ({_format_size(MAX_FILE_SIZE)}):\n\n"
+                f"Telegram ({_format_size(size_limit)}):\n\n"
             )
             for sf in skipped[:5]:
                 skip_text += f"• `{sf['name']}` ({_format_size(sf['size'])})\n"
