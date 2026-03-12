@@ -206,22 +206,24 @@ async def _download_video_to_temp(
     url: str,
     file_name: str,
     file_size: int,
-    temp_dir: str = "/tmp",
+    on_download_chunk: Optional[callable] = None,
 ) -> str:
     """
-    Download video file to temp directory for metadata extraction.
+    Download video file to temp directory for metadata/thumbnail extraction.
+    Fires on_download_chunk(n) after each chunk so the progress tracker updates
+    during the actual network download.
     Returns path to the temp file.
     """
-    import tempfile
-    temp_file = os.path.join(tempfile.gettempdir(), f"direct_link_{random.randint(100000, 999999)}_{file_name}")
-    
-    downloaded = 0
+    temp_file = os.path.join(
+        tempfile.gettempdir(),
+        f"direct_link_{random.randint(100000, 999999)}_{file_name}"
+    )
+    loop = asyncio.get_running_loop()
     async for chunk in client.download_stream(url):
-        # Write chunk to file (run in executor to avoid blocking)
-        loop = asyncio.get_running_loop()
+        # Write chunk to file via executor to avoid blocking the event loop
         await loop.run_in_executor(None, _append_bytes, temp_file, chunk)
-        downloaded += len(chunk)
-    
+        if on_download_chunk:
+            on_download_chunk(len(chunk))
     return temp_file
 
 
@@ -494,34 +496,37 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         temp_video_path = None
 
         if is_video:
-            # For videos: download to temp, extract metadata, generate thumbnail
-            await status_msg.edit(f"📥 Memuat turun video: {file_name}...")
+            # For videos: download to temp first (needed for ffprobe + thumbnail),
+            # then upload from the local temp file.
+            # Tracker is already started — we pass add_downloaded so the
+            # download bar updates in real-time during the network fetch.
             try:
                 temp_video_path = await _download_video_to_temp(
-                    _direct_client, final_url, file_name, file_size
+                    _direct_client, final_url, file_name, file_size,
+                    on_download_chunk=tracker.add_downloaded,
                 )
-                
-                # Extract metadata
+
+                # Extract metadata with ffprobe
                 video_meta = await _get_video_metadata(temp_video_path)
                 print(f"[DirectLink] Video metadata: {video_meta}")
-                
+
                 # Generate thumbnail at 10% of duration
                 duration = video_meta.get("duration", 0)
                 thumb_raw = await _generate_video_thumb(temp_video_path, duration)
                 if thumb_raw:
                     print(f"[DirectLink] Thumbnail generated: {len(thumb_raw)} bytes")
-                
-                # Create FileStreamer for upload (from temp file)
-                streamer = FileStreamer(temp_video_path, file_name, tracker.add_downloaded)
+
+                # Upload from temp file — download is already fully counted,
+                # so don't pass on_download_chunk to FileStreamer.
+                streamer = FileStreamer(temp_video_path, file_name)
             except Exception as e:
                 print(f"[DirectLink] Video processing error: {e}")
-                if tracker:
-                    await tracker.stop(f"❌ Ralat pemprosesan video: {e}")
+                await tracker.stop(f"❌ Ralat pemprosesan video: {e}")
                 if temp_video_path and os.path.exists(temp_video_path):
                     os.remove(temp_video_path)
                 return
         else:
-            # For non-videos: stream directly from URL
+            # For non-videos: stream directly from URL (no temp file needed)
             streamer = DirectLinkStreamer(
                 _direct_client,
                 final_url,
