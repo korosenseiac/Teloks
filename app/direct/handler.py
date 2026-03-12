@@ -10,6 +10,7 @@ import asyncio
 import os
 import random
 import re
+import tempfile
 from typing import Dict, List, Optional, Tuple
 
 from pyrogram import Client
@@ -39,10 +40,11 @@ from app.database.db import (
 )
 from app.bot.session_manager import manager
 from app.utils.streamer import upload_stream
-from app.utils.media import classify as _classify, mime as _mime, MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM
+from app.utils.media import classify as _classify, mime as _mime, ext as _ext, MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM, VIDEO_EXTS
 from app.direct.client import DirectLinkClient
 from app.direct.streamer import DirectLinkStreamer
 from app.terabox.progress import ProgressTracker
+from app.mediafire.streamer import FileStreamer
 
 # ---------------------------------------------------------------------------
 # Pattern matching for direct links
@@ -97,14 +99,20 @@ async def _get_backup_group_peer():
     return InputPeerChannel(channel_id=channel_id, access_hash=0)
 
 
-async def _generate_video_thumb(video_path: str) -> Optional[bytes]:
-    """Generate a thumbnail for a video file using ffmpeg."""
+async def _generate_video_thumb(video_path: str, duration_sec: int = 0) -> Optional[bytes]:
+    """Generate a thumbnail for a video file using ffmpeg.
+    
+    Seeks to 10% of video duration (or 1 second if duration unknown).
+    """
     try:
         thumb_path = video_path + ".thumb.jpg"
+        # If duration is known, seek to 10% of the video
+        seek_time = max(1, int(duration_sec * 0.1)) if duration_sec > 0 else 1
+        
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
             "-i", video_path,
-            "-ss", "1",
+            "-ss", str(seek_time),
             "-frames:v", "1",
             "-q:v", "5",
             "-vf", "scale='min(320,iw)':-2",
@@ -193,6 +201,36 @@ async def _upload_thumb_to_telegram(bot: Client, thumb_raw: bytes) -> Optional[I
     return None
 
 
+async def _download_video_to_temp(
+    client: DirectLinkClient,
+    url: str,
+    file_name: str,
+    file_size: int,
+    temp_dir: str = "/tmp",
+) -> str:
+    """
+    Download video file to temp directory for metadata extraction.
+    Returns path to the temp file.
+    """
+    import tempfile
+    temp_file = os.path.join(tempfile.gettempdir(), f"direct_link_{random.randint(100000, 999999)}_{file_name}")
+    
+    downloaded = 0
+    async for chunk in client.download_stream(url):
+        # Write chunk to file (run in executor to avoid blocking)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _append_bytes, temp_file, chunk)
+        downloaded += len(chunk)
+    
+    return temp_file
+
+
+def _append_bytes(path: str, data: bytes) -> None:
+    """Append bytes to file (blocking — call via executor)."""
+    with open(path, "ab") as f:
+        f.write(data)
+
+
 async def _upload_file_to_backup(
     bot: Client,
     backup_peer,
@@ -200,6 +238,8 @@ async def _upload_file_to_backup(
     file_name: str,
     file_size: int,
     tracker: Optional[ProgressTracker] = None,
+    thumb_raw: Optional[bytes] = None,
+    video_meta: Optional[Dict[str, int]] = None,
 ) -> Optional[int]:
     """Upload file to backup group and return message_id."""
     try:
@@ -211,24 +251,29 @@ async def _upload_file_to_backup(
         if kind == "photo":
             media = InputMediaUploadedPhoto(file=input_file)
         elif kind == "video":
-            # For videos, try to get metadata and thumbnail
-            thumb_raw = None
-            video_meta = {"duration": 0, "width": 0, "height": 0}
-            # Note: We don't have the file locally, so skip ffprobe
-            
+            vm = video_meta or {}
+            duration = vm.get("duration", 0)
+            width = vm.get("width", 0)
+            height = vm.get("height", 0)
+
+            # Upload thumbnail if available
+            thumb_input_file = None
+            if thumb_raw:
+                thumb_input_file = await _upload_thumb_to_telegram(bot, thumb_raw)
+                if thumb_input_file:
+                    print(f"[DirectLink] Thumbnail uploaded for {file_name} ({len(thumb_raw)} bytes)")
+
             media = InputMediaUploadedDocument(
                 file=input_file,
                 mime_type=mime_type,
                 attributes=[
                     DocumentAttributeVideo(
-                        duration=video_meta.get("duration", 0),
-                        w=video_meta.get("width", 0),
-                        h=video_meta.get("height", 0),
+                        duration=duration, w=width, h=height,
                         supports_streaming=True,
                     ),
                     DocumentAttributeFilename(file_name=file_name),
                 ],
-                thumb=None,
+                thumb=thumb_input_file,
             )
         else:
             media = InputMediaUploadedDocument(
@@ -438,25 +483,67 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             await status_msg.edit(f"❌ Gagal mendapat backup group: {e}")
             return
 
-        # Create streamer
-        streamer = DirectLinkStreamer(
-            _direct_client,
-            final_url,
-            file_size,
-            file_name,
-        )
-
         # Create progress tracker
         tracker = ProgressTracker(status_msg, file_name, file_size)
         tracker.start()
 
-        # Set download progress callback
-        streamer.on_download_chunk = tracker.add_downloaded
+        # Check if file is a video
+        is_video = _ext(file_name) in VIDEO_EXTS
+        thumb_raw = None
+        video_meta: Optional[Dict[str, int]] = None
+        temp_video_path = None
 
-        # Upload to backup group
+        if is_video:
+            # For videos: download to temp, extract metadata, generate thumbnail
+            await status_msg.edit(f"📥 Memuat turun video: {file_name}...")
+            try:
+                temp_video_path = await _download_video_to_temp(
+                    _direct_client, final_url, file_name, file_size
+                )
+                
+                # Extract metadata
+                video_meta = await _get_video_metadata(temp_video_path)
+                print(f"[DirectLink] Video metadata: {video_meta}")
+                
+                # Generate thumbnail at 10% of duration
+                duration = video_meta.get("duration", 0)
+                thumb_raw = await _generate_video_thumb(temp_video_path, duration)
+                if thumb_raw:
+                    print(f"[DirectLink] Thumbnail generated: {len(thumb_raw)} bytes")
+                
+                # Create FileStreamer for upload (from temp file)
+                streamer = FileStreamer(temp_video_path, file_name, tracker.add_downloaded)
+            except Exception as e:
+                print(f"[DirectLink] Video processing error: {e}")
+                if tracker:
+                    await tracker.stop(f"❌ Ralat pemprosesan video: {e}")
+                if temp_video_path and os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+                return
+        else:
+            # For non-videos: stream directly from URL
+            streamer = DirectLinkStreamer(
+                _direct_client,
+                final_url,
+                file_size,
+                file_name,
+                on_download_chunk=tracker.add_downloaded,
+            )
+
+        # Upload to backup group with metadata and thumbnail
         backup_msg_id = await _upload_file_to_backup(
-            bot, backup_peer, streamer, file_name, file_size, tracker=tracker
+            bot, backup_peer, streamer, file_name, file_size, 
+            tracker=tracker,
+            thumb_raw=thumb_raw,
+            video_meta=video_meta
         )
+
+        # Clean up temp video file if created
+        if temp_video_path and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+            except Exception as e:
+                print(f"[DirectLink] Cleanup error: {e}")
 
         if not backup_msg_id:
             await tracker.stop("❌ Gagal memuat naik ke grup sandaran.")
