@@ -111,8 +111,8 @@ async def _generate_video_thumb(video_path: str, duration_sec: int = 0) -> Optio
         
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
-            "-i", video_path,
             "-ss", str(seek_time),
+            "-i", video_path,
             "-frames:v", "1",
             "-q:v", "5",
             "-vf", "scale='min(320,iw)':-2",
@@ -411,12 +411,12 @@ async def _send_to_user(
         if is_sent_to_bot:
             # File is ALREADY in the user's chat (they sent it to the bot)
             # We just need to forward/copy it to the backup group to keep a record.
-            # Using forward_messages so it retains its identity or copy_message if forward is disabled
+            # Using forward_messages so it retains its identity
             await _safe_send(
-                lambda: bot.copy_message(
+                lambda: bot.forward_messages(
                     chat_id=BACKUP_GROUP_ID,
                     from_chat_id=user_id,
-                    message_id=msg_id,
+                    message_ids=msg_id,
                 ),
                 retries=3,
             )
@@ -623,11 +623,11 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
                 channel_id_str = str(BACKUP_GROUP_ID).replace("-100", "")
                 link = f"https://t.me/c/{channel_id_str}/{msg_id}" if not is_sent_to_bot else None
                 await log_forward(
-                    username=message.from_user.username or "Unknown",
-                    backup_message_id=msg_id, # Use msg_id directly
-                    file_size=f"{file_size / (1024 * 1024):.2f} MB", # Calculate file_size_mb here
-                    source_name=f"DirectLink/{file_name}",
-                    backup_message_link=link, # Use the determined link
+                    message.from_user.username or "Unknown",
+                    msg_id,
+                    file_size,
+                    f"DirectLink/{file_name}",
+                    link
                 )
             except Exception as e:
                 print(f"[DirectLink] Logging error: {e}")

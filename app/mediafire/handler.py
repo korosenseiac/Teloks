@@ -102,8 +102,8 @@ async def _generate_video_thumb(video_path: str) -> Optional[bytes]:
         thumb_path = video_path + ".thumb.jpg"
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
-            "-i", video_path,
             "-ss", "1",          # seek to 1 second
+            "-i", video_path,
             "-frames:v", "1",    # single frame
             "-q:v", "5",         # JPEG quality (lower = better, 2-31)
             "-vf", "scale='min(320,iw)':-2",  # max 320px wide, keep ratio
@@ -393,10 +393,10 @@ async def _send_album_to_user(
     async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
         if is_sent_to_bot:
             r = await _safe_send(
-                lambda _mid=mid: bot.copy_message(
+                lambda _mid=mid: bot.forward_messages(
                     chat_id=BACKUP_GROUP_ID,
                     from_chat_id=user_id,
-                    message_id=_mid,
+                    message_ids=_mid,
                 )
             )
             if r:
@@ -505,10 +505,10 @@ async def _deliver_to_user(
     async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
         if is_sent_to_bot:
             r = await _safe_send(
-                lambda _mid=mid: bot.copy_message(
+                lambda _mid=mid: bot.forward_messages(
                     chat_id=BACKUP_GROUP_ID,
                     from_chat_id=user_id,
-                    message_id=_mid,
+                    message_ids=_mid,
                 )
             )
             if r:
@@ -817,7 +817,7 @@ async def _handle_direct_media(
         link = f"https://t.me/c/{channel_id_str}/{bmid}" if not is_sent_to_bot else None
         await log_forward(
             message.from_user.username, bmid, file_size,
-            f"MediaFire/{filename}", link,
+            f"MediaFire/{filename}", link
         )
 
         # Deliver to user
@@ -1065,7 +1065,7 @@ async def _handle_archive(
                     _lnk = f"https://t.me/c/{_cid}/{_b}" if not _is_bot else None
                     await log_forward(
                         message.from_user.username, _b, _s,
-                        f"MediaFire/{filename}/{_n}", _lnk,
+                        f"MediaFire/{filename}/{_n}", _lnk
                     )
             gc.collect()
 
@@ -1141,7 +1141,7 @@ async def _handle_archive(
                     link = f"https://t.me/c/{channel_id_str}/{bmid}" if not is_sent_to_bot else None
                     await log_forward(
                         message.from_user.username, bmid, mf["size"],
-                        f"MediaFire/{filename}/{mf['name']}", link,
+                        f"MediaFire/{filename}/{mf['name']}", link
                     )
                 else:
                     print(f"[MediaFire] Skipping {mf['name']} \u2014 upload failed after {MAX_RETRIES} attempts.")

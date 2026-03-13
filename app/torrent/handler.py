@@ -128,8 +128,8 @@ async def _generate_video_thumb(video_path: str) -> Optional[bytes]:
         thumb_path = video_path + ".thumb.jpg"
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
-            "-i", video_path,
             "-ss", "1",
+            "-i", video_path,
             "-frames:v", "1",
             "-q:v", "5",
             "-vf", "scale='min(320,iw)':-2",
@@ -368,10 +368,10 @@ async def _send_album_to_user(
         if is_sent_to_bot:
             # It's already in the user's chat, forward/copy to backup group
             r = await _safe_send(
-                lambda _mid=mid: bot.copy_message(
+                lambda _mid=mid: bot.forward_messages(
                     chat_id=BACKUP_GROUP_ID,
                     from_chat_id=user_id,
-                    message_id=_mid,
+                    message_ids=_mid,
                 )
             )
             if r:
@@ -1010,7 +1010,7 @@ async def _process_torrent(
             link = f"https://t.me/c/{channel_id_str}/{bmid}" if not is_sent_to_bot else None
             await log_forward(
                 message.from_user.username, bmid, file_size,
-                f"Torrent/{torrent_name}/{file_name}", link,
+                f"Torrent/{torrent_name}/{file_name}", link
             )
         else:
             print(f"[Torrent] Skipping {file_name} — upload failed after {MAX_RETRIES} attempts.")

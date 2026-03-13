@@ -770,7 +770,10 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                     _b, _k, _n, _s, _is_bot = _pr
                     _cid = str(BACKUP_GROUP_ID).replace("-100", "")
                     _lnk = f"https://t.me/c/{_cid}/{_b}" if not _is_bot else None
-                    await log_forward(message.from_user.username, _b, _s, f"TeraBox/{surl}", _lnk)
+                    await log_forward(
+                        message.from_user.username, _b, _s,
+                        f"TeraBox/{surl}", _lnk
+                    )
 
         # --- Phase B: Upload non-photos sequentially with full progress ---
         for _seq_idx, entry in enumerate(_non_photo_entries, 1):
@@ -861,10 +864,10 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             """Send a single backup message to the user. Returns True on success."""
             if is_sent_to_bot:
                 r = await _safe_send(
-                    lambda _mid=mid: bot.copy_message(
+                    lambda _mid=mid: bot.forward_messages(
                         chat_id=BACKUP_GROUP_ID,
                         from_chat_id=user_id,
-                        message_id=_mid,
+                        message_ids=_mid,
                     )
                 )
                 if r:
