@@ -6,6 +6,7 @@ for any HTTP/HTTPS URL.
 """
 from __future__ import annotations
 
+import os
 import re
 from typing import AsyncGenerator, Dict, Optional
 from urllib.parse import urlparse, unquote
@@ -57,6 +58,52 @@ class DirectLinkClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    def _get_proxy_url(self) -> Optional[str]:
+        """Read proxy.txt from project root and construct proxy URL."""
+        # Project root is 3 levels up from app/direct/client.py
+        root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        proxy_file = os.path.join(root_dir, "proxy.txt")
+        
+        if not os.path.exists(proxy_file):
+            # Fallback for deployed path if needed
+            if os.path.exists("/opt/telegram-forwarder-bot/proxy.txt"):
+                proxy_file = "/opt/telegram-forwarder-bot/proxy.txt"
+            else:
+                return None
+        
+        try:
+            with open(proxy_file, "r") as f:
+                content = f.read()
+            
+            host = port = username = password = None
+            for line in content.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if ":" in line:
+                    key, val = line.split(":", 1)
+                    key = key.strip().lower()
+                    val = val.strip()
+                    if key == "host":
+                        host = val
+                    elif key == "port":
+                        port = val
+                    elif key == "username":
+                        username = val
+                    elif key == "password":
+                        password = val
+            
+            if host and port:
+                if username and password:
+                    from urllib.parse import quote
+                    user_quoted = quote(username)
+                    pass_quoted = quote(password)
+                    return f"http://{user_quoted}:{pass_quoted}@{host}:{port}"
+                return f"http://{host}:{port}"
+        except Exception as e:
+            print(f"[DirectLink] Error reading proxy.txt: {e}")
+        return None
+
     # ---------------------------------------------------------------- resolve
 
     async def resolve(self, url: str) -> Dict[str, object]:
@@ -90,12 +137,14 @@ class DirectLinkClient:
             raise ValueError(f"Invalid URL: no hostname")
 
         # GET with redirects to find final URL and metadata
+        proxy_url = self._get_proxy_url()
         try:
             async with session.head(
                 url,
                 timeout=_TIMEOUT,
                 allow_redirects=True,
                 ssl=False,
+                proxy=proxy_url,
             ) as resp:
                 if resp.status >= 400:
                     raise ValueError(
@@ -159,12 +208,15 @@ class DirectLinkClient:
         if start_offset > 0:
             headers["Range"] = f"bytes={start_offset}-"
 
+        proxy_url = self._get_proxy_url()
+
         async with session.get(
             url,
             headers=headers,
             timeout=_STREAM_TIMEOUT,
             allow_redirects=True,
             ssl=False,
+            proxy=proxy_url,
         ) as resp:
             if resp.status >= 400:
                 raise ValueError(f"HTTP {resp.status} for {url}")

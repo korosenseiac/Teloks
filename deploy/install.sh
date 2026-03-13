@@ -222,6 +222,9 @@ case "$1" in
     edit-env)
         sudo nano $BOT_DIR/.env
         ;;
+    edit-proxy)
+        sudo nano $BOT_DIR/proxy.txt
+        ;;
     update)
         echo "========================================="
         echo "  Updating Bot from GitHub..."
@@ -282,6 +285,7 @@ case "$1" in
         echo "  logs        - Show live logs (Ctrl+C to exit)"
         echo "  logs-tail   - Show last N logs (default 100)"
         echo "  edit-env    - Edit environment variables"
+        echo "  edit-proxy  - Edit HTTP proxy configuration"
         echo "  update      - Pull latest version from GitHub and restart"
         ;;
 esac

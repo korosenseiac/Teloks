@@ -142,6 +142,7 @@ case "$1" in
     logs) sudo journalctl -u $SERVICE_NAME -f --no-pager ;;
     logs-tail) sudo journalctl -u $SERVICE_NAME -n ${2:-100} --no-pager ;;
     edit-env) sudo nano $BOT_DIR/.env ;;
+    edit-proxy) sudo nano $BOT_DIR/proxy.txt ;;
     update)
         echo "========================================="
         echo "  Updating Bot from GitHub..."
@@ -180,7 +181,7 @@ case "$1" in
         echo "  Update Complete!"
         echo "========================================="
         ;;
-    *) echo "Usage: bot {start|stop|restart|status|logs|logs-tail|edit-env|update}" ;;
+    *) echo "Usage: bot {start|stop|restart|status|logs|logs-tail|edit-env|edit-proxy|update}" ;;
 esac
 BOTCMD
 chmod +x /usr/local/bin/bot
