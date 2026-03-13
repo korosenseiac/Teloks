@@ -688,7 +688,7 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
     print(f"[Torrent] user={user_id} type={link_type} link={link[:80]}…")
 
     # ---------------------------------------------------------------- Start
-    active_user_processes[user_id] = True
+    active_user_processes[user_id] = asyncio.current_task()
     reset_cancel(user_id)
     status_msg = await message.reply_text("🧲 Memulakan muat turun torrent…")
     temp_dir = tempfile.mkdtemp(prefix="torrent_")
@@ -704,6 +704,8 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
             await status_msg.edit(f"❌ Ralat torrent: {e}")
         except Exception:
             pass
+    except asyncio.CancelledError:
+        print(f"[Torrent] Handler cancelled for user {user_id}")
     except Exception as e:
         print(f"[Torrent] Handler error: {e}")
         import traceback
@@ -771,7 +773,7 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
         return
 
     # ---------------------------------------------------------------- Download .torrent file
-    active_user_processes[user_id] = True
+    active_user_processes[user_id] = asyncio.current_task()
     reset_cancel(user_id)
     status_msg = await message.reply_text("🧲 Memuat turun fail .torrent…")
     temp_dir = tempfile.mkdtemp(prefix="torrent_")
@@ -795,6 +797,8 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
             await status_msg.edit(f"❌ Ralat torrent: {e}")
         except Exception:
             pass
+    except asyncio.CancelledError:
+        print(f"[Torrent] Handler cancelled for user {user_id}")
     except Exception as e:
         print(f"[Torrent] Handler error: {e}")
         import traceback

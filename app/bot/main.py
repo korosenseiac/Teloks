@@ -58,6 +58,10 @@ def request_cancel(user_id: int):
     if user_id not in cancel_events:
         cancel_events[user_id] = asyncio.Event()
     cancel_events[user_id].set()
+    
+    task = active_user_processes.get(user_id)
+    if isinstance(task, asyncio.Task):
+        task.cancel()
 
 # File size limit (2GB in bytes)
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
@@ -403,8 +407,8 @@ async def cancel_handler(client: Client, message: Message):
         request_cancel(user_id)
         await message.reply_text(
             "🚫 **Membatalkan proses...**\n\n"
-            "Proses akan dibatalkan selepas operasi semasa selesai.\n"
-            "💾 Folder sementara akan dibersihkan."
+            "Proses telah dibatalkan dengan serta-merta.\n"
+            "💾 Folder sementara telah dibersihkan."
         )
         return
 
@@ -554,7 +558,7 @@ async def link_handler(client: Client, message: Message):
     print(f"DEBUG: Backup Group ID: {BACKUP_GROUP_ID}")
 
     # Mark user as having an active process
-    active_user_processes[user_id] = True
+    active_user_processes[user_id] = asyncio.current_task()
     reset_cancel(user_id)
 
     status_msg = await message.reply_text(f"🔄 Sedang Diproses..")
@@ -792,6 +796,8 @@ async def link_handler(client: Client, message: Message):
         
         await status_msg.delete()
 
+    except asyncio.CancelledError:
+        print(f"[Main] Process cancelled by user {user_id}")
     except Exception as e:
         await status_msg.edit(f"....")
         import traceback

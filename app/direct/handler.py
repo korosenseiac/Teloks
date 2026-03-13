@@ -534,7 +534,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
     url = match.group(0).strip()
 
     # Mark user as active
-    active_user_processes[user_id] = True
+    active_user_processes[user_id] = asyncio.current_task()
     reset_cancel(user_id)
 
     status_msg = await message.reply_text("🔄 Sedang Diproses..")

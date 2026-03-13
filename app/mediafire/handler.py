@@ -709,7 +709,7 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
     print(f"[MediaFire] user={user_id} url={url!r}")
 
     # ---------------------------------------------------------------- Start
-    active_user_processes[user_id] = True
+    active_user_processes[user_id] = asyncio.current_task()
     reset_cancel(user_id)
     status_msg = await message.reply_text("🔍 Menyelesaikan link MediaFire…")
 
@@ -772,6 +772,8 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
                 "yang mengandungi foto/video."
             )
 
+    except asyncio.CancelledError:
+        print(f"[MediaFire] Handler cancelled for user {user_id}")
     except Exception as e:
         print(f"[MediaFire] Handler error: {e}")
         import traceback

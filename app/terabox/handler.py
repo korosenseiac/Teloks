@@ -469,7 +469,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
     print(f"[TB:handler] user={user_id} raw_link={message.text.strip()!r} share_host={share_host!r} surl={surl!r}")
 
     # ---------------------------------------------------------------- Start
-    active_user_processes[user_id] = True
+    active_user_processes[user_id] = asyncio.current_task()
     reset_cancel(user_id)
     status_msg = await message.reply_text("🔍 Parsing share link…")
 
@@ -1068,6 +1068,8 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             except Exception:
                 pass
 
+    except asyncio.CancelledError:
+        print(f"[TeraBox] Handler cancelled for user {user_id}")
     except Exception as e:
         print(f"[TeraBox] Handler error: {e}")
         import traceback; traceback.print_exc()
