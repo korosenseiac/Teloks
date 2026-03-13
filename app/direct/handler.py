@@ -526,7 +526,8 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         return
 
     # Extract URL from message
-    match = DIRECT_LINK_PATTERN.search(message.text)
+    message_text = message.text or message.caption or ""
+    match = DIRECT_LINK_PATTERN.search(message_text)
     if not match:
         await message.reply_text("❌ Tidak dapat mengesan URL yang sah.")
         return
@@ -584,6 +585,19 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         video_meta: Optional[Dict[str, int]] = None
         temp_video_path = None
 
+        # Load user-provided custom thumbnail if present
+        if message.photo:
+            try:
+                await status_msg.edit("🖼 Menyediakan gambar kecil (thumbnail)...")
+                custom_thumb_path = await message.download()
+                if custom_thumb_path:
+                    with open(custom_thumb_path, "rb") as f:
+                        thumb_raw = f.read()
+                    os.remove(custom_thumb_path)
+                    print(f"[DirectLink] Custom thumbnail loaded: {len(thumb_raw)} bytes")
+            except Exception as e:
+                print(f"[DirectLink] Failed to download custom thumbnail: {e}")
+
         if is_video:
             # For videos: download to temp first (needed for ffprobe + thumbnail),
             # then upload from the local temp file.
@@ -601,9 +615,12 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
 
                 # Generate thumbnail at 10% of duration
                 duration = video_meta.get("duration", 0)
-                thumb_raw = await _generate_video_thumb(temp_video_path, duration)
-                if thumb_raw:
-                    print(f"[DirectLink] Thumbnail generated: {len(thumb_raw)} bytes")
+                if not thumb_raw:
+                    thumb_raw = await _generate_video_thumb(temp_video_path, duration)
+                    if thumb_raw:
+                        print(f"[DirectLink] Thumbnail generated: {len(thumb_raw)} bytes")
+                else:
+                    print(f"[DirectLink] Skipping thumbnail generation, using custom thumbnail.")
 
                 # Upload from temp file — download is already fully counted,
                 # so don't pass on_download_chunk to FileStreamer.
