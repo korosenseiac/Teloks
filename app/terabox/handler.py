@@ -246,8 +246,8 @@ async def _upload_terabox_file_to_backup(
             on_download_chunk=on_dl,
         )
         
-        # Use user_client for uploading if the file is > 2GB (requires Premium)
-        upload_client = user_client if file_size > 2 * 1024 * 1024 * 1024 else bot
+        # User requested Option 2 (user client -> bot chat) for ALL files
+        upload_client = user_client
         
         # If using user_client, send to the bot instead of the backup group
         is_sent_to_bot = (upload_client == user_client)
