@@ -257,6 +257,7 @@ def _append_bytes(path: str, data: bytes) -> None:
 
 async def _upload_file_to_backup(
     bot: Client,
+    user_client: Client,
     backup_peer,
     streamer,
     file_name: str,
@@ -264,11 +265,19 @@ async def _upload_file_to_backup(
     tracker: Optional[ProgressTracker] = None,
     thumb_raw: Optional[bytes] = None,
     video_meta: Optional[Dict[str, int]] = None,
-) -> Optional[int]:
-    """Upload file to backup group and return message_id."""
+) -> Tuple[Optional[int], bool]:
+    """Upload file to backup group (or bot chat if large) and return (message_id, is_sent_to_bot)."""
     try:
         on_ul = tracker.add_uploaded if tracker else None
-        input_file = await upload_stream(bot, streamer, file_name, on_upload_chunk=on_ul)
+        
+        # Use user_client for uploading if the file is > 2GB (requires Premium)
+        upload_client = user_client if file_size > 2 * 1024 * 1024 * 1024 else bot
+        
+        # If using user_client, send to the bot instead of the backup group (Option 2)
+        is_sent_to_bot = (upload_client == user_client)
+        upload_peer = bot.me.username if is_sent_to_bot else backup_peer
+        
+        input_file = await upload_stream(upload_client, streamer, file_name, on_upload_chunk=on_ul)
         kind = _classify(file_name)
         mime_type = _mime(file_name)
 
@@ -283,7 +292,7 @@ async def _upload_file_to_backup(
             # Upload thumbnail if available
             thumb_input_file = None
             if thumb_raw:
-                thumb_input_file = await _upload_thumb_to_telegram(bot, thumb_raw)
+                thumb_input_file = await _upload_thumb_to_telegram(upload_client, thumb_raw)
                 if thumb_input_file:
                     print(f"[DirectLink] Thumbnail uploaded for {file_name} ({len(thumb_raw)} bytes)")
 
@@ -306,12 +315,12 @@ async def _upload_file_to_backup(
                 attributes=[DocumentAttributeFilename(file_name=file_name)],
             )
 
-        # Send to backup group with FloodWait handling
+        # Send to target peer with FloodWait handling
         for attempt in range(1, 4):
             try:
-                updates = await bot.invoke(
+                updates = await upload_client.invoke(
                     SendMedia(
-                        peer=backup_peer,
+                        peer=await upload_client.resolve_peer(upload_peer),
                         media=media,
                         message="",
                         random_id=random.randint(0, 2 ** 63 - 1),
@@ -329,12 +338,15 @@ async def _upload_file_to_backup(
         # Extract message_id
         msg_id = _extract_msg_id(updates)
         if msg_id:
-            return msg_id
+            return msg_id, is_sent_to_bot
 
         # Fallback: search recent messages
         print(f"[DirectLink] WARNING: Could not extract msg_id, searching recent messages")
         try:
-            recent = await bot.get_messages(BACKUP_GROUP_ID, list(range(-1, -4, -1)))
+            target_chat_id = bot.me.id if is_sent_to_bot else BACKUP_GROUP_ID
+            search_client = upload_client if is_sent_to_bot else bot
+            
+            recent = await search_client.get_messages(target_chat_id, list(range(-1, -4, -1)))
             if not isinstance(recent, list):
                 recent = [recent]
             for msg in recent:
@@ -345,16 +357,16 @@ async def _upload_file_to_backup(
                     elif msg.video:
                         fname = msg.video.file_name
                     if fname == file_name:
-                        return msg.id
+                        return msg.id, is_sent_to_bot
         except Exception as e:
             print(f"[DirectLink] Fallback search failed: {e}")
 
-        return None
+        return None, is_sent_to_bot
     except Exception as e:
         print(f"[DirectLink] Upload error: {e}")
         import traceback
         traceback.print_exc()
-        return None
+        return None, False
 
 
 def _extract_msg_id(updates) -> Optional[int]:
@@ -391,19 +403,36 @@ async def _safe_send(coro_factory, retries: int = 3):
 async def _send_to_user(
     bot: Client,
     user_id: int,
-    backup_msg_id: int,
+    msg_id: int,
+    is_sent_to_bot: bool,
 ) -> bool:
-    """Copy message from backup group to user."""
+    """Deliver file to user and ensure it's in the backup group."""
     try:
-        r = await _safe_send(
-            lambda: bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=BACKUP_GROUP_ID,
-                message_id=backup_msg_id,
-            ),
-            retries=3,
-        )
-        return r is not None
+        if is_sent_to_bot:
+            # File is ALREADY in the user's chat (they sent it to the bot)
+            # We just need to forward/copy it to the backup group to keep a record.
+            # Using forward_messages so it retains its identity or copy_message if forward is disabled
+            await _safe_send(
+                lambda: bot.copy_message(
+                    chat_id=BACKUP_GROUP_ID,
+                    from_chat_id=user_id,
+                    message_id=msg_id,
+                ),
+                retries=3,
+            )
+            # For the user, it is delivered.
+            return True
+        else:
+            # File is in backup group. Copy to user.
+            r = await _safe_send(
+                lambda: bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=BACKUP_GROUP_ID,
+                    message_id=msg_id,
+                ),
+                retries=3,
+            )
+            return r is not None
     except Exception as e:
         print(f"[DirectLink] Failed to send to user: {e}")
         return False
@@ -446,6 +475,11 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
     user_session = await get_user_session(user_id)
     if not user_session:
         await message.reply_text("❌ Belum login. Sila /start untuk login.")
+        return
+
+    user_client = await manager.get_client(user_id)
+    if not user_client:
+        await message.reply_text("❌ Sesi tidak sah. Sila login semula.")
         return
 
     # Check if user has completed profile setup
@@ -558,8 +592,8 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             )
 
         # Upload to backup group with metadata and thumbnail
-        backup_msg_id = await _upload_file_to_backup(
-            bot, backup_peer, streamer, file_name, file_size, 
+        msg_id, is_sent_to_bot = await _upload_file_to_backup(
+            bot, user_client, backup_peer, streamer, file_name, file_size, 
             tracker=tracker,
             thumb_raw=thumb_raw,
             video_meta=video_meta
@@ -575,24 +609,25 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             except Exception as e:
                 print(f"[DirectLink] Cleanup error: {e}")
 
-        if not backup_msg_id:
+        if not msg_id:
             await tracker.stop("❌ Gagal memuat naik ke grup sandaran.")
             return
 
         # Send to user
         await tracker.stop("⬆️ Menghantar ke anda…")
-        delivered = await _send_to_user(bot, user_id, backup_msg_id)
+        delivered = await _send_to_user(bot, user_id, msg_id, is_sent_to_bot)
 
         if delivered:
             # Log the upload
             try:
-                file_size_mb = file_size / (1024 * 1024)
+                channel_id_str = str(BACKUP_GROUP_ID).replace("-100", "")
+                link = f"https://t.me/c/{channel_id_str}/{msg_id}" if not is_sent_to_bot else None
                 await log_forward(
                     username=message.from_user.username or "Unknown",
-                    backup_message_id=backup_msg_id,
-                    file_size=f"{file_size_mb:.2f} MB",
+                    backup_message_id=msg_id, # Use msg_id directly
+                    file_size=f"{file_size / (1024 * 1024):.2f} MB", # Calculate file_size_mb here
                     source_name=f"DirectLink/{file_name}",
-                    backup_message_link=f"https://t.me/c/{abs(BACKUP_GROUP_ID) - 100}/.../{backup_msg_id}",
+                    backup_message_link=link, # Use the determined link
                 )
             except Exception as e:
                 print(f"[DirectLink] Logging error: {e}")

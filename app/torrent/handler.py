@@ -60,6 +60,7 @@ from app.utils.media import (
 from app.torrent.client import Aria2Error
 from app.torrent.streamer import TorrentFileStreamer
 from app.terabox.progress import ProgressTracker
+from app.bot.session_manager import manager
 
 # ---------------------------------------------------------------------------
 # Link patterns
@@ -224,6 +225,7 @@ async def _upload_thumb_to_telegram(
 
 async def _upload_file_to_backup(
     bot: Client,
+    user_client: Client,
     backup_peer,
     streamer,
     file_name: str,
@@ -231,11 +233,19 @@ async def _upload_file_to_backup(
     tracker=None,
     thumb_raw: Optional[bytes] = None,
     video_meta: Optional[Dict[str, int]] = None,
-) -> Optional[int]:
-    """Upload *streamer* to backup group. Returns message_id or None."""
+) -> Tuple[Optional[int], bool]:
+    """Upload *streamer* to backup group. Returns (message_id, is_sent_to_bot)."""
     try:
         on_ul = tracker.add_uploaded if tracker else None
-        input_file = await upload_stream(bot, streamer, file_name, on_upload_chunk=on_ul)
+        
+        # Use user_client for uploading if the file is > 2GB (requires Premium)
+        upload_client = user_client if file_size > 2 * 1024 * 1024 * 1024 else bot
+        
+        # If using user_client, send to the bot instead of the backup group
+        is_sent_to_bot = (upload_client == user_client)
+        upload_peer = bot.me.username if is_sent_to_bot else backup_peer
+        
+        input_file = await upload_stream(upload_client, streamer, file_name, on_upload_chunk=on_ul)
 
         kind = _classify(file_name)
         mime_type = _mime(file_name)
@@ -246,7 +256,7 @@ async def _upload_file_to_backup(
             vm = video_meta or {}
             thumb_input_file = None
             if thumb_raw:
-                thumb_input_file = await _upload_thumb_to_telegram(bot, thumb_raw)
+                thumb_input_file = await _upload_thumb_to_telegram(upload_client, thumb_raw)
             media = InputMediaUploadedDocument(
                 file=input_file,
                 mime_type=mime_type,
@@ -271,9 +281,9 @@ async def _upload_file_to_backup(
         # SendMedia with FloodWait handling
         for _attempt in range(1, 4):
             try:
-                updates = await bot.invoke(
+                updates = await upload_client.invoke(
                     SendMedia(
-                        peer=backup_peer,
+                        peer=await upload_client.resolve_peer(upload_peer),
                         media=media,
                         message="",
                         random_id=random.randint(0, 2 ** 63 - 1),
@@ -290,12 +300,15 @@ async def _upload_file_to_backup(
 
         msg_id = _extract_msg_id(updates)
         if msg_id:
-            return msg_id
+            return msg_id, is_sent_to_bot
 
         # Fallback — scan recent messages
         print(f"[Torrent] WARNING: Could not extract msg_id for {file_name}")
         try:
-            recent = await bot.get_messages(BACKUP_GROUP_ID, list(range(-1, -4, -1)))
+            target_chat_id = bot.me.id if is_sent_to_bot else BACKUP_GROUP_ID
+            search_client = upload_client if is_sent_to_bot else bot
+            
+            recent = await search_client.get_messages(target_chat_id, list(range(-1, -4, -1)))
             if not isinstance(recent, list):
                 recent = [recent]
             for msg in recent:
@@ -306,16 +319,16 @@ async def _upload_file_to_backup(
                     elif msg.video:
                         fname = msg.video.file_name
                     if fname == file_name:
-                        return msg.id
+                        return msg.id, is_sent_to_bot
         except Exception as fb_err:
             print(f"[Torrent] Fallback search failed: {fb_err}")
 
-        return None
+        return None, is_sent_to_bot
     except Exception as e:
         print(f"[Torrent] _upload_file_to_backup error ({file_name}): {e}")
         import traceback
         traceback.print_exc()
-        return None
+        return None, False
 
 
 # ---------------------------------------------------------------------------
@@ -344,36 +357,58 @@ async def _safe_send(coro_factory, retries: int = 3):
 async def _send_album_to_user(
     bot: Client,
     user_id: int,
-    items: List[Tuple[int, str, str, int]],
+    items: List[Tuple[int, str, str, int, bool]],
     delivered_mids: set,
 ) -> None:
     if not items:
         return
     CHUNK = 8
 
-    async def _send_single(mid: int) -> bool:
-        r = await _safe_send(
-            lambda _mid=mid: bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=BACKUP_GROUP_ID,
-                message_id=_mid,
+    async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
+        if is_sent_to_bot:
+            # It's already in the user's chat, forward/copy to backup group
+            r = await _safe_send(
+                lambda _mid=mid: bot.copy_message(
+                    chat_id=BACKUP_GROUP_ID,
+                    from_chat_id=user_id,
+                    message_id=_mid,
+                )
             )
-        )
-        if r:
-            delivered_mids.add(mid)
-            return True
-        return False
+            if r:
+                delivered_mids.add(mid)
+                return True
+            return False
+        else:
+            r = await _safe_send(
+                lambda _mid=mid: bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=BACKUP_GROUP_ID,
+                    message_id=_mid,
+                )
+            )
+            if r:
+                delivered_mids.add(mid)
+                return True
+            return False
 
     for i in range(0, len(items), CHUNK):
         chunk = items[i : i + CHUNK]
         chunk_mids = [mid for mid, *_ in chunk]
+        
+        # Cannot group nicely if mixed between backup and user chat, so we filter
+        # For simplify, if any in chunk is_sent_to_bot, send individually
+        if any(is_bot for _, _, _, _, is_bot in chunk):
+            for mid, kind, name, size, is_sent_to_bot in chunk:
+                await _send_single(mid, is_sent_to_bot)
+                await asyncio.sleep(0.5)
+            continue
 
         backup_msgs = await _safe_send(
             lambda _ids=chunk_mids: bot.get_messages(BACKUP_GROUP_ID, _ids)
         )
         if backup_msgs is None:
-            for mid, kind, name, size in chunk:
-                await _send_single(mid)
+            for mid, kind, name, size, is_sent_to_bot in chunk:
+                await _send_single(mid, is_sent_to_bot)
                 await asyncio.sleep(0.5)
             continue
 
@@ -396,13 +431,13 @@ async def _send_album_to_user(
                 valid_mids.append(msg.id)
 
         if not media_list:
-            for mid, kind, name, size in chunk:
-                await _send_single(mid)
+            for mid, kind, name, size, is_sent_to_bot in chunk:
+                await _send_single(mid, is_sent_to_bot)
                 await asyncio.sleep(0.5)
             continue
 
         if len(media_list) == 1:
-            await _send_single(valid_mids[0])
+            await _send_single(valid_mids[0], False)
         else:
             r = await _safe_send(
                 lambda _ml=media_list: bot.send_media_group(user_id, _ml)
@@ -429,45 +464,58 @@ async def _send_album_to_user(
 async def _deliver_to_user(
     bot: Client,
     user_id: int,
-    uploaded: List[Tuple[int, str, str, int]],
+    uploaded: List[Tuple[int, str, str, int, bool]],
     status_msg: Message,
 ) -> None:
     await status_msg.edit("⬆️ Menghantar ke anda…")
 
     delivered_mids: set = set()
 
-    async def _send_single(mid: int) -> bool:
-        r = await _safe_send(
-            lambda _mid=mid: bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=BACKUP_GROUP_ID,
-                message_id=_mid,
+    async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
+        if is_sent_to_bot:
+            r = await _safe_send(
+                lambda _mid=mid: bot.copy_message(
+                    chat_id=BACKUP_GROUP_ID,
+                    from_chat_id=user_id,
+                    message_id=_mid,
+                )
             )
-        )
-        if r:
-            delivered_mids.add(mid)
-            return True
-        return False
+            if r:
+                delivered_mids.add(mid)
+                return True
+            return False
+        else:
+            r = await _safe_send(
+                lambda _mid=mid: bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=BACKUP_GROUP_ID,
+                    message_id=_mid,
+                )
+            )
+            if r:
+                delivered_mids.add(mid)
+                return True
+            return False
 
-    photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
-    videos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
-    others = [(mid, k, n, s) for mid, k, n, s in uploaded if k not in ("photo", "video")]
+    photos = [(mid, k, n, s, is_bot) for mid, k, n, s, is_bot in uploaded if k == "photo"]
+    videos = [(mid, k, n, s, is_bot) for mid, k, n, s, is_bot in uploaded if k == "video"]
+    others = [(mid, k, n, s, is_bot) for mid, k, n, s, is_bot in uploaded if k not in ("photo", "video")]
 
     await _send_album_to_user(bot, user_id, photos, delivered_mids)
     await _send_album_to_user(bot, user_id, videos, delivered_mids)
 
-    for mid, *_ in others:
-        await _send_single(mid)
+    for mid, k, n, s, is_bot in others:
+        await _send_single(mid, is_bot)
         await asyncio.sleep(0.5)
 
     # Safety net
-    all_mids = {mid for mid, *_ in uploaded}
-    missing = all_mids - delivered_mids
+    all_mids_map = {mid: is_bot for mid, k, n, s, is_bot in uploaded}
+    missing = set(all_mids_map.keys()) - delivered_mids
     if missing:
         print(f"[Torrent] Safety net: {len(missing)} file(s) resending")
         await asyncio.sleep(2)
         for mid in missing:
-            await _send_single(mid)
+            await _send_single(mid, all_mids_map[mid])
             await asyncio.sleep(1)
 
     sent_count = len(delivered_mids)
@@ -581,6 +629,11 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
         user_profile_states[user_id] = {"step": ProfileStep.ASK_GENDER, "data": {}}
         return
 
+    user_client = await manager.get_client(user_id)
+    if not user_client:
+        await message.reply_text("❌ Sesi tidak sah. Sila login semula.")
+        return
+
     # ---------------------------------------------------------------- Detect link type
     text = message.text or ""
     magnet_match = MAGNET_LINK_PATTERN.search(text)
@@ -609,7 +662,7 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
 
     try:
         await _process_torrent(
-            bot, message, status_msg, user_id,
+            bot, user_client, message, status_msg, user_id,
             link, link_type, temp_dir,
         )
     except Aria2Error as e:
@@ -679,6 +732,11 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
         user_profile_states[user_id] = {"step": ProfileStep.ASK_GENDER, "data": {}}
         return
 
+    user_client = await manager.get_client(user_id)
+    if not user_client:
+        await message.reply_text("❌ Sesi tidak sah. Sila login semula.")
+        return
+
     # ---------------------------------------------------------------- Download .torrent file
     active_user_processes[user_id] = True
     reset_cancel(user_id)
@@ -695,7 +753,7 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
             return
 
         await _process_torrent(
-            bot, message, status_msg, user_id,
+            bot, user_client, message, status_msg, user_id,
             torrent_file_path, "torrent_file", temp_dir,
         )
     except Aria2Error as e:
@@ -728,6 +786,7 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
 
 async def _process_torrent(
     bot: Client,
+    user_client: Client,
     message: Message,
     status_msg: Message,
     user_id: int,
@@ -920,13 +979,14 @@ async def _process_torrent(
         tracker.start()
 
         bmid = None
+        is_sent_to_bot = False
         for attempt in range(1, MAX_RETRIES + 1):
             streamer = TorrentFileStreamer(
                 file_path, file_name,
                 on_read_chunk=tracker.add_downloaded,
             )
-            bmid = await _upload_file_to_backup(
-                bot, backup_peer, streamer,
+            bmid, is_sent_to_bot = await _upload_file_to_backup(
+                bot, user_client, backup_peer, streamer,
                 file_name, file_size,
                 tracker=tracker,
                 thumb_raw=thumb_raw,
@@ -945,9 +1005,9 @@ async def _process_torrent(
         await tracker.stop()
 
         if bmid:
-            uploaded.append((bmid, file_kind, file_name, file_size))
+            uploaded.append((bmid, file_kind, file_name, file_size, is_sent_to_bot))
             channel_id_str = str(BACKUP_GROUP_ID).replace("-100", "")
-            link = f"https://t.me/c/{channel_id_str}/{bmid}"
+            link = f"https://t.me/c/{channel_id_str}/{bmid}" if not is_sent_to_bot else None
             await log_forward(
                 message.from_user.username, bmid, file_size,
                 f"Torrent/{torrent_name}/{file_name}", link,
