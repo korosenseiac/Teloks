@@ -295,6 +295,19 @@ async def _upload_terabox_file_to_backup(
                 attributes=[DocumentAttributeFilename(file_name=file_name)],
             )
 
+        # Register interceptor future if sending to bot
+        fut = None
+        uid = None
+        if is_sent_to_bot:
+            from app.bot.main import pending_bot_uploads
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            me = await user_client.get_me()
+            uid = me.id
+            if uid not in pending_bot_uploads:
+                pending_bot_uploads[uid] = []
+            pending_bot_uploads[uid].append((file_name, fut))
+
         # Retry SendMedia with FloodWait handling
         SEND_RETRIES = 5
         updates = None
@@ -341,27 +354,29 @@ async def _upload_terabox_file_to_backup(
                     break
 
         if is_sent_to_bot:
-            user_me = await user_client.get_me()
-            await asyncio.sleep(2)
-            backup_msg_id = None
-            async for m in bot.get_chat_history(user_me.id, limit=10):
-                if m.media:
-                    try:
-                        fw_msg = await bot.forward_messages(
-                            chat_id=BACKUP_GROUP_ID,
-                            from_chat_id=user_me.id,
-                            message_ids=m.id
-                        )
-                        if fw_msg:
-                            backup_msg_id = fw_msg.id
-                            break
-                    except Exception as e:
-                        print(f"[TeraBox] Failed to forward bot message {m.id}: {e}")
-            
-            if backup_msg_id:
-                return backup_msg_id, True
-            else:
-                print(f"[TeraBox] Failed to find or forward message to backup group for {file_name}")
+            try:
+                bot_msg = await asyncio.wait_for(fut, timeout=120)
+                backup_msg_id = None
+                try:
+                    fw_msg = await bot.forward_messages(
+                        chat_id=BACKUP_GROUP_ID,
+                        from_chat_id=bot_msg.chat.id,
+                        message_ids=bot_msg.id
+                    )
+                    if fw_msg:
+                        backup_msg_id = fw_msg.id
+                except Exception as e:
+                    print(f"[TeraBox] Failed to forward bot message {bot_msg.id}: {e}")
+                
+                if backup_msg_id:
+                    return backup_msg_id, True
+                else:
+                    print(f"[TeraBox] Failed to forward message to backup group for {file_name}")
+                    return None, True
+            except asyncio.TimeoutError:
+                print(f"[TeraBox] Timeout waiting for bot to receive the message for {file_name}")
+                if uid in pending_bot_uploads:
+                    pending_bot_uploads[uid] = [p for p in pending_bot_uploads[uid] if p[1] != fut]
                 return None, True
 
         if msg_id:

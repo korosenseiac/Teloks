@@ -40,6 +40,9 @@ active_user_processes = {}
 # Cancellation events per user (user_id: asyncio.Event)
 cancel_events = {}
 
+# Track pending bot uploads for Option 2 (user_id -> list of (file_name, asyncio.Future))
+pending_bot_uploads = {}
+
 def is_cancelled(user_id: int) -> bool:
     """Check if the user's process has been cancelled."""
     event = cancel_events.get(user_id)
@@ -452,6 +455,26 @@ async def torrent_magnet_handler(client: Client, message: Message):
 @app.on_message(filters.regex(TORRENT_URL_PATTERN) & filters.private)
 async def torrent_url_handler(client: Client, message: Message):
     await torrent_link_handler(client, message)
+
+
+@app.on_message(filters.media & filters.private, group=0)
+async def bot_media_interceptor(client: Client, message: Message):
+    """Intercept media messages sent by the user to the bot during Option 2 uploads."""
+    user_id = message.from_user.id
+    if user_id in pending_bot_uploads and pending_bot_uploads[user_id]:
+        media_obj = message.document or message.video or message.audio or message.photo
+        if not media_obj:
+            return
+        file_name = getattr(media_obj, "file_name", None)
+        
+        for i, (fname, fut) in enumerate(pending_bot_uploads[user_id]):
+            # if name matches, or if it's a photo without a name and we expect a photo
+            if fname == file_name or (file_name is None and message.photo):
+                if not fut.done():
+                    fut.set_result(message)
+                pending_bot_uploads[user_id].pop(i)
+                message.stop_propagation()
+                return
 
 
 @app.on_message(filters.document & filters.private, group=2)
