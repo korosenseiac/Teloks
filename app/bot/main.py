@@ -461,7 +461,13 @@ async def torrent_url_handler(client: Client, message: Message):
     await torrent_link_handler(client, message)
 
 
-@app.on_message(filters.media & filters.private, group=0)
+async def _is_pending_upload(_, __, message: Message):
+    user_id = message.from_user.id if message.from_user else None
+    return bool(user_id and user_id in pending_bot_uploads and pending_bot_uploads[user_id])
+
+pending_upload_filter = filters.create(_is_pending_upload)
+
+@app.on_message(filters.media & filters.private & pending_upload_filter, group=0)
 async def bot_media_interceptor(client: Client, message: Message):
     """Intercept media messages sent by the user to the bot during Option 2 uploads."""
     user_id = message.from_user.id
