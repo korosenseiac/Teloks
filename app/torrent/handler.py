@@ -299,31 +299,49 @@ async def _upload_file_to_backup(
             return None
 
         msg_id = _extract_msg_id(updates)
+        
+        if is_sent_to_bot:
+            user_me = await user_client.get_me()
+            await asyncio.sleep(2)
+            backup_msg_id = None
+            async for m in bot.get_chat_history(user_me.id, limit=10):
+                if m.media:
+                    try:
+                        fw_msg = await bot.forward_messages(
+                            chat_id=BACKUP_GROUP_ID,
+                            from_chat_id=user_me.id,
+                            message_ids=m.id
+                        )
+                        if fw_msg:
+                            backup_msg_id = fw_msg.id
+                            break
+                    except Exception as e:
+                        print(f"[Torrent] Failed to forward bot message {m.id}: {e}")
+            
+            if backup_msg_id:
+                return backup_msg_id, True
+            else:
+                print("[Torrent] Failed to find or forward message to backup group")
+                return None, True
+
         if msg_id:
-            return msg_id, is_sent_to_bot
+            return msg_id, False
 
         # Fallback — scan recent messages
         print(f"[Torrent] WARNING: Could not extract msg_id for {file_name}")
         try:
-            target_chat_id = bot.me.id if is_sent_to_bot else BACKUP_GROUP_ID
-            search_client = upload_client if is_sent_to_bot else bot
-            
-            recent = await search_client.get_messages(target_chat_id, list(range(-1, -4, -1)))
+            recent = await bot.get_messages(BACKUP_GROUP_ID, list(range(-1, -4, -1)))
             if not isinstance(recent, list):
                 recent = [recent]
             for msg in recent:
                 if msg and not getattr(msg, "empty", False):
-                    fname = None
-                    if msg.document:
-                        fname = msg.document.file_name
-                    elif msg.video:
-                        fname = msg.video.file_name
+                    fname = getattr(msg.document or msg.video, "file_name", None)
                     if fname == file_name:
-                        return msg.id, is_sent_to_bot
+                        return msg.id, False
         except Exception as fb_err:
             print(f"[Torrent] Fallback search failed: {fb_err}")
 
-        return None, is_sent_to_bot
+        return None, False
     except Exception as e:
         print(f"[Torrent] _upload_file_to_backup error ({file_name}): {e}")
         import traceback

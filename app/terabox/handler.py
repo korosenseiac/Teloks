@@ -340,20 +340,41 @@ async def _upload_terabox_file_to_backup(
                     msg_id = upd.message.id
                     break
 
+        if is_sent_to_bot:
+            user_me = await user_client.get_me()
+            await asyncio.sleep(2)
+            backup_msg_id = None
+            async for m in bot.get_chat_history(user_me.id, limit=10):
+                if m.media:
+                    try:
+                        fw_msg = await bot.forward_messages(
+                            chat_id=BACKUP_GROUP_ID,
+                            from_chat_id=user_me.id,
+                            message_ids=m.id
+                        )
+                        if fw_msg:
+                            backup_msg_id = fw_msg.id
+                            break
+                    except Exception as e:
+                        print(f"[TeraBox] Failed to forward bot message {m.id}: {e}")
+            
+            if backup_msg_id:
+                return backup_msg_id, True
+            else:
+                print(f"[TeraBox] Failed to find or forward message to backup group for {file_name}")
+                return None, True
+
         if msg_id:
-            return msg_id, is_sent_to_bot
+            return msg_id, False
 
         # Fallback: scan recent messages in the backup group
         print(f"[TeraBox] WARNING: Could not extract msg_id from SendMedia response type={type(updates).__name__} for {file_name}")
         print(f"[TeraBox] Response: {updates}")
 
-        # Try to find the just-uploaded message by searching recent messages
+        # Try to find the just-uploaded message by searching recent messages in BACKUP GRoUP
         try:
-            target_chat_id = bot.me.id if is_sent_to_bot else BACKUP_GROUP_ID
-            search_client = upload_client if is_sent_to_bot else bot
-
-            recent = await search_client.get_messages(
-                target_chat_id, list(range(-1, -4, -1))  # last 3 messages
+            recent = await bot.get_messages(
+                BACKUP_GROUP_ID, list(range(-1, -4, -1))  # last 3 messages
             )
             if not isinstance(recent, list):
                 recent = [recent]
@@ -368,11 +389,11 @@ async def _upload_terabox_file_to_backup(
                         fname = msg.audio.file_name
                     if fname == file_name:
                         print(f"[TeraBox] Fallback: found msg_id={msg.id} for {file_name}")
-                        return msg.id, is_sent_to_bot
+                        return msg.id, False
         except Exception as fb_err:
             print(f"[TeraBox] Fallback search failed: {fb_err}")
 
-        return None, is_sent_to_bot
+        return None, False
 
     except Exception as e:
         print(f"[TeraBox] _upload_terabox_file_to_backup error ({file_name}): {e}")
