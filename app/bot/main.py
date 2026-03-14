@@ -472,14 +472,16 @@ async def bot_media_interceptor(client: Client, message: Message):
     """Intercept media messages sent by the user to the bot during Option 2 uploads."""
     user_id = message.from_user.id
     if user_id in pending_bot_uploads and pending_bot_uploads[user_id]:
-        media_obj = message.document or message.video or message.audio or message.photo
+        media_obj = (message.document or message.video or message.audio or 
+                     message.photo or message.animation or message.voice)
         if not media_obj:
             return
         file_name = getattr(media_obj, "file_name", None)
         
         for i, (fname, fut) in enumerate(pending_bot_uploads[user_id]):
             # if name matches, or if it's a photo without a name and we expect a photo
-            if fname == file_name or (file_name is None and message.photo):
+            # fallback: if there is only 1 pending upload, just resolve it to avoid timeouts.
+            if fname == file_name or (file_name is None and message.photo) or len(pending_bot_uploads[user_id]) == 1:
                 if not fut.done():
                     fut.set_result(message)
                 pending_bot_uploads[user_id].pop(i)

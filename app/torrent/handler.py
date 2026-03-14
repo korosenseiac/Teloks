@@ -399,18 +399,8 @@ async def _send_album_to_user(
 
     async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
         if is_sent_to_bot:
-            # It's already in the user's chat, forward/copy to backup group
-            r = await _safe_send(
-                lambda _mid=mid: bot.forward_messages(
-                    chat_id=BACKUP_GROUP_ID,
-                    from_chat_id=user_id,
-                    message_ids=_mid,
-                )
-            )
-            if r:
-                delivered_mids.add(mid)
-                return True
-            return False
+            delivered_mids.add(mid)
+            return True
         else:
             r = await _safe_send(
                 lambda _mid=mid: bot.copy_message(
@@ -506,17 +496,8 @@ async def _deliver_to_user(
 
     async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
         if is_sent_to_bot:
-            r = await _safe_send(
-                lambda _mid=mid: bot.copy_message(
-                    chat_id=BACKUP_GROUP_ID,
-                    from_chat_id=user_id,
-                    message_id=_mid,
-                )
-            )
-            if r:
-                delivered_mids.add(mid)
-                return True
-            return False
+            delivered_mids.add(mid)
+            return True
         else:
             r = await _safe_send(
                 lambda _mid=mid: bot.copy_message(

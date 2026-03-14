@@ -442,18 +442,10 @@ async def _send_to_user(
     """Deliver file to user and ensure it's in the backup group."""
     try:
         if is_sent_to_bot:
-            # File is ALREADY in the user's chat (they sent it to the bot)
-            # We just need to forward/copy it to the backup group to keep a record.
-            # Using forward_messages so it retains its identity
-            await _safe_send(
-                lambda: bot.forward_messages(
-                    chat_id=BACKUP_GROUP_ID,
-                    from_chat_id=user_id,
-                    message_ids=msg_id,
-                ),
-                retries=3,
-            )
-            # For the user, it is delivered.
+            # The file was uploaded by the user_client directly to the bot chat.
+            # It's already fully visible to the user as if they sent it themselves.
+            # `_upload_file_to_backup` has ALSO already forwarded it to the backup group.
+            # We don't need to do any further forwarding here.
             return True
         else:
             # File is in backup group. Copy to user.

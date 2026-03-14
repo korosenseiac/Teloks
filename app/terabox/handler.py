@@ -899,17 +899,8 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
             """Send a single backup message to the user. Returns True on success."""
             if is_sent_to_bot:
-                r = await _safe_send(
-                    lambda _mid=mid: bot.forward_messages(
-                        chat_id=BACKUP_GROUP_ID,
-                        from_chat_id=user_id,
-                        message_ids=_mid,
-                    )
-                )
-                if r:
-                    delivered_mids.add(mid)
-                    return True
-                return False
+                delivered_mids.add(mid)
+                return True
             else:
                 r = await _safe_send(
                     lambda _mid=mid: bot.copy_message(
