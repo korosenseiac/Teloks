@@ -114,7 +114,7 @@ async def _generate_video_thumb(video_path: str, duration_sec: int = 0) -> Optio
             "-ss", str(seek_time),
             "-i", video_path,
             "-frames:v", "1",
-            "-q:v", "5",
+            "-q:v", "2",
             "-vf", "scale='min(320,iw)':-2",
             thumb_path,
             stdout=asyncio.subprocess.DEVNULL,
@@ -133,6 +133,28 @@ async def _generate_video_thumb(video_path: str, duration_sec: int = 0) -> Optio
     except Exception as e:
         print(f"[DirectLink] Error generating thumbnail: {e}")
     return None
+
+
+def _resize_thumb_high_quality(raw: bytes, max_side: int = 320) -> bytes:
+    """Resize thumbnail to max_side px on longest side, using high JPEG quality."""
+    from io import BytesIO
+    try:
+        from PIL import Image
+        img = Image.open(BytesIO(raw))
+        # Convert RGBA/palette to RGB for JPEG
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        # Resize preserving aspect ratio
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+    except ImportError:
+        print("[DirectLink] Pillow not installed, returning raw thumbnail")
+        return raw
+    except Exception as e:
+        print(f"[DirectLink] Thumbnail resize error: {e}")
+        return raw
 
 
 async def _get_video_metadata(video_path: str) -> Dict[str, int]:
@@ -578,15 +600,29 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         temp_video_path = None
 
         # Load user-provided custom thumbnail if present
-        if message.photo:
+        # Prefer document (full quality) over photo (Telegram-compressed)
+        custom_thumb_source = None
+        if message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+            custom_thumb_source = "document"
+        elif message.photo:
+            custom_thumb_source = "photo"
+
+        if custom_thumb_source:
             try:
                 await status_msg.edit("🖼 Menyediakan gambar kecil (thumbnail)...")
-                custom_thumb_path = await message.download()
+                if custom_thumb_source == "document":
+                    # Document = full quality, no Telegram compression
+                    custom_thumb_path = await message.download()
+                else:
+                    # Photo = download the largest available size
+                    custom_thumb_path = await bot.download_media(message.photo.file_id)
                 if custom_thumb_path:
                     with open(custom_thumb_path, "rb") as f:
                         thumb_raw = f.read()
                     os.remove(custom_thumb_path)
-                    print(f"[DirectLink] Custom thumbnail loaded: {len(thumb_raw)} bytes")
+                    # Resize to 320px with high JPEG quality
+                    thumb_raw = _resize_thumb_high_quality(thumb_raw)
+                    print(f"[DirectLink] Custom thumbnail loaded ({custom_thumb_source}): {len(thumb_raw)} bytes")
             except Exception as e:
                 print(f"[DirectLink] Failed to download custom thumbnail: {e}")
 
