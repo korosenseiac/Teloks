@@ -47,9 +47,20 @@ class DirectLinkClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            proxy_url = self._get_proxy_url()
+            if proxy_url:
+                try:
+                    from aiohttp_socks import ProxyConnector
+                    connector = ProxyConnector.from_url(proxy_url, limit_per_host=5)
+                except ImportError:
+                    print("[DirectLink] 'aiohttp_socks' not installed. Ignoring SOCKS5 proxy.")
+                    connector = aiohttp.TCPConnector(limit_per_host=5)
+            else:
+                connector = aiohttp.TCPConnector(limit_per_host=5)
+            
             self._session = aiohttp.ClientSession(
                 headers={"User-Agent": _USER_AGENT},
-                connector=aiohttp.TCPConnector(limit_per_host=5),
+                connector=connector,
             )
         return self._session
 
@@ -98,8 +109,8 @@ class DirectLinkClient:
                     from urllib.parse import quote
                     user_quoted = quote(username)
                     pass_quoted = quote(password)
-                    return f"http://{user_quoted}:{pass_quoted}@{host}:{port}"
-                return f"http://{host}:{port}"
+                    return f"socks5://{user_quoted}:{pass_quoted}@{host}:{port}"
+                return f"socks5://{host}:{port}"
         except Exception as e:
             print(f"[DirectLink] Error reading proxy.txt: {e}")
         return None
@@ -137,14 +148,12 @@ class DirectLinkClient:
             raise ValueError(f"Invalid URL: no hostname")
 
         # GET with redirects to find final URL and metadata
-        proxy_url = self._get_proxy_url()
         try:
             async with session.head(
                 url,
                 timeout=_TIMEOUT,
                 allow_redirects=True,
                 ssl=False,
-                proxy=proxy_url,
             ) as resp:
                 if resp.status >= 400:
                     raise ValueError(
@@ -208,15 +217,12 @@ class DirectLinkClient:
         if start_offset > 0:
             headers["Range"] = f"bytes={start_offset}-"
 
-        proxy_url = self._get_proxy_url()
-
         async with session.get(
             url,
             headers=headers,
             timeout=_STREAM_TIMEOUT,
             allow_redirects=True,
             ssl=False,
-            proxy=proxy_url,
         ) as resp:
             if resp.status >= 400:
                 raise ValueError(f"HTTP {resp.status} for {url}")
