@@ -1,4 +1,4 @@
-host: 54.254.239.80
-port: 40872
-username: KdxhQVArcz
-password: 6ygRHvDYBF
+host: 18.143.130.111
+port: 1080
+username: alep
+password: alep

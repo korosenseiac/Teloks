@@ -48,7 +48,6 @@ from app.database.db import log_forward, get_user_session, get_user_profile
 from app.utils.streamer import upload_stream
 from app.terabox.streamer import TeraBoxMediaStreamer
 from app.terabox.progress import ProgressTracker
-from app.bot.session_manager import manager
 
 # ---------------------------------------------------------------------------
 # Multi-domain regex for TeraBox share links
@@ -223,7 +222,6 @@ async def _upload_thumb_to_telegram(bot: Client, thumb_raw: bytes) -> Optional[I
 
 async def _upload_terabox_file_to_backup(
     bot: Client,
-    user_client: Client,
     tb_client,
     backup_peer,
     dlink: str,
@@ -231,10 +229,10 @@ async def _upload_terabox_file_to_backup(
     file_name: str,
     thumb_url: str = "",
     tracker: Optional[ProgressTracker] = None,
-) -> Tuple[Optional[int], bool]:
+) -> Optional[int]:
     """
-    Download from TeraBox and upload to the backup Telegram group (or bot chat if >2GB).
-    Returns (message_id, is_sent_to_bot).
+    Download from TeraBox and upload to the backup Telegram group using the bot session.
+    Returns message_id or None on failure.
     """
     try:
         # Build callbacks for progress tracking
@@ -245,15 +243,9 @@ async def _upload_terabox_file_to_backup(
             tb_client, dlink, file_size, file_name,
             on_download_chunk=on_dl,
         )
-        
-        # User requested Option 2 (user client -> bot chat) for ALL files
-        upload_client = user_client
-        
-        # If using user_client, send to the bot instead of the backup group
-        is_sent_to_bot = (upload_client == user_client)
-        upload_peer = bot.me.username if is_sent_to_bot else backup_peer
-        
-        input_file = await upload_stream(upload_client, streamer, file_name, on_upload_chunk=on_ul)
+
+        # Upload using bot session directly to backup group
+        input_file = await upload_stream(bot, streamer, file_name, on_upload_chunk=on_ul)
 
         kind = _classify(file_name)
         mime = _mime(file_name)
@@ -266,7 +258,7 @@ async def _upload_terabox_file_to_backup(
             if thumb_url:
                 thumb_raw = await _download_thumb_bytes(thumb_url, tb_client._cookie_str)
                 if thumb_raw:
-                    thumb_input_file = await _upload_thumb_to_telegram(upload_client, thumb_raw)
+                    thumb_input_file = await _upload_thumb_to_telegram(bot, thumb_raw)
                     if thumb_input_file:
                         print(f"[TeraBox] Thumbnail uploaded for {file_name} ({len(thumb_raw)} bytes)")
 
@@ -295,27 +287,14 @@ async def _upload_terabox_file_to_backup(
                 attributes=[DocumentAttributeFilename(file_name=file_name)],
             )
 
-        # Register interceptor future if sending to bot
-        fut = None
-        uid = None
-        if is_sent_to_bot:
-            from app.bot.main import pending_bot_uploads
-            loop = asyncio.get_running_loop()
-            fut = loop.create_future()
-            me = await user_client.get_me()
-            uid = me.id
-            if uid not in pending_bot_uploads:
-                pending_bot_uploads[uid] = []
-            pending_bot_uploads[uid].append((file_name, fut))
-
-        # Retry SendMedia with FloodWait handling
+        # Send directly to backup group using bot session
         SEND_RETRIES = 5
         updates = None
         for send_attempt in range(1, SEND_RETRIES + 1):
             try:
-                updates = await upload_client.invoke(
+                updates = await bot.invoke(
                     SendMedia(
-                        peer=await upload_client.resolve_peer(upload_peer),
+                        peer=backup_peer,
                         media=media,
                         message="",
                         random_id=random.randint(0, 2 ** 63 - 1),
@@ -328,10 +307,10 @@ async def _upload_terabox_file_to_backup(
                 if send_attempt < SEND_RETRIES:
                     await asyncio.sleep(wait + 2)
                 else:
-                    return None, False
+                    return None
 
         if updates is None:
-            return None, False
+            return None
 
         # Extract message_id from various response types
         msg_id = None
@@ -353,40 +332,13 @@ async def _upload_terabox_file_to_backup(
                     msg_id = upd.message.id
                     break
 
-        if is_sent_to_bot:
-            try:
-                bot_msg = await asyncio.wait_for(fut, timeout=120)
-                backup_msg_id = None
-                try:
-                    fw_msg = await bot.forward_messages(
-                        chat_id=BACKUP_GROUP_ID,
-                        from_chat_id=bot_msg.chat.id,
-                        message_ids=bot_msg.id
-                    )
-                    if fw_msg:
-                        backup_msg_id = fw_msg.id
-                except Exception as e:
-                    print(f"[TeraBox] Failed to forward bot message {bot_msg.id}: {e}")
-                
-                if backup_msg_id:
-                    return backup_msg_id, True
-                else:
-                    print(f"[TeraBox] Failed to forward message to backup group for {file_name}")
-                    return None, True
-            except asyncio.TimeoutError:
-                print(f"[TeraBox] Timeout waiting for bot to receive the message for {file_name}")
-                if uid in pending_bot_uploads:
-                    pending_bot_uploads[uid] = [p for p in pending_bot_uploads[uid] if p[1] != fut]
-                return None, True
-
         if msg_id:
-            return msg_id, False
+            return msg_id
 
         # Fallback: scan recent messages in the backup group
         print(f"[TeraBox] WARNING: Could not extract msg_id from SendMedia response type={type(updates).__name__} for {file_name}")
         print(f"[TeraBox] Response: {updates}")
 
-        # Try to find the just-uploaded message by searching recent messages in BACKUP GRoUP
         try:
             recent = await bot.get_messages(
                 BACKUP_GROUP_ID, list(range(-1, -4, -1))  # last 3 messages
@@ -404,16 +356,16 @@ async def _upload_terabox_file_to_backup(
                         fname = msg.audio.file_name
                     if fname == file_name:
                         print(f"[TeraBox] Fallback: found msg_id={msg.id} for {file_name}")
-                        return msg.id, False
+                        return msg.id
         except Exception as fb_err:
             print(f"[TeraBox] Fallback search failed: {fb_err}")
 
-        return None, False
+        return None
 
     except Exception as e:
         print(f"[TeraBox] _upload_terabox_file_to_backup error ({file_name}): {e}")
         import traceback; traceback.print_exc()
-        return None, False
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -439,11 +391,6 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
     user_session = await get_user_session(user_id)
     if not user_session:
         await message.reply_text("❌ Belum login. Sila /start untuk login.")
-        return
-
-    user_client = await manager.get_client(user_id)
-    if not user_client:
-        await message.reply_text("❌ Sesi tidak sah. Sila login semula.")
         return
 
     user_profile = await get_user_profile(user_id)
@@ -671,7 +618,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             return ""
 
         # 10. Upload files to backup group (photos concurrent, others sequential)
-        uploaded: List[Tuple[int, str, str, int, bool]] = []
+        uploaded: List[Tuple[int, str, str, int]] = []
         total_up = len(enriched)
         MAX_RETRIES = 5
 
@@ -766,7 +713,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                                 print(f"[TeraBox] Still no dlink for {_pe['name']}")
                                 break
                         _bmid = await _upload_terabox_file_to_backup(
-                            bot, user_client, tb, backup_peer,
+                            bot, tb, backup_peer,
                             _dlink, _pe["size"], _pe["name"],
                             thumb_url=_pe.get("thumb_url", ""),
                             tracker=type("_Proxy", (), {
@@ -781,7 +728,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                     _photo_state["done"] += 1
                     await asyncio.sleep(0.3)
                     if _bmid:
-                        return (_bmid, _pe["kind"], _pe["name"], _pe["size"], is_sent_to_bot)
+                        return (_bmid, _pe["kind"], _pe["name"], _pe["size"])
                     return None
 
             _photo_results = await asyncio.gather(
@@ -803,9 +750,9 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                     continue
                 if _pr:
                     uploaded.append(_pr)
-                    _b, _k, _n, _s, _is_bot = _pr
+                    _b, _k, _n, _s = _pr
                     _cid = str(BACKUP_GROUP_ID).replace("-100", "")
-                    _lnk = f"https://t.me/c/{_cid}/{_b}" if not _is_bot else None
+                    _lnk = f"https://t.me/c/{_cid}/{_b}"
                     await log_forward(
                         message.from_user.username, _b, _s,
                         f"TeraBox/{surl}", _lnk
@@ -837,8 +784,8 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                         print(f"[TeraBox] Still no dlink for {entry['name']}")
                         break
 
-                bmid, is_sent_to_bot = await _upload_terabox_file_to_backup(
-                    bot, user_client, tb, backup_peer,
+                bmid = await _upload_terabox_file_to_backup(
+                    bot, tb, backup_peer,
                     dlink, entry["size"], entry["name"],
                     thumb_url=entry.get("thumb_url", ""),
                     tracker=tracker,
@@ -857,9 +804,9 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             await asyncio.sleep(1.5)
 
             if bmid:
-                uploaded.append((bmid, entry["kind"], entry["name"], entry["size"], is_sent_to_bot))
+                uploaded.append((bmid, entry["kind"], entry["name"], entry["size"]))
                 channel_id_str = str(BACKUP_GROUP_ID).replace("-100", "")
-                link = f"https://t.me/c/{channel_id_str}/{bmid}" if not is_sent_to_bot else None
+                link = f"https://t.me/c/{channel_id_str}/{bmid}"
                 await log_forward(
                     message.from_user.username, bmid, entry["size"],
                     f"TeraBox/{surl}", link
@@ -896,27 +843,23 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         delivered_mids: set = set()
 
         # ---------- Helper: send one file individually -----------------------
-        async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
+        async def _send_single(mid: int) -> bool:
             """Send a single backup message to the user. Returns True on success."""
-            if is_sent_to_bot:
+            r = await _safe_send(
+                lambda _mid=mid: bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=BACKUP_GROUP_ID,
+                    message_id=_mid,
+                )
+            )
+            if r:
                 delivered_mids.add(mid)
                 return True
-            else:
-                r = await _safe_send(
-                    lambda _mid=mid: bot.copy_message(
-                        chat_id=user_id,
-                        from_chat_id=BACKUP_GROUP_ID,
-                        message_id=_mid,
-                    )
-                )
-                if r:
-                    delivered_mids.add(mid)
-                    return True
-                return False
+            return False
 
         # ---------- Helper: send album chunk to user -------------------------
         async def _send_album_to_user(
-            items: List[Tuple[int, str, str, int, bool]],
+            items: List[Tuple[int, str, str, int]],
         ) -> None:
             """
             Send a list of backup-group items to the user as albums (max 8).
@@ -932,22 +875,14 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 chunk = items[i : i + CHUNK]
                 chunk_mids = [mid for mid, *_ in chunk]
 
-                # If any file was sent to the bot directly, we must send them individually
-                # because bot cannot group messages from different chats.
-                if any(is_bot for _, _, _, _, is_bot in chunk):
-                    for mid, kind, name, size, is_sent_to_bot in chunk:
-                        await _send_single(mid, is_sent_to_bot)
-                        await asyncio.sleep(0.5)
-                    continue
-
                 # Fetch backup messages
                 backup_msgs = await _safe_send(
                     lambda _ids=chunk_mids: bot.get_messages(BACKUP_GROUP_ID, _ids)
                 )
                 if backup_msgs is None:
                     # Fallback: send each individually
-                    for mid, kind, name, size, is_sent_to_bot in chunk:
-                        await _send_single(mid, is_sent_to_bot)
+                    for mid, kind, name, size in chunk:
+                        await _send_single(mid)
                         await asyncio.sleep(0.5)
                     continue
 
@@ -972,14 +907,14 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
 
                 if not media_list:
                     # get_messages returned nothing useful — send individually
-                    for mid, kind, name, size, is_sent_to_bot in chunk:
-                        await _send_single(mid, is_sent_to_bot)
+                    for mid, kind, name, size in chunk:
+                        await _send_single(mid)
                         await asyncio.sleep(0.5)
                     continue
 
                 if len(media_list) == 1:
                     # send_media_group requires ≥2 items — send single file directly
-                    await _send_single(valid_mids[0], False)
+                    await _send_single(valid_mids[0])
                 else:
                     # Try sending as album
                     r = await _safe_send(
@@ -1001,17 +936,17 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                         # Album failed — fallback: send each individually
                         print(f"[TeraBox] Album send failed, falling back to individual sends")
                         for mid in valid_mids:
-                            await _send_single(mid, False)
+                            await _send_single(mid)
                             await asyncio.sleep(0.5)
 
                 # Delay between chunks to avoid FloodWait
                 await asyncio.sleep(1.5)
 
         # 11. Separate by type for album grouping
-        photos = [(mid, k, n, s, is_bot) for mid, k, n, s, is_bot in uploaded if k == "photo"]
-        videos = [(mid, k, n, s, is_bot) for mid, k, n, s, is_bot in uploaded if k == "video"]
-        audios = [(mid, k, n, s, is_bot) for mid, k, n, s, is_bot in uploaded if k == "audio"]
-        others = [(mid, k, n, s, is_bot) for mid, k, n, s, is_bot in uploaded
+        photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
+        videos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
+        audios = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "audio"]
+        others = [(mid, k, n, s) for mid, k, n, s in uploaded
                   if k not in ("photo", "video", "audio")]
 
         # Send: photos album first
@@ -1021,24 +956,24 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         await _send_album_to_user(videos)
 
         # Send: audio files individually
-        for mid, k, n, s, is_bot in audios:
-            await _send_single(mid, is_bot)
+        for mid, k, n, s in audios:
+            await _send_single(mid)
             await asyncio.sleep(0.5)
 
         # Send: other documents individually
-        for mid, k, n, s, is_bot in others:
-            await _send_single(mid, is_bot)
+        for mid, k, n, s in others:
+            await _send_single(mid)
             await asyncio.sleep(0.5)
 
         # ---------- SAFETY NET: resend any files not confirmed delivered ------
-        all_mids_map = {mid: is_bot for mid, k, n, s, is_bot in uploaded}
-        missing_mids = set(all_mids_map.keys()) - delivered_mids
+        all_mids = {mid for mid, k, n, s in uploaded}
+        missing_mids = all_mids - delivered_mids
 
         if missing_mids:
             print(f"[TeraBox] Safety net: {len(missing_mids)} file(s) not confirmed delivered, resending individually")
             await asyncio.sleep(2)  # extra breathing room
             for mid in missing_mids:
-                await _send_single(mid, all_mids_map[mid])
+                await _send_single(mid)
                 await asyncio.sleep(1)
 
         # Final count
