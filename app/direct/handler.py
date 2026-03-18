@@ -312,8 +312,12 @@ async def _upload_file_to_backup(
     try:
         on_ul = tracker.add_uploaded if tracker else None
         
-        # User requested Option 2 (user client -> bot chat) for ALL files
-        upload_client = user_client
+        # Use bot session (sends directly to backup group) for files <= 2GB.
+        # Use user session (sends to bot chat, then forwards) for files > 2GB.
+        if file_size <= 2 * 1024 * 1024 * 1024:
+            upload_client = bot
+        else:
+            upload_client = user_client
         
         # If using user_client, send to the bot instead of the backup group (Option 2)
         is_sent_to_bot = (upload_client == user_client)
