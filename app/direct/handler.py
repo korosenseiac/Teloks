@@ -10,11 +10,17 @@ import asyncio
 import os
 import random
 import re
+import shutil
 import tempfile
 from typing import Dict, List, Optional, Tuple
 
 from pyrogram import Client
-from pyrogram.types import Message
+from pyrogram.types import (
+    Message,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
+)
 from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
@@ -40,11 +46,25 @@ from app.database.db import (
 )
 from app.bot.session_manager import manager
 from app.utils.streamer import upload_stream
-from app.utils.media import classify as _classify, mime as _mime, ext as _ext, MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM, VIDEO_EXTS
+from app.utils.media import (
+    classify as _classify,
+    mime as _mime,
+    ext as _ext,
+    MAX_FILE_SIZE,
+    MAX_FILE_SIZE_PREMIUM,
+    VIDEO_EXTS,
+    is_archive,
+    is_media,
+    MEDIA_EXTS,
+)
 from app.direct.client import DirectLinkClient
 from app.direct.streamer import DirectLinkStreamer
 from app.terabox.progress import ProgressTracker
 from app.mediafire.streamer import FileStreamer
+from app.mediafire.archive import (
+    count_media_in_archive,
+    iter_extract_media,
+)
 
 # ---------------------------------------------------------------------------
 # Pattern matching for direct links
@@ -455,6 +475,170 @@ async def _safe_send(coro_factory, retries: int = 3):
     return None
 
 
+async def _send_album_to_user(
+    bot: Client,
+    user_id: int,
+    items: List[Tuple[int, str, str, int]],
+    delivered_mids: set,
+) -> None:
+    """
+    Send *items* ``(backup_msg_id, kind, name, size)`` to the user as
+    media-group albums (max 8 per album). Tracks delivered message IDs
+    in *delivered_mids*.
+    """
+    if not items:
+        return
+
+    CHUNK = 8
+
+    async def _send_single(mid: int) -> bool:
+        r = await _safe_send(
+            lambda _mid=mid: bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=BACKUP_GROUP_ID,
+                message_id=_mid,
+            )
+        )
+        if r:
+            delivered_mids.add(mid)
+            return True
+        return False
+
+    for i in range(0, len(items), CHUNK):
+        chunk = items[i : i + CHUNK]
+        chunk_mids = [mid for mid, *_ in chunk]
+
+        backup_msgs = await _safe_send(
+            lambda _ids=chunk_mids: bot.get_messages(BACKUP_GROUP_ID, _ids)
+        )
+        if backup_msgs is None:
+            for mid, kind, name, size in chunk:
+                await _send_single(mid)
+                await asyncio.sleep(0.5)
+            continue
+
+        if not isinstance(backup_msgs, list):
+            backup_msgs = [backup_msgs]
+
+        media_list = []
+        valid_mids = []
+        for msg in backup_msgs:
+            if not msg or getattr(msg, "empty", False):
+                continue
+            if msg.photo:
+                media_list.append(InputMediaPhoto(msg.photo.file_id))
+                valid_mids.append(msg.id)
+            elif msg.video:
+                media_list.append(InputMediaVideo(msg.video.file_id))
+                valid_mids.append(msg.id)
+            elif msg.document:
+                media_list.append(InputMediaDocument(msg.document.file_id))
+                valid_mids.append(msg.id)
+
+        if not media_list:
+            for mid, kind, name, size in chunk:
+                await _send_single(mid)
+                await asyncio.sleep(0.5)
+            continue
+
+        if len(media_list) == 1:
+            await _send_single(valid_mids[0])
+        else:
+            r = await _safe_send(
+                lambda _ml=media_list: bot.send_media_group(user_id, _ml)
+            )
+            if r:
+                actual = len(r) if isinstance(r, list) else 0
+                if actual == len(media_list):
+                    delivered_mids.update(valid_mids)
+                else:
+                    print(f"[DirectLink] Album partial: sent {actual}/{len(media_list)}")
+                    for vm in valid_mids[:actual]:
+                        delivered_mids.add(vm)
+            else:
+                print("[DirectLink] Album send failed, falling back to individual sends")
+                for mid in valid_mids:
+                    await _send_single(mid)
+                    await asyncio.sleep(0.5)
+
+        await asyncio.sleep(1.5)
+
+
+async def _deliver_to_user_multi(
+    bot: Client,
+    user_id: int,
+    uploaded: List[Tuple[int, str, str, int]],
+    status_msg: Message,
+) -> None:
+    """
+    Deliver all uploaded backup-group files to the user.
+    Photos are sent as album(s) first, then videos as album(s).
+    Includes a safety-net pass for any missed deliveries.
+    """
+    await status_msg.edit("⬆️ Menghantar ke anda…")
+
+    delivered_mids: set = set()
+
+    async def _send_single(mid: int) -> bool:
+        r = await _safe_send(
+            lambda _mid=mid: bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=BACKUP_GROUP_ID,
+                message_id=_mid,
+            )
+        )
+        if r:
+            delivered_mids.add(mid)
+            return True
+        return False
+
+    photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
+    videos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
+    others = [(mid, k, n, s) for mid, k, n, s in uploaded
+              if k not in ("photo", "video")]
+
+    # Send: photos album first
+    await _send_album_to_user(bot, user_id, photos, delivered_mids)
+
+    # Send: videos album next
+    await _send_album_to_user(bot, user_id, videos, delivered_mids)
+
+    # Send: anything else individually
+    for mid, k, n, s in others:
+        await _send_single(mid)
+        await asyncio.sleep(0.5)
+
+    # Safety net — resend anything not confirmed delivered
+    all_mids = {mid for mid, k, n, s in uploaded}
+    missing_mids = all_mids - delivered_mids
+
+    if missing_mids:
+        print(
+            f"[DirectLink] Safety net: {len(missing_mids)} file(s) not "
+            "confirmed delivered, resending individually"
+        )
+        await asyncio.sleep(2)
+        for mid in missing_mids:
+            await _send_single(mid)
+            await asyncio.sleep(1)
+
+    total_to_send = len(uploaded)
+    sent_count = len(delivered_mids)
+
+    if sent_count < total_to_send:
+        try:
+            await status_msg.edit(
+                f"⚠️ Selesai! {sent_count}/{total_to_send} fail berjaya dihantar."
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+
 async def _send_to_user(
     bot: Client,
     user_id: int,
@@ -490,6 +674,332 @@ async def _send_to_user(
 # ---------------------------------------------------------------------------
 # Main handler
 # ---------------------------------------------------------------------------
+
+
+async def _download_archive_to_temp(
+    direct_client: DirectLinkClient,
+    url: str,
+    filename: str,
+    file_size: int,
+    dest_dir: str,
+    tracker: Optional[ProgressTracker] = None,
+) -> str:
+    """
+    Stream-download the archive from Direct Link into *dest_dir*.
+    Returns the path to the downloaded archive file.
+    """
+    archive_path = os.path.join(dest_dir, filename)
+    downloaded = 0
+
+    async for chunk in direct_client.download_stream(url):
+        # Write chunk to file (run in executor to avoid blocking)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, _append_bytes, archive_path, chunk
+        )
+        downloaded += len(chunk)
+        if tracker:
+            tracker.add_downloaded(len(chunk))
+
+    return archive_path
+
+
+async def _handle_archive(
+    bot: Client,
+    direct_client: DirectLinkClient,
+    backup_peer,
+    message: Message,
+    status_msg: Message,
+    user_id: int,
+    url: str,
+    filename: str,
+    file_size: int,
+    skip_non_videos: bool = False,
+) -> None:
+    """Download archive, extract media ONE AT A TIME, upload each, send albums to user."""
+    import gc
+    import time as _time
+    from app.terabox.progress import _human_bytes, _human_speed, _bar, _eta
+    from app.bot.main import is_cancelled
+
+    temp_dir = tempfile.mkdtemp(prefix="direct_archive_")
+
+    try:
+        # ----- Phase 1: Download the archive -----
+        await status_msg.edit(
+            f"📥 Memuat turun arkib: `{filename}`\n"
+            f"📦 Saiz: {_human_bytes(file_size)}"
+        )
+
+        dl_tracker = ProgressTracker(
+            status_msg=status_msg,
+            file_name=filename,
+            file_size=file_size,
+        )
+        dl_tracker.start()
+
+        archive_path = await _download_archive_to_temp(
+            direct_client, url, filename, file_size, temp_dir,
+            tracker=dl_tracker,
+        )
+
+        await dl_tracker.stop()
+
+        # Check for cancellation after download
+        if is_cancelled(user_id):
+            await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+            return
+
+        # ----- Phase 2: Count media files (metadata only, no extraction) -----
+        await status_msg.edit("📂 Mengimbas fail media dalam arkib…")
+
+        loop = asyncio.get_running_loop()
+        total_files = await loop.run_in_executor(
+            None, count_media_in_archive, archive_path, skip_non_videos
+        )
+
+        if total_files == 0:
+            msg = "❌ Tiada fail video dijumpai dalam arkib." if skip_non_videos else "❌ Tiada fail media (foto/video) dijumpai dalam arkib."
+            await status_msg.edit(msg)
+            return
+
+        extract_dir = os.path.join(temp_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+
+        await status_msg.edit(
+            f"📤 Memuat naik {total_files} fail media ke Telegram…"
+        )
+
+        # ----- Phase 3: Extract & upload (photos parallel, videos sequential) -----
+        uploaded: List[Tuple[int, str, str, int]] = []
+        MAX_RETRIES = 3
+        idx = 0
+
+        # Batch settings for concurrent photo uploads
+        _PHOTO_BATCH = 5
+        _PHOTO_WORKERS = 3
+        _photo_batch: List[Dict[str, Any]] = []
+
+        _batch_state = {
+            "done": 0, "downloaded": 0, "uploaded": 0,
+            "_dl_samples": [], "_ul_samples": [],
+            "batch_total_size": 0, "batch_count": 0,
+        }
+        _batch_stopped = {"v": False}
+        _batch_start = _time.monotonic()
+
+        def _batch_add_dl(n: int):
+            now = _time.monotonic()
+            _batch_state["downloaded"] += n
+            _batch_state["_dl_samples"].append((now, _batch_state["downloaded"]))
+            if len(_batch_state["_dl_samples"]) > 60:
+                _batch_state["_dl_samples"] = _batch_state["_dl_samples"][-60:]
+
+        def _batch_add_ul(n: int):
+            now = _time.monotonic()
+            _batch_state["uploaded"] += n
+            _batch_state["_ul_samples"].append((now, _batch_state["uploaded"]))
+            if len(_batch_state["_ul_samples"]) > 60:
+                _batch_state["_ul_samples"] = _batch_state["_ul_samples"][-60:]
+
+        def _rolling_speed(samples, window=8.0):
+            if len(samples) < 2:
+                return 0.0
+            now = samples[-1][0]
+            cutoff = now - window
+            for i, (t, _) in enumerate(samples):
+                if t >= cutoff:
+                    t0, b0 = samples[i]
+                    t1, b1 = samples[-1]
+                    dt = t1 - t0
+                    return (b1 - b0) / dt if dt > 0 else 0.0
+            return 0.0
+
+        async def _batch_updater_loop():
+            while not _batch_stopped["v"]:
+                await asyncio.sleep(2.5)
+                if _batch_stopped["v"]:
+                    break
+                try:
+                    ts = _batch_state["batch_total_size"]
+                    if ts <= 0:
+                        continue
+                    dl_frac = _batch_state["downloaded"] / ts
+                    ul_frac = _batch_state["uploaded"] / ts
+                    dl_speed = _rolling_speed(_batch_state["_dl_samples"])
+                    ul_speed = _rolling_speed(_batch_state["_ul_samples"])
+                    dl_rem = max(0, ts - _batch_state["downloaded"])
+                    ul_rem = max(0, ts - _batch_state["uploaded"])
+                    elapsed = _time.monotonic() - _batch_start
+                    mins, secs = divmod(int(elapsed), 60)
+                    text = (
+                        f"🖼️ **Foto {_batch_state['done']}/{_batch_state['batch_count']}** "
+                        f"(📊 {total_files} jumlah fail)\n"
+                        f"📦 {_human_bytes(ts)}\n\n"
+                        f"⬇️ Muat Turun  {_bar(dl_frac)}  {dl_frac*100:.0f}%\n"
+                        f"    {_human_bytes(_batch_state['downloaded'])} • {_human_speed(dl_speed)} • ETA {_eta(dl_rem, dl_speed)}\n\n"
+                        f"⬆️ Muat Naik   {_bar(ul_frac)}  {ul_frac*100:.0f}%\n"
+                        f"    {_human_bytes(_batch_state['uploaded'])} • {_human_speed(ul_speed)} • ETA {_eta(ul_rem, ul_speed)}\n\n"
+                        f"⏱ Masa: {mins}m {secs}s"
+                    )
+                    await status_msg.edit(text)
+                except Exception:
+                    pass
+
+        _batch_updater_task = asyncio.create_task(_batch_updater_loop())
+
+        async def _flush_photo_batch():
+            """Upload accumulated photos concurrently then clean up."""
+            if not _photo_batch:
+                return
+            batch = list(_photo_batch)
+            _photo_batch.clear()
+
+            _batch_state["batch_total_size"] += sum(e["size"] for e in batch)
+            _batch_state["batch_count"] += len(batch)
+
+            _sem = asyncio.Semaphore(_PHOTO_WORKERS)
+
+            _ul_proxy = type("_Proxy", (), {
+                "add_downloaded": staticmethod(lambda n: None),
+                "add_uploaded": staticmethod(_batch_add_ul),
+            })()
+
+            async def _upload_one_photo(entry):
+                async with _sem:
+                    if is_cancelled(user_id):
+                        return None
+
+                    _bmid = None
+                    for _att in range(1, MAX_RETRIES + 1):
+                        streamer = FileStreamer(
+                            entry["path"], entry["name"],
+                            on_download_chunk=_batch_add_dl,
+                        )
+                        _bmid, _is_sent_to_bot = await _upload_file_to_backup(
+                            bot, None, backup_peer, streamer,
+                            entry["name"], entry["size"],
+                            tracker=_ul_proxy,
+                        )
+                        if _bmid:
+                            break
+                        if _att < MAX_RETRIES:
+                            await asyncio.sleep(1)
+
+                    try:
+                        os.remove(entry["path"])
+                    except OSError:
+                        pass
+
+                    _batch_state["done"] += 1
+                    await asyncio.sleep(0.3)
+                    if _bmid:
+                        return (_bmid, entry["kind"], entry["name"], entry["size"])
+                    return None
+
+            results = await asyncio.gather(
+                *[_upload_one_photo(e) for e in batch],
+                return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, Exception):
+                    print(f"[DirectArchive] Photo batch exception: {r}")
+                    continue
+                if r:
+                    uploaded.append(r)
+            gc.collect()
+
+        async for mf in iter_extract_media(archive_path, extract_dir, skip_non_videos):
+            idx += 1
+
+            if is_cancelled(user_id):
+                await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+                return
+
+            if mf["kind"] == "photo":
+                _photo_batch.append(mf)
+                if len(_photo_batch) >= _PHOTO_BATCH:
+                    await _flush_photo_batch()
+            else:
+                await _flush_photo_batch()
+
+                thumb_raw = None
+                video_meta = None
+                if mf["kind"] == "video":
+                    thumb_raw = await _generate_video_thumb(mf["path"])
+                    video_meta = await _get_video_metadata(mf["path"])
+
+                tracker = ProgressTracker(
+                    status_msg=status_msg,
+                    file_name=mf["name"],
+                    file_size=mf["size"],
+                    file_index=idx,
+                    file_total=total_files,
+                )
+                tracker.start()
+
+                bmid = None
+                for attempt in range(1, MAX_RETRIES + 1):
+                    streamer = FileStreamer(
+                        mf["path"], mf["name"],
+                        on_download_chunk=tracker.add_downloaded,
+                    )
+                    bmid, _is_sent_to_bot = await _upload_file_to_backup(
+                        bot, None, backup_peer, streamer,
+                        mf["name"], mf["size"],
+                        tracker=tracker,
+                        thumb_raw=thumb_raw,
+                        video_meta=video_meta,
+                    )
+                    if bmid:
+                        break
+                    if attempt < MAX_RETRIES:
+                        tracker.downloaded = 0
+                        tracker.uploaded = 0
+                        tracker._dl_samples.clear()
+                        tracker._ul_samples.clear()
+                        await asyncio.sleep(3)
+
+                await tracker.stop()
+
+                if bmid:
+                    uploaded.append((bmid, mf["kind"], mf["name"], mf["size"]))
+                
+                try:
+                    os.remove(mf["path"])
+                except OSError:
+                    pass
+                gc.collect()
+
+                if idx < total_files:
+                    await asyncio.sleep(2)
+
+        await _flush_photo_batch()
+
+        _batch_stopped["v"] = True
+        _batch_updater_task.cancel()
+        try:
+            await _batch_updater_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+
+        if not uploaded:
+            await status_msg.edit("❌ Semua fail gagal dimuat naik.")
+            return
+
+        await _deliver_to_user_multi(bot, user_id, uploaded, status_msg)
+
+    finally:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        gc.collect()
 
 
 async def direct_link_handler(bot: Client, message: Message) -> None:
@@ -587,6 +1097,14 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             backup_peer = await _get_backup_group_peer()
         except Exception as e:
             await status_msg.edit(f"❌ Gagal mendapat backup group: {e}")
+            return
+
+        # Check if file is an archive
+        if is_archive(file_name):
+            await _handle_archive(
+                bot, _direct_client, backup_peer, message, status_msg,
+                user_id, final_url, file_name, file_size
+            )
             return
 
         # Create progress tracker
