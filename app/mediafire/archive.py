@@ -17,7 +17,7 @@ import os
 import zipfile
 from typing import AsyncIterator, Dict, List
 
-from app.utils.media import MEDIA_EXTS, ext, classify
+from app.utils.media import MEDIA_EXTS, VIDEO_EXTS, ext, classify
 
 # Try to import rarfile — graceful fallback if not installed
 try:
@@ -71,13 +71,14 @@ async def extract_media_from_archive(
 # ---------------------------------------------------------------------------
 
 
-def count_media_in_archive(archive_path: str) -> int:
+def count_media_in_archive(archive_path: str, skip_non_video: bool = False) -> int:
     """
     Return the number of media files inside the archive without extracting.
     Quick scan used to show progress info.
     """
     lower = archive_path.lower()
     count = 0
+    filter_exts = VIDEO_EXTS if skip_non_video else MEDIA_EXTS
     try:
         if lower.endswith(".zip"):
             with zipfile.ZipFile(archive_path, "r") as zf:
@@ -85,7 +86,7 @@ def count_media_in_archive(archive_path: str) -> int:
                     if info.is_dir():
                         continue
                     basename = os.path.basename(info.filename)
-                    if basename and ext(basename) in MEDIA_EXTS:
+                    if basename and ext(basename) in filter_exts:
                         count += 1
         elif lower.endswith(".rar") and _HAS_RAR:
             with rarfile.RarFile(archive_path, "r") as rf:
@@ -93,7 +94,7 @@ def count_media_in_archive(archive_path: str) -> int:
                     if info.is_dir():
                         continue
                     basename = os.path.basename(info.filename)
-                    if basename and ext(basename) in MEDIA_EXTS:
+                    if basename and ext(basename) in filter_exts:
                         count += 1
     except Exception:
         pass
@@ -103,6 +104,7 @@ def count_media_in_archive(archive_path: str) -> int:
 async def iter_extract_media(
     archive_path: str,
     dest_dir: str,
+    skip_non_video: bool = False,
 ) -> AsyncIterator[Dict[str, object]]:
     """
     Async generator that extracts media files from an archive ONE AT A TIME.
@@ -116,7 +118,7 @@ async def iter_extract_media(
     lower = archive_path.lower()
 
     if lower.endswith(".zip"):
-        async for item in _iter_extract_zip(archive_path, dest_dir):
+        async for item in _iter_extract_zip(archive_path, dest_dir, skip_non_video):
             yield item
     elif lower.endswith(".rar"):
         if not _HAS_RAR:
@@ -124,7 +126,7 @@ async def iter_extract_media(
                 "Sokongan RAR tidak tersedia — sila pasang `rarfile` dan "
                 "binary `unrar` pada pelayan."
             )
-        async for item in _iter_extract_rar(archive_path, dest_dir):
+        async for item in _iter_extract_rar(archive_path, dest_dir, skip_non_video):
             yield item
     else:
         raise ValueError(f"Format arkib tidak disokong: {os.path.basename(archive_path)}")
@@ -136,12 +138,12 @@ async def iter_extract_media(
 
 
 async def _iter_extract_zip(
-    archive_path: str, dest_dir: str
+    archive_path: str, dest_dir: str, skip_non_video: bool = False
 ) -> AsyncIterator[Dict[str, object]]:
     loop = asyncio.get_running_loop()
     # Get the list of media entries first (metadata only, no extraction)
     entries = await loop.run_in_executor(
-        None, _list_zip_media_entries, archive_path
+        None, _list_zip_media_entries, archive_path, skip_non_video
     )
     seen_names: Dict[str, int] = {}
     for entry_name in entries:
@@ -161,15 +163,16 @@ async def _iter_extract_zip(
         }
 
 
-def _list_zip_media_entries(archive_path: str) -> List[str]:
+def _list_zip_media_entries(archive_path: str, skip_non_video: bool = False) -> List[str]:
     """Return entry names of media files inside a ZIP (no extraction)."""
     entries = []
+    filter_exts = VIDEO_EXTS if skip_non_video else MEDIA_EXTS
     with zipfile.ZipFile(archive_path, "r") as zf:
         for info in zf.infolist():
             if info.is_dir():
                 continue
             basename = os.path.basename(info.filename)
-            if basename and ext(basename) in MEDIA_EXTS:
+            if basename and ext(basename) in filter_exts:
                 entries.append(info.filename)
     return entries
 
@@ -193,11 +196,11 @@ def _extract_single_zip_entry(
 
 
 async def _iter_extract_rar(
-    archive_path: str, dest_dir: str
+    archive_path: str, dest_dir: str, skip_non_video: bool = False
 ) -> AsyncIterator[Dict[str, object]]:
     loop = asyncio.get_running_loop()
     entries = await loop.run_in_executor(
-        None, _list_rar_media_entries, archive_path
+        None, _list_rar_media_entries, archive_path, skip_non_video
     )
     seen_names: Dict[str, int] = {}
     for entry_name in entries:
@@ -216,15 +219,16 @@ async def _iter_extract_rar(
         }
 
 
-def _list_rar_media_entries(archive_path: str) -> List[str]:
+def _list_rar_media_entries(archive_path: str, skip_non_video: bool = False) -> List[str]:
     """Return entry names of media files inside a RAR (no extraction)."""
     entries = []
+    filter_exts = VIDEO_EXTS if skip_non_video else MEDIA_EXTS
     with rarfile.RarFile(archive_path, "r") as rf:
         for info in rf.infolist():
             if info.is_dir():
                 continue
             basename = os.path.basename(info.filename)
-            if basename and ext(basename) in MEDIA_EXTS:
+            if basename and ext(basename) in filter_exts:
                 entries.append(info.filename)
     return entries
 

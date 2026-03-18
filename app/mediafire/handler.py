@@ -614,12 +614,13 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
         return
 
     # ---------------------------------------------------------------- Parse link
+    skip_non_videos = "/skip" in message.text.lower()
     match = MEDIAFIRE_LINK_PATTERN.search(message.text)
     if not match:
         return
 
     url = match.group(0)  # full URL
-    print(f"[MediaFire] user={user_id} url={url!r}")
+    print(f"[MediaFire] user={user_id} url={url!r} skip={skip_non_videos}")
 
     # ---------------------------------------------------------------- Start
     active_user_processes[user_id] = asyncio.current_task()
@@ -640,6 +641,10 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
         direct_url = info["direct_url"]
         filename = info["filename"]
         file_size = info["size"]
+
+        if skip_non_videos and not is_archive(filename) and _classify(filename) != "video":
+            await status_msg.edit("❌ Fail ini bukannya video. Melangkau (skip).")
+            return
 
         print(
             f"[MediaFire] Resolved: filename={filename!r} "
@@ -671,6 +676,7 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
                 bot, mf_client, backup_peer,
                 message, status_msg, user_id,
                 direct_url, filename, file_size,
+                skip_non_videos=skip_non_videos,
             )
         elif is_media(filename):
             await _handle_direct_media(
@@ -790,6 +796,7 @@ async def _handle_archive(
     direct_url: str,
     filename: str,
     file_size: int,
+    skip_non_videos: bool = False,
 ) -> None:
     """Download archive, extract media ONE AT A TIME, upload each, send albums to user.
 
@@ -841,13 +848,12 @@ async def _handle_archive(
 
         loop = asyncio.get_running_loop()
         total_files = await loop.run_in_executor(
-            None, count_media_in_archive, archive_path
+            None, count_media_in_archive, archive_path, skip_non_videos
         )
 
         if total_files == 0:
-            await status_msg.edit(
-                "❌ Tiada fail media (foto/video) dijumpai dalam arkib."
-            )
+            msg = "❌ Tiada fail video dijumpai dalam arkib." if skip_non_videos else "❌ Tiada fail media (foto/video) dijumpai dalam arkib."
+            await status_msg.edit(msg)
             return
 
         extract_dir = os.path.join(temp_dir, "extracted")
@@ -1014,7 +1020,7 @@ async def _handle_archive(
                     )
             gc.collect()
 
-        async for mf in iter_extract_media(archive_path, extract_dir):
+        async for mf in iter_extract_media(archive_path, extract_dir, skip_non_videos):
             idx += 1
 
             if is_cancelled(user_id):

@@ -409,11 +409,12 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         return
 
     # ---------------------------------------------------------------- Parse link
+    skip_non_videos = "/skip" in message.text.lower()
     parsed = _extract_terabox_info(message.text)
     if not parsed:
         return
     share_host, surl = parsed     # e.g. ("1024tera.com", "ZwBiS4hI1209mq7eGN6OXA")
-    print(f"[TB:handler] user={user_id} raw_link={message.text.strip()!r} share_host={share_host!r} surl={surl!r}")
+    print(f"[TB:handler] user={user_id} raw_link={message.text.strip()!r} share_host={share_host!r} surl={surl!r} skip={skip_non_videos}")
 
     # ---------------------------------------------------------------- Start
     active_user_processes[user_id] = asyncio.current_task()
@@ -594,8 +595,13 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 "fs_id": fid,
             })
 
+        if skip_non_videos:
+            enriched = [e for e in enriched if e["kind"] == "video"]
+            print(f"[TB:handler] /skip filtered {total} -> {len(enriched)} video(s)")
+
         if not enriched:
-            await status_msg.edit("❌ Tiada fail untuk dimuat naik.")
+            msg = "❌ Tiada video dijumpai untuk dimuat naik." if skip_non_videos else "❌ Tiada fail untuk dimuat naik."
+            await status_msg.edit(msg)
             return
 
         # 9. Resolve backup group peer
