@@ -377,9 +377,17 @@ async def _upload_file_to_backup(
         # Send to target peer with FloodWait handling
         for attempt in range(1, 4):
             try:
+                # Use resolve_peer ONLY if upload_peer is a string or int (username, chat_id).
+                # If it's already an InputPeer (from backup group), use it directly.
+                target_peer = (
+                    await upload_client.resolve_peer(upload_peer)
+                    if isinstance(upload_peer, (str, int))
+                    else upload_peer
+                )
+                
                 updates = await upload_client.invoke(
                     SendMedia(
-                        peer=await upload_client.resolve_peer(upload_peer),
+                        peer=target_peer,
                         media=media,
                         message="",
                         random_id=random.randint(0, 2 ** 63 - 1),
