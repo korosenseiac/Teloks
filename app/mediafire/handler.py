@@ -652,11 +652,31 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
         )
 
         # 2. Validate size
-        if file_size > MAX_FILE_SIZE:
-            await status_msg.edit(
-                f"❌ Fail terlalu besar! ({_format_size(file_size)})\n"
-                f"Had maksimum: {_format_size(MAX_FILE_SIZE)}"
+        is_premium = getattr(message.from_user, "is_premium", False) or False
+        size_limit = MAX_FILE_SIZE_PREMIUM if is_premium else MAX_FILE_SIZE
+        
+        # [MODIFIED] Move size limit check for archives to extraction phase
+        # Allow archives up to 10 GB during initial download
+        is_arch = is_archive(filename)
+        hard_limit = 10 * 1024 * 1024 * 1024  # 10 GB
+        
+        effective_limit = hard_limit if is_arch else size_limit
+
+        if file_size > effective_limit:
+            limit_gb = effective_limit / (1024 * 1024 * 1024)
+            actual_gb = file_size / (1024 * 1024 * 1024)
+            msg = (
+                f"❌ **Fail terlalu besar!**\n\n"
+                f"Had Maksimum: {limit_gb:.1f} GB\n"
+                f"Fail ini: {actual_gb:.2f} GB"
             )
+            if is_arch:
+                msg += "\n(Saiz arkib melebihi had sistem 10GB)"
+            else:
+                user_type = "Premium" if is_premium else "Biasa"
+                msg += f"\n(User {user_type})"
+                
+            await status_msg.edit(msg)
             return
 
         # 3. Resolve backup group peer
@@ -677,6 +697,7 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
                 message, status_msg, user_id,
                 direct_url, filename, file_size,
                 skip_non_videos=skip_non_videos,
+                is_premium=is_premium,
             )
         elif is_media(filename):
             await _handle_direct_media(
@@ -797,6 +818,7 @@ async def _handle_archive(
     filename: str,
     file_size: int,
     skip_non_videos: bool = False,
+    is_premium: bool = False,
 ) -> None:
     """Download archive, extract media ONE AT A TIME, upload each, send albums to user.
 
@@ -810,6 +832,7 @@ async def _handle_archive(
     import gc
 
     temp_dir = tempfile.mkdtemp(prefix="mf_archive_")
+    size_limit = MAX_FILE_SIZE_PREMIUM if is_premium else MAX_FILE_SIZE
 
     try:
         # ----- Phase 1: Download the archive -----
@@ -967,7 +990,7 @@ async def _handle_archive(
                     if is_cancelled(user_id):
                         return None
 
-                    if mf_entry["size"] > MAX_FILE_SIZE:
+                    if mf_entry["size"] > size_limit:
                         print(f"[MediaFire] Skipping oversized photo: {mf_entry['name']} ({_format_size(mf_entry['size'])})")
                         return None
 
@@ -1037,7 +1060,7 @@ async def _handle_archive(
                 await _flush_photo_batch()
 
                 # --- Process video/document sequentially with full progress ---
-                if mf["size"] > MAX_FILE_SIZE:
+                if mf["size"] > size_limit:
                     print(f"[MediaFire] Skipping oversized file: {mf['name']} ({_format_size(mf['size'])})")
                     try:
                         os.remove(mf["path"])

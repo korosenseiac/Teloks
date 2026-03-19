@@ -727,6 +727,7 @@ async def _handle_archive(
     filename: str,
     file_size: int,
     skip_non_videos: bool = False,
+    is_premium: bool = False,
 ) -> None:
     """Download archive, extract media ONE AT A TIME, upload each, send albums to user."""
     import gc
@@ -735,6 +736,7 @@ async def _handle_archive(
     from app.bot.main import is_cancelled
 
     temp_dir = tempfile.mkdtemp(prefix="direct_archive_")
+    size_limit = MAX_FILE_SIZE_PREMIUM if is_premium else MAX_FILE_SIZE
 
     try:
         # ----- Phase 1: Download the archive -----
@@ -882,6 +884,11 @@ async def _handle_archive(
                     if is_cancelled(user_id):
                         return None
 
+                    # Use size limit check for extracted photos
+                    if entry["size"] > size_limit:
+                        print(f"[DirectArchive] Skipping oversized photo: {entry['name']} ({_human_bytes(entry['size'])})")
+                        return None
+
                     _bmid = None
                     for _att in range(1, MAX_RETRIES + 1):
                         streamer = FileStreamer(
@@ -934,6 +941,14 @@ async def _handle_archive(
                     await _flush_photo_batch()
             else:
                 await _flush_photo_batch()
+
+                if mf["size"] > size_limit:
+                    print(f"[DirectArchive] Skipping oversized file: {mf['name']} ({_human_bytes(mf['size'])})")
+                    try:
+                        os.remove(mf["path"])
+                    except OSError:
+                        pass
+                    continue
 
                 thumb_raw = None
                 video_meta = None
@@ -1092,16 +1107,29 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         # Check file size limit
         is_premium = getattr(message.from_user, "is_premium", False) or False
         size_limit = MAX_FILE_SIZE_PREMIUM if is_premium else MAX_FILE_SIZE
+        
+        # [MODIFIED] Move size limit check for archives to extraction phase
+        # Allow archives up to 10 GB during initial download
+        is_arch = is_archive(file_name)
+        hard_limit = 10 * 1024 * 1024 * 1024  # 10 GB
+        
+        effective_limit = hard_limit if is_arch else size_limit
 
-        if file_size > size_limit:
-            limit_gb = size_limit / (1024 * 1024 * 1024)
+        if file_size > effective_limit:
+            limit_gb = effective_limit / (1024 * 1024 * 1024)
             actual_gb = file_size / (1024 * 1024 * 1024)
-            user_type = "Premium" if is_premium else "Biasa"
-            await status_msg.edit(
+            msg = (
                 f"❌ **Fail terlalu besar!**\n\n"
-                f"User {user_type}: Max {limit_gb:.1f} GB\n"
+                f"Had Maksimum: {limit_gb:.1f} GB\n"
                 f"Fail ini: {actual_gb:.2f} GB"
             )
+            if is_arch:
+                msg += "\n(Saiz arkib melebihi had sistem 10GB)"
+            else:
+                user_type = "Premium" if is_premium else "Biasa"
+                msg += f"\n(User {user_type})"
+                
+            await status_msg.edit(msg)
             return
 
         # Get backup group peer
@@ -1115,7 +1143,8 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         if is_archive(file_name):
             await _handle_archive(
                 bot, _direct_client, backup_peer, message, status_msg,
-                user_id, final_url, file_name, file_size
+                user_id, final_url, file_name, file_size,
+                is_premium=is_premium
             )
             return
 
