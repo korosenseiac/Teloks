@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pyrogram import Client
 from pyrogram.errors import FloodWait
+
+from app.utils.message import safe_edit
 from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
@@ -461,7 +463,7 @@ async def _deliver_to_user(
     Photos are sent as album(s) first, then videos as album(s).
     Includes a safety-net pass for any missed deliveries.
     """
-    await status_msg.edit("⬆️ Menghantar ke anda…")
+    await safe_edit(status_msg, "⬆️ Menghantar ke anda…")
 
     delivered_mids: set = set()
 
@@ -513,7 +515,7 @@ async def _deliver_to_user(
 
     if sent_count < total_to_send:
         try:
-            await status_msg.edit(
+            await safe_edit(status_msg, 
                 f"⚠️ Selesai! {sent_count}/{total_to_send} fail berjaya dihantar."
             )
         except Exception:
@@ -635,7 +637,7 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
         try:
             info = await mf_client.resolve(url)
         except ValueError as e:
-            await status_msg.edit(f"❌ {e}")
+            await safe_edit(status_msg, f"❌ {e}")
             return
 
         direct_url = info["direct_url"]
@@ -643,7 +645,7 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
         file_size = info["size"]
 
         if skip_non_videos and not is_archive(filename) and _classify(filename) != "video":
-            await status_msg.edit("❌ Fail ini bukannya video. Melangkau (skip).")
+            await safe_edit(status_msg, "❌ Fail ini bukannya video. Melangkau (skip).")
             return
 
         print(
@@ -676,18 +678,18 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
                 user_type = "Premium" if is_premium else "Biasa"
                 msg += f"\n(User {user_type})"
                 
-            await status_msg.edit(msg)
+            await safe_edit(status_msg, msg)
             return
 
         # 3. Resolve backup group peer
         # Check for cancellation after resolve
         if is_cancelled(user_id):
-            await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+            await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
             return
 
         backup_peer = await get_backup_group_peer(bot)
         if not backup_peer:
-            await status_msg.edit("❌ Backup group tidak dijumpai.")
+            await safe_edit(status_msg, "❌ Backup group tidak dijumpai.")
             return
 
         # 4. Branch based on file type
@@ -706,7 +708,7 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
                 direct_url, filename, file_size,
             )
         else:
-            await status_msg.edit(
+            await safe_edit(status_msg, 
                 "❌ **Fail ini bukan media yang disokong.**\n\n"
                 "Bot hanya menyokong fail foto, video, atau arkib (ZIP/RAR) "
                 "yang mengandungi foto/video."
@@ -719,7 +721,7 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
         import traceback
         traceback.print_exc()
         try:
-            await status_msg.edit(f"❌ Ralat tidak dijangka: {e}")
+            await safe_edit(status_msg, f"❌ Ralat tidak dijangka: {e}")
         except Exception:
             pass
 
@@ -750,10 +752,10 @@ async def _handle_direct_media(
 
     # Check for cancellation before starting upload
     if is_cancelled(user_id):
-        await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+        await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
         return
 
-    await status_msg.edit(
+    await safe_edit(status_msg, 
         f"📥 Memuat turun & memuat naik: `{filename}`\n"
         f"📦 Saiz: {_format_size(file_size)}"
     )
@@ -780,7 +782,7 @@ async def _handle_direct_media(
         await tracker.stop()
 
         if not bmid:
-            await status_msg.edit("❌ Gagal memuat naik fail ke Telegram.")
+            await safe_edit(status_msg, "❌ Gagal memuat naik fail ke Telegram.")
             return
 
         kind = _classify(filename)
@@ -836,7 +838,7 @@ async def _handle_archive(
 
     try:
         # ----- Phase 1: Download the archive -----
-        await status_msg.edit(
+        await safe_edit(status_msg, 
             f"📥 Memuat turun arkib: `{filename}`\n"
             f"📦 Saiz: {_format_size(file_size)}"
         )
@@ -860,14 +862,14 @@ async def _handle_archive(
         # Check for cancellation after download
         from app.bot.main import is_cancelled
         if is_cancelled(user_id):
-            await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+            await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
             return
 
         # Close the MediaFire HTTP session early to free resources
         await mf_client.close()
 
         # ----- Phase 2: Count media files (metadata only, no extraction) -----
-        await status_msg.edit("📂 Mengimbas fail media dalam arkib…")
+        await safe_edit(status_msg, "📂 Mengimbas fail media dalam arkib…")
 
         loop = asyncio.get_running_loop()
         total_files = await loop.run_in_executor(
@@ -876,13 +878,13 @@ async def _handle_archive(
 
         if total_files == 0:
             msg = "❌ Tiada fail video dijumpai dalam arkib." if skip_non_videos else "❌ Tiada fail media (foto/video) dijumpai dalam arkib."
-            await status_msg.edit(msg)
+            await safe_edit(status_msg, msg)
             return
 
         extract_dir = os.path.join(temp_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
 
-        await status_msg.edit(
+        await safe_edit(status_msg, 
             f"📤 Memuat naik {total_files} fail media ke Telegram…"
         )
 
@@ -960,7 +962,7 @@ async def _handle_archive(
                         f"    {_human_bytes(_batch_state['uploaded'])} \u2022 {_human_speed(ul_speed)} \u2022 ETA {_eta(ul_rem, ul_speed)}\n\n"
                         f"\u23f1 Masa: {mins}m {secs}s"
                     )
-                    await status_msg.edit(text)
+                    await safe_edit(status_msg, text)
                 except Exception:
                     pass
 
@@ -1047,7 +1049,7 @@ async def _handle_archive(
             idx += 1
 
             if is_cancelled(user_id):
-                await status_msg.edit("\U0001f6ab **Proses dibatalkan!**\n\n\U0001f4be Folder sementara sedang dibersihkan...")
+                await safe_edit(status_msg, "\U0001f6ab **Proses dibatalkan!**\n\n\U0001f4be Folder sementara sedang dibersihkan...")
                 return
 
             if mf["kind"] == "photo":
@@ -1148,7 +1150,7 @@ async def _handle_archive(
             pass
 
         if not uploaded:
-            await status_msg.edit("❌ Semua fail gagal dimuat naik.")
+            await safe_edit(status_msg, "❌ Semua fail gagal dimuat naik.")
             return
 
         # ----- Phase 4: Send to user -----

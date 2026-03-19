@@ -13,6 +13,8 @@ from typing import Optional
 
 from pyrogram.types import Message
 
+from app.utils.message import safe_edit
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -79,7 +81,7 @@ class ProgressTracker:
     >>> await tracker.stop()                  # cancel updater & final edit
     """
 
-    EDIT_INTERVAL: float = 2.5  # seconds between message edits (avoid flood)
+    EDIT_INTERVAL: float = 4.5  # seconds between message edits (avoid flood)
 
     def __init__(
         self,
@@ -210,7 +212,7 @@ class ProgressTracker:
                 break
             try:
                 text = self._render()
-                await self.status_msg.edit(text)
+                await safe_edit(self.status_msg, text)
             except Exception:
                 pass  # FloodWait, message deleted, etc.
 
@@ -225,6 +227,6 @@ class ProgressTracker:
                 pass
         if final_text:
             try:
-                await self.status_msg.edit(final_text)
+                await safe_edit(self.status_msg, final_text)
             except Exception:
                 pass

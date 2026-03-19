@@ -26,6 +26,8 @@ import aiohttp
 
 from pyrogram import Client
 from pyrogram.errors import FloodWait
+
+from app.utils.message import safe_edit
 from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
@@ -429,7 +431,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             tb = await get_terabox_client()
         except RuntimeError as e:
             active_user_processes.pop(user_id, None)
-            await status_msg.edit(f"❌ TeraBox tidak dikonfigurasi: {e}")
+            await safe_edit(status_msg, f"❌ TeraBox tidak dikonfigurasi: {e}")
             return
 
         # 2. Get share metadata
@@ -437,7 +439,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         print(f"[TB:handler] short_url_info full response: {info}")
         if not info or info.get("errno", -1) != 0:
             errno = info.get("errno") if info else "?"
-            await status_msg.edit(
+            await safe_edit(status_msg, 
                 f"❌ Link tidak sah atau telah tamat tempoh. (errno={errno})"
             )
             return
@@ -449,11 +451,11 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # 3. Transfer share items into a temp folder on YOUR TeraBox account.
         #    Inspired by TeraFetch: skip share/list (errno=105 on datacenter IPs)
         #    and transfer root items directly, then list our own files.
-        await status_msg.edit("📁 Mencipta folder sementara…")
+        await safe_edit(status_msg, "📁 Mencipta folder sementara…")
         temp_folder = f"/terabox_temp_{uuid.uuid4().hex[:12]}"
         cd_result = await tb.create_dir(temp_folder)
         if not cd_result or cd_result.get("errno", -1) != 0:
-            await status_msg.edit(
+            await safe_edit(status_msg, 
                 "❌ Gagal mencipta folder sementara di TeraBox. "
                 f"(errno={cd_result.get('errno') if cd_result else '?'})"
             )
@@ -464,7 +466,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         root_count = len(root_items)
         print(f"[TB:handler] transferring {root_count} root items: {root_fs_ids}")
 
-        await status_msg.edit(
+        await safe_edit(status_msg, 
             f"➡️ Memindahkan {root_count} item ke akaun TeraBox anda…"
         )
         transfer_result = await tb.share_transfer(share_id, from_uk, root_fs_ids, temp_folder)
@@ -476,7 +478,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             if transfer_result and transfer_result.get("errno") == 12:
                 print(f"[TB:handler] share_transfer errno=12 (already exists), continuing")
             else:
-                await status_msg.edit(
+                await safe_edit(status_msg, 
                     f"❌ Gagal memindahkan fail. (errno={errno}) {extra}"
                 )
                 return
@@ -484,12 +486,12 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # 4. Wait for async transfer task to complete, then list files
         task_id = transfer_result.get("task_id") if transfer_result else None
         if task_id:
-            await status_msg.edit("⏳ Menunggu pemindahan selesai…")
+            await safe_edit(status_msg, "⏳ Menunggu pemindahan selesai…")
             print(f"[TB:handler] async task_id={task_id}, polling…")
             for poll_i in range(60):                       # max ~120 s
                 # Check for cancellation during polling
                 if is_cancelled(user_id):
-                    await status_msg.edit("\ud83d\udeab **Proses dibatalkan!**\n\n\ud83d\udcbe Folder sementara sedang dibersihkan...")
+                    await safe_edit(status_msg, "\ud83d\udeab **Proses dibatalkan!**\n\n\ud83d\udcbe Folder sementara sedang dibersihkan...")
                     return
 
                 await asyncio.sleep(2)
@@ -508,7 +510,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                         break
                     if t_status in (3, "failed"):
                         print(f"[TB:handler] task FAILED: {task_resp}")
-                        await status_msg.edit("❌ Pemindahan gagal di sisi TeraBox.")
+                        await safe_edit(status_msg, "❌ Pemindahan gagal di sisi TeraBox.")
                         return
             else:
                 print("[TB:handler] task polling timed out after 120s")
@@ -516,7 +518,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # Give TeraBox a moment to finalise the listing
         await asyncio.sleep(1)
 
-        await status_msg.edit("📂 Mengimbas fail yang dipindahkan…")
+        await safe_edit(status_msg, "📂 Mengimbas fail yang dipindahkan…")
 
         # Retry _collect_own_files a few times in case listing is delayed
         all_files: List[Dict[str, Any]] = []
@@ -532,7 +534,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             for f in all_files[:5]:
                 print(f"  └ {f.get('server_filename')} size={f.get('size')} fs_id={f.get('fs_id')}")
         if not all_files:
-            await status_msg.edit("❌ Tiada fail dijumpai selepas pemindahan.")
+            await safe_edit(status_msg, "❌ Tiada fail dijumpai selepas pemindahan.")
             return
 
         total = len(all_files)
@@ -544,13 +546,13 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 f"• `{f['server_filename']}` ({int(f['size']) / 1e9:.2f} GB)"
                 for f in oversized
             )
-            await status_msg.edit(
+            await safe_edit(status_msg, 
                 f"❌ **{len(oversized)} fail melebihi had 2 GB:**\n\n{names}"
             )
             return
 
         # 6. Get dlink for each transferred file (batched to avoid API limits)
-        await status_msg.edit("🔗 Mendapatkan link muat turun…")
+        await safe_edit(status_msg, "🔗 Mendapatkan link muat turun…")
         my_fs_ids = [int(f["fs_id"]) for f in all_files]
 
         DLINK_BATCH = 5  # TeraBox may limit how many dlinks per request
@@ -601,13 +603,13 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
 
         if not enriched:
             msg = "❌ Tiada video dijumpai untuk dimuat naik." if skip_non_videos else "❌ Tiada fail untuk dimuat naik."
-            await status_msg.edit(msg)
+            await safe_edit(status_msg, msg)
             return
 
         # 9. Resolve backup group peer
         backup_peer = await get_backup_group_peer(bot)
         if not backup_peer:
-            await status_msg.edit("❌ Backup group tidak dijumpai.")
+            await safe_edit(status_msg, "❌ Backup group tidak dijumpai.")
             return
 
         # Helper: fetch a fresh dlink for a single fs_id
@@ -699,7 +701,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                             f"    {_human_bytes(_photo_state['uploaded'])} \u2022 {_human_speed(ul_speed)} \u2022 ETA {_eta(ul_rem, ul_speed)}\n\n"
                             f"\u23f1 Masa: {mins}m {secs}s"
                         )
-                        await status_msg.edit(text)
+                        await safe_edit(status_msg, text)
                     except Exception:
                         pass
 
@@ -767,7 +769,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # --- Phase B: Upload non-photos sequentially with full progress ---
         for _seq_idx, entry in enumerate(_non_photo_entries, 1):
             if is_cancelled(user_id):
-                await status_msg.edit("\U0001f6ab **Proses dibatalkan!**\n\n\U0001f4be Folder sementara sedang dibersihkan...")
+                await safe_edit(status_msg, "\U0001f6ab **Proses dibatalkan!**\n\n\U0001f4be Folder sementara sedang dibersihkan...")
                 return
 
             tracker = ProgressTracker(
@@ -821,10 +823,10 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 print(f"[TeraBox] Skipping {entry['name']} \u2014 upload failed.")
 
         if not uploaded:
-            await status_msg.edit("❌ Semua fail gagal dimuat naik.")
+            await safe_edit(status_msg, "❌ Semua fail gagal dimuat naik.")
             return
 
-        await status_msg.edit("⬆️ Menghantar ke anda…")
+        await safe_edit(status_msg, "⬆️ Menghantar ke anda…")
 
         # ---------- Reliable send helper with FloodWait + retry --------------
         async def _safe_send(coro_factory, retries: int = 3):
@@ -989,7 +991,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # Summary
         if sent_count < total_to_send:
             try:
-                await status_msg.edit(
+                await safe_edit(status_msg, 
                     f"⚠️ Selesai! {sent_count}/{total_to_send} fail berjaya dihantar."
                 )
             except Exception:
@@ -1006,7 +1008,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         print(f"[TeraBox] Handler error: {e}")
         import traceback; traceback.print_exc()
         try:
-            await status_msg.edit(f"❌ Ralat tidak dijangka: {e}")
+            await safe_edit(status_msg, f"❌ Ralat tidak dijangka: {e}")
         except Exception:
             pass
 

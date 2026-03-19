@@ -15,6 +15,7 @@ import tempfile
 from typing import Dict, List, Optional, Tuple
 
 from pyrogram import Client
+from app.utils.message import safe_edit
 from pyrogram.types import (
     Message,
     InputMediaPhoto,
@@ -587,7 +588,7 @@ async def _deliver_to_user_multi(
     Photos are sent as album(s) first, then videos as album(s).
     Includes a safety-net pass for any missed deliveries.
     """
-    await status_msg.edit("⬆️ Menghantar ke anda…")
+    await safe_edit(status_msg, "⬆️ Menghantar ke anda…")
 
     delivered_mids: set = set()
 
@@ -639,7 +640,7 @@ async def _deliver_to_user_multi(
 
     if sent_count < total_to_send:
         try:
-            await status_msg.edit(
+            await safe_edit(status_msg, 
                 f"⚠️ Selesai! {sent_count}/{total_to_send} fail berjaya dihantar."
             )
         except Exception:
@@ -740,7 +741,7 @@ async def _handle_archive(
 
     try:
         # ----- Phase 1: Download the archive -----
-        await status_msg.edit(
+        await safe_edit(status_msg, 
             f"📥 Memuat turun arkib: `{filename}`\n"
             f"📦 Saiz: {_human_bytes(file_size)}"
         )
@@ -761,11 +762,11 @@ async def _handle_archive(
 
         # Check for cancellation after download
         if is_cancelled(user_id):
-            await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+            await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
             return
 
         # ----- Phase 2: Count media files (metadata only, no extraction) -----
-        await status_msg.edit("📂 Mengimbas fail media dalam arkib…")
+        await safe_edit(status_msg, "📂 Mengimbas fail media dalam arkib…")
 
         loop = asyncio.get_running_loop()
         total_files = await loop.run_in_executor(
@@ -774,13 +775,13 @@ async def _handle_archive(
 
         if total_files == 0:
             msg = "❌ Tiada fail video dijumpai dalam arkib." if skip_non_videos else "❌ Tiada fail media (foto/video) dijumpai dalam arkib."
-            await status_msg.edit(msg)
+            await safe_edit(status_msg, msg)
             return
 
         extract_dir = os.path.join(temp_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
 
-        await status_msg.edit(
+        await safe_edit(status_msg, 
             f"📤 Memuat naik {total_files} fail media ke Telegram…"
         )
 
@@ -856,7 +857,7 @@ async def _handle_archive(
                         f"    {_human_bytes(_batch_state['uploaded'])} • {_human_speed(ul_speed)} • ETA {_eta(ul_rem, ul_speed)}\n\n"
                         f"⏱ Masa: {mins}m {secs}s"
                     )
-                    await status_msg.edit(text)
+                    await safe_edit(status_msg, text)
                 except Exception:
                     pass
 
@@ -932,7 +933,7 @@ async def _handle_archive(
             idx += 1
 
             if is_cancelled(user_id):
-                await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+                await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
                 return
 
             if mf["kind"] == "photo":
@@ -1016,7 +1017,7 @@ async def _handle_archive(
             pass
 
         if not uploaded:
-            await status_msg.edit("❌ Semua fail gagal dimuat naik.")
+            await safe_edit(status_msg, "❌ Semua fail gagal dimuat naik.")
             return
 
         await _deliver_to_user_multi(bot, user_id, uploaded, status_msg)
@@ -1093,11 +1094,11 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
 
     try:
         # Resolve URL metadata
-        await status_msg.edit("🔍 Mengekstrak metadata URL...")
+        await safe_edit(status_msg, "🔍 Mengekstrak metadata URL...")
         try:
             metadata = await _direct_client.resolve(url)
         except Exception as e:
-            await status_msg.edit(f"❌ Tidak dapat mengakses URL: {e}")
+            await safe_edit(status_msg, f"❌ Tidak dapat mengakses URL: {e}")
             return
 
         file_size = metadata.get("size", 0)
@@ -1129,14 +1130,14 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
                 user_type = "Premium" if is_premium else "Biasa"
                 msg += f"\n(User {user_type})"
                 
-            await status_msg.edit(msg)
+            await safe_edit(status_msg, msg)
             return
 
         # Get backup group peer
         try:
             backup_peer = await _get_backup_group_peer()
         except Exception as e:
-            await status_msg.edit(f"❌ Gagal mendapat backup group: {e}")
+            await safe_edit(status_msg, f"❌ Gagal mendapat backup group: {e}")
             return
 
         # Check if file is an archive
@@ -1168,7 +1169,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
 
         if custom_thumb_source:
             try:
-                await status_msg.edit("🖼 Menyediakan gambar kecil (thumbnail)...")
+                await safe_edit(status_msg, "🖼 Menyediakan gambar kecil (thumbnail)...")
                 if custom_thumb_source == "document":
                     # Document = full quality, no Telegram compression
                     custom_thumb_path = await message.download()
@@ -1274,13 +1275,13 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             except Exception:
                 pass
         else:
-            await status_msg.edit("⚠️ Selesai! Fail telah dimuat naik ke grup sandaran tetapi gagal dihantar.")
+            await safe_edit(status_msg, "⚠️ Selesai! Fail telah dimuat naik ke grup sandaran tetapi gagal dihantar.")
 
     except asyncio.CancelledError:
         if tracker:
             await tracker.stop("❌ Dibatalkan oleh pengguna.")
         else:
-            await status_msg.edit("❌ Dibatalkan oleh pengguna.")
+            await safe_edit(status_msg, "❌ Dibatalkan oleh pengguna.")
     except Exception as e:
         print(f"[DirectLink] Handler error: {e}")
         import traceback
@@ -1289,7 +1290,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             await tracker.stop(f"❌ Ralat: {e}")
         else:
             try:
-                await status_msg.edit(f"❌ Ralat: {e}")
+                await safe_edit(status_msg, f"❌ Ralat: {e}")
             except Exception:
                 pass
     finally:

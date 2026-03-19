@@ -24,6 +24,7 @@ from app.bot.session_manager import manager
 from app.utils.streamer import MediaStreamer, upload_stream
 from app.bot.auth import handle_login_command, handle_auth_message, handle_login_callback, cancel_login, handle_main_menu_callback, handle_profile_callback, handle_profile_age_message, start_profile_setup
 from app.bot.states import user_profile_states, ProfileStep
+from app.utils.message import safe_edit
 from app.terabox.handler import terabox_link_handler, TERABOX_LINK_PATTERN
 from app.mediafire.handler import mediafire_link_handler, MEDIAFIRE_LINK_PATTERN
 from app.torrent.handler import (
@@ -575,7 +576,7 @@ async def link_handler(client: Client, message: Message):
     user_client = await manager.get_client(user_id)
     if not user_client:
         active_user_processes.pop(user_id, None)
-        await status_msg.edit("❌ Belum login.")
+        await safe_edit(status_msg, "❌ Belum login.")
         return
 
     try:
@@ -586,13 +587,13 @@ async def link_handler(client: Client, message: Message):
             if is_public_link:
                 # For public links, try resolving with @ prefix
                 try:
-                    await status_msg.edit(f"🔄 Resolving @{chat_id}...")
+                    await safe_edit(status_msg, f"🔄 Resolving @{chat_id}...")
                     target_msg = await user_client.get_messages(f"@{chat_id}", msg_id)
                 except Exception as e2:
-                    await status_msg.edit(f"❌ Tidak dapat akses @{chat_id}: {e2}")
+                    await safe_edit(status_msg, f"❌ Tidak dapat akses @{chat_id}: {e2}")
                     return
             else:
-                await status_msg.edit(f"🔄 Scanning... ({e})")
+                await safe_edit(status_msg, f"🔄 Scanning... ({e})")
                 
                 found_chat = None
                 debug_ids = []
@@ -617,17 +618,17 @@ async def link_handler(client: Client, message: Message):
                     
                     if not found_chat:
                         ids_sample = ", ".join(debug_ids)
-                        await status_msg.edit(f"❌ Chat {chat_id} tidak dijumpai. First 5 IDs: {ids_sample}")
+                        await safe_edit(status_msg, f"❌ Chat {chat_id} tidak dijumpai. First 5 IDs: {ids_sample}")
                         return
 
                     # Try again with the found chat_id
                     target_msg = await user_client.get_messages(chat_id, msg_id)
                 except Exception as e2:
-                    await status_msg.edit(f"❌ Error: {e2}")
+                    await safe_edit(status_msg, f"❌ Error: {e2}")
                     return
         
         if not target_msg or not target_msg.media:
-            await status_msg.edit("❌ Bukan media/file.")
+            await safe_edit(status_msg, "❌ Bukan media/file.")
             return
 
         # Get source chat name
@@ -636,7 +637,7 @@ async def link_handler(client: Client, message: Message):
         # Check if this message is part of a media group (album)
         messages_to_process = []
         if target_msg.media_group_id:
-            await status_msg.edit("📂 Detected media group, memproses semua files...")
+            await safe_edit(status_msg, "📂 Detected media group, memproses semua files...")
             # Fetch all messages in the media group
             media_group_msgs = await user_client.get_media_group(chat_id, msg_id)
             messages_to_process = media_group_msgs
@@ -660,7 +661,7 @@ async def link_handler(client: Client, message: Message):
             for fname, fsize in oversized_files:
                 error_msg += f"📁 `{fname}`: {format_file_size(fsize)}\n"
             error_msg += f"\n⚠️ Had maksimum: 600MB"
-            await status_msg.edit(error_msg)
+            await safe_edit(status_msg, error_msg)
             return
 
         total_files = len(messages_to_process)
@@ -678,10 +679,10 @@ async def link_handler(client: Client, message: Message):
             for idx, msg_to_process in enumerate(messages_to_process, 1):
                 # Check for cancellation
                 if is_cancelled(user_id):
-                    await status_msg.edit("🚫 **Proses dibatalkan!**")
+                    await safe_edit(status_msg, "🚫 **Proses dibatalkan!**")
                     return
 
-                await status_msg.edit(f"⬇️ Memuat naik {idx}/{total_files}...")
+                await safe_edit(status_msg, f"⬇️ Memuat naik {idx}/{total_files}...")
                 
                 # Upload each file and get file_id
                 result = await upload_single_media_for_group(
@@ -692,7 +693,7 @@ async def link_handler(client: Client, message: Message):
                     uploaded_media.append(result)
             
             if not uploaded_media:
-                await status_msg.edit("❌ Gagal memproses media/file.")
+                await safe_edit(status_msg, "❌ Gagal memproses media/file.")
                 return
             
             # Build InputMedia list using file_ids
@@ -718,7 +719,7 @@ async def link_handler(client: Client, message: Message):
                     backup_media_list.append(InputMediaDocument(file_id))
             
             # Send as media group to backup group
-            await status_msg.edit(f"📤 ...")
+            await safe_edit(status_msg, f"📤 ...")
             
             try:
                 backup_msgs = await client.send_media_group(
@@ -739,7 +740,7 @@ async def link_handler(client: Client, message: Message):
                 await log_forward(message.from_user.username, first_msg_id, total_album_size, source_name, backup_message_link)
                 
                 # Forward as album to user
-                await status_msg.edit(f"⬆️ Menghantar album ke anda...")
+                await safe_edit(status_msg, f"⬆️ Menghantar album ke anda...")
                 
                 # Build media list using file_ids from backup messages
                 user_media_list = []
@@ -760,17 +761,17 @@ async def link_handler(client: Client, message: Message):
                 print(f"DEBUG: Failed to send media group to backup: {e}")
                 import traceback
                 traceback.print_exc()
-                await status_msg.edit(f"❌ Gagal menghantar album: {e}")
+                await safe_edit(status_msg, f"❌ Gagal menghantar album: {e}")
                 return
         else:
             # Process single file individually
             for idx, msg_to_process in enumerate(messages_to_process, 1):
                 # Check for cancellation
                 if is_cancelled(user_id):
-                    await status_msg.edit("🚫 **Proses dibatalkan!**")
+                    await safe_edit(status_msg, "🚫 **Proses dibatalkan!**")
                     return
 
-                await status_msg.edit(f"⬇️ Memproses {idx}/{total_files}...")
+                await safe_edit(status_msg, f"⬇️ Memproses {idx}/{total_files}...")
                 
                 # Process single media file
                 backup_msg_id, file_name, file_size = await process_single_media(
@@ -786,11 +787,11 @@ async def link_handler(client: Client, message: Message):
                     await log_forward(message.from_user.username, backup_msg_id, file_size, source_name, backup_message_link)
 
             if not backup_msg_ids:
-                await status_msg.edit("❌ Gagal memproses media/file.")
+                await safe_edit(status_msg, "❌ Gagal memproses media/file.")
                 return
 
             # Forward individual messages to user
-            await status_msg.edit(f"⬆️ Mengirim {len(backup_msg_ids)} file(s) ke Anda...")
+            await safe_edit(status_msg, f"⬆️ Mengirim {len(backup_msg_ids)} file(s) ke Anda...")
             for backup_msg_id in backup_msg_ids:
                 try:
                     await client.copy_message(
@@ -807,7 +808,7 @@ async def link_handler(client: Client, message: Message):
     except asyncio.CancelledError:
         print(f"[Main] Process cancelled by user {user_id}")
     except Exception as e:
-        await status_msg.edit(f"....")
+        await safe_edit(status_msg, f"....")
         import traceback
         traceback.print_exc()
     finally:
