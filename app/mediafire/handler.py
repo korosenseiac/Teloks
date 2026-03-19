@@ -51,7 +51,7 @@ from app.config import BACKUP_GROUP_ID
 from app.database.db import log_forward, get_user_session, get_user_profile
 from app.utils.streamer import upload_stream
 from app.utils.media import (
-    PHOTO_EXTS, VIDEO_EXTS, MAX_FILE_SIZE,
+    PHOTO_EXTS, VIDEO_EXTS, MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM,
     ext as _ext, classify as _classify, mime as _mime,
     is_media, is_archive,
 )
