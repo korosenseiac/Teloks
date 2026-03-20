@@ -2,6 +2,7 @@ import asyncio
 import math
 import random
 from pyrogram import Client
+from pyrogram.errors import FloodWait
 from pyrogram.file_id import FileId, PHOTO_TYPES
 from pyrogram.raw.functions.upload import GetFile, SaveFilePart, SaveBigFilePart
 from pyrogram.raw.types import InputFileLocation, InputFile, InputFileBig, InputDocumentFileLocation, InputPhotoFileLocation
@@ -155,35 +156,45 @@ async def upload_stream(client: Client, streamer, file_name: str, on_upload_chun
     print(f"[Upload] file_size={file_size}, chunk_size={chunk_size}, total_parts={total_parts}, is_big={is_big}")
 
     # --- Concurrent upload machinery ----------------------------------------
-    UPLOAD_WORKERS = 3 if is_big else 1  # Low worker count to limit memory on small VPS
+    UPLOAD_WORKERS = 2 if is_big else 1  # Reduced from 3 to avoid FloodWait
     sem = asyncio.Semaphore(UPLOAD_WORKERS)
     pending: list = []
 
     async def _upload_part(part_idx: int, data: bytes):
         async with sem:
-            if is_big:
-                await client.invoke(
-                    SaveBigFilePart(
-                        file_id=file_id,
-                        file_part=part_idx,
-                        file_total_parts=total_parts,
-                        bytes=data,
-                    ),
-                    retries=3,
-                    timeout=60,
-                )
-            else:
-                await client.invoke(
-                    SaveFilePart(
-                        file_id=file_id,
-                        file_part=part_idx,
-                        bytes=data,
-                    ),
-                    retries=3,
-                    timeout=60,
-                )
-            if on_upload_chunk:
-                on_upload_chunk(len(data))
+            for attempt in range(3):
+                try:
+                    if is_big:
+                        await client.invoke(
+                            SaveBigFilePart(
+                                file_id=file_id,
+                                file_part=part_idx,
+                                file_total_parts=total_parts,
+                                bytes=data,
+                            ),
+                            retries=3,
+                            timeout=60,
+                        )
+                    else:
+                        await client.invoke(
+                            SaveFilePart(
+                                file_id=file_id,
+                                file_part=part_idx,
+                                bytes=data,
+                            ),
+                            retries=3,
+                            timeout=60,
+                        )
+                    if on_upload_chunk:
+                        on_upload_chunk(len(data))
+                    return  # Success
+                except FloodWait as fw:
+                    wait = getattr(fw, "value", getattr(fw, "x", 10))
+                    if wait > 60:
+                        print(f"FloodWait {wait}s too long for upload part, aborting...")
+                        raise  # Re-raise to abort entire upload
+                    print(f"FloodWait {wait}s on part {part_idx} (attempt {attempt+1}/3)")
+                    await asyncio.sleep(wait + 1)
 
     # --- Read & upload loop --------------------------------------------------
     part_count = 0

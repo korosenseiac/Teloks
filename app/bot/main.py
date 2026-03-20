@@ -3,6 +3,7 @@ import random
 import math
 from io import BytesIO
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
 from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.functions.upload import SaveFilePart
@@ -720,12 +721,27 @@ async def link_handler(client: Client, message: Message):
             
             # Send as media group to backup group
             await safe_edit(status_msg, f"📤 ...")
-            
+
             try:
-                backup_msgs = await client.send_media_group(
-                    chat_id=BACKUP_GROUP_ID,
-                    media=backup_media_list
-                )
+                # Send to backup with FloodWait handling
+                backup_msgs = None
+                for attempt in range(3):
+                    try:
+                        backup_msgs = await client.send_media_group(
+                            chat_id=BACKUP_GROUP_ID,
+                            media=backup_media_list
+                        )
+                        break
+                    except FloodWait as fw:
+                        wait = getattr(fw, "value", getattr(fw, "x", 10))
+                        if wait > 300:  # Skip if wait > 5 minutes
+                            print(f"FloodWait too long ({wait}s) for backup send, skipping...")
+                            raise
+                        print(f"FloodWait {wait}s on backup send (attempt {attempt+1}/3)")
+                        await asyncio.sleep(wait + 1)
+
+                if not backup_msgs:
+                    raise Exception("Failed to send media group after retries")
                 
                 # Collect all message IDs
                 for backup_msg in backup_msgs:
@@ -755,7 +771,18 @@ async def link_handler(client: Client, message: Message):
                         user_media_list.append(InputMediaDocument(backup_msg.document.file_id))
                 
                 if user_media_list:
-                    await client.send_media_group(chat_id=user_id, media=user_media_list)
+                    # Send to user with FloodWait handling
+                    for attempt in range(3):
+                        try:
+                            await client.send_media_group(chat_id=user_id, media=user_media_list)
+                            break
+                        except FloodWait as fw:
+                            wait = getattr(fw, "value", getattr(fw, "x", 10))
+                            if wait > 300:  # Skip if wait > 5 minutes
+                                print(f"FloodWait too long ({wait}s) for user send, skipping...")
+                                break
+                            print(f"FloodWait {wait}s on user send (attempt {attempt+1}/3)")
+                            await asyncio.sleep(wait + 1)
                     
             except Exception as e:
                 print(f"DEBUG: Failed to send media group to backup: {e}")
