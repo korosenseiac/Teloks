@@ -757,31 +757,24 @@ async def link_handler(client: Client, message: Message):
                 
                 # Forward as album to user
                 await safe_edit(status_msg, f"⬆️ Menghantar album ke anda...")
-                
-                # Build media list using file_ids from backup messages
-                user_media_list = []
-                for backup_msg in backup_msgs:
-                    if backup_msg.photo:
-                        user_media_list.append(InputMediaPhoto(backup_msg.photo.file_id))
-                    elif backup_msg.video:
-                        user_media_list.append(InputMediaVideo(backup_msg.video.file_id))
-                    elif backup_msg.audio:
-                        user_media_list.append(InputMediaAudio(backup_msg.audio.file_id))
-                    elif backup_msg.document:
-                        user_media_list.append(InputMediaDocument(backup_msg.document.file_id))
-                
-                if user_media_list:
-                    # Send to user with FloodWait handling
+
+                # Forward album from backup group to user (no re-upload needed)
+                if backup_msgs:
+                    message_ids = [msg.id for msg in backup_msgs]
                     for attempt in range(3):
                         try:
-                            await client.send_media_group(chat_id=user_id, media=user_media_list)
+                            await client.forward_messages(
+                                chat_id=user_id,
+                                from_chat_id=BACKUP_GROUP_ID,
+                                message_ids=message_ids
+                            )
                             break
                         except FloodWait as fw:
                             wait = getattr(fw, "value", getattr(fw, "x", 10))
                             if wait > 300:  # Skip if wait > 5 minutes
-                                print(f"FloodWait too long ({wait}s) for user send, skipping...")
+                                print(f"FloodWait too long ({wait}s) for user forward, skipping...")
                                 break
-                            print(f"FloodWait {wait}s on user send (attempt {attempt+1}/3)")
+                            print(f"FloodWait {wait}s on user forward (attempt {attempt+1}/3)")
                             await asyncio.sleep(wait + 1)
                     
             except Exception as e:
