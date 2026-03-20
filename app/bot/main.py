@@ -758,24 +758,52 @@ async def link_handler(client: Client, message: Message):
                 # Forward as album to user
                 await safe_edit(status_msg, f"⬆️ Menghantar album ke anda...")
 
-                # Forward album from backup group to user (no re-upload needed)
-                if backup_msgs:
-                    message_ids = [msg.id for msg in backup_msgs]
+                # Build media list using file_ids from backup messages (no re-upload)
+                user_media_list = []
+                for backup_msg in backup_msgs:
+                    if backup_msg.photo:
+                        user_media_list.append(InputMediaPhoto(backup_msg.photo.file_id))
+                    elif backup_msg.video:
+                        user_media_list.append(InputMediaVideo(backup_msg.video.file_id))
+                    elif backup_msg.audio:
+                        user_media_list.append(InputMediaAudio(backup_msg.audio.file_id))
+                    elif backup_msg.document:
+                        user_media_list.append(InputMediaDocument(backup_msg.document.file_id))
+
+                # Try send_media_group first (preserves album), fallback to copy_message
+                if user_media_list:
+                    album_sent = False
                     for attempt in range(3):
                         try:
-                            await client.forward_messages(
-                                chat_id=user_id,
-                                from_chat_id=BACKUP_GROUP_ID,
-                                message_ids=message_ids
-                            )
+                            await client.send_media_group(chat_id=user_id, media=user_media_list)
+                            album_sent = True
                             break
                         except FloodWait as fw:
                             wait = getattr(fw, "value", getattr(fw, "x", 10))
-                            if wait > 300:  # Skip if wait > 5 minutes
-                                print(f"FloodWait too long ({wait}s) for user forward, skipping...")
+                            if wait > 60:  # If wait > 1 minute, fall back to copy_message
+                                print(f"FloodWait {wait}s too long for album, using copy_message fallback...")
                                 break
-                            print(f"FloodWait {wait}s on user forward (attempt {attempt+1}/3)")
+                            print(f"FloodWait {wait}s on user album (attempt {attempt+1}/3)")
                             await asyncio.sleep(wait + 1)
+
+                    # Fallback: copy messages individually if album send failed
+                    if not album_sent:
+                        for backup_msg in backup_msgs:
+                            for copy_attempt in range(3):
+                                try:
+                                    await client.copy_message(
+                                        chat_id=user_id,
+                                        from_chat_id=BACKUP_GROUP_ID,
+                                        message_id=backup_msg.id
+                                    )
+                                    break
+                                except FloodWait as fw:
+                                    wait = getattr(fw, "value", getattr(fw, "x", 10))
+                                    if wait > 300:
+                                        print(f"FloodWait {wait}s too long for copy, skipping...")
+                                        break
+                                    await asyncio.sleep(wait + 1)
+                            await asyncio.sleep(0.5)
                     
             except Exception as e:
                 print(f"DEBUG: Failed to send media group to backup: {e}")

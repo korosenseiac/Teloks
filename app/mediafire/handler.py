@@ -427,13 +427,9 @@ async def _send_album_to_user(
         if len(media_list) == 1:
             await _send_single(valid_mids[0])
         else:
-            # Try forwarding as album (no re-upload needed)
+            # Try sending as album (preserves grouping)
             r = await _safe_send(
-                lambda _mids=valid_mids: bot.forward_messages(
-                    chat_id=user_id,
-                    from_chat_id=BACKUP_GROUP_ID,
-                    message_ids=_mids
-                )
+                lambda _ml=media_list: bot.send_media_group(user_id, _ml)
             )
             if r:
                 actual = len(r) if isinstance(r, list) else 0
