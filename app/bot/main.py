@@ -518,6 +518,111 @@ async def direct_link_message_handler(client: Client, message: Message):
 # Archive processing helper for telegram forwarder
 # ---------------------------------------------------------------------------
 
+async def _archive_get_video_metadata(video_path: str) -> dict:
+    """Use ffprobe to get duration, width, height for videos."""
+    meta = {"duration": 0, "width": 0, "height": 0}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration",
+            "-show_entries", "format=duration",
+            "-of", "csv=p=0:s=,",
+            video_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0 and stdout:
+            lines = stdout.decode().strip().splitlines()
+            if lines:
+                parts = lines[0].split(",")
+                if len(parts) >= 2:
+                    try:
+                        meta["width"] = int(parts[0])
+                    except (ValueError, TypeError):
+                        pass
+                    try:
+                        meta["height"] = int(parts[1])
+                    except (ValueError, TypeError):
+                        pass
+                    if len(parts) >= 3:
+                        try:
+                            meta["duration"] = int(float(parts[2]))
+                        except (ValueError, TypeError):
+                            pass
+                # Try format duration if stream duration not found
+                if meta["duration"] == 0 and len(lines) > 1:
+                    try:
+                        meta["duration"] = int(float(lines[1].strip().rstrip(",")))
+                    except (ValueError, TypeError):
+                        pass
+    except Exception as e:
+        print(f"[Archive] _archive_get_video_metadata error: {e}")
+    return meta
+
+
+async def _archive_generate_video_thumb(video_path: str, duration: int = 0) -> bytes | None:
+    """
+    Use ffmpeg to extract a JPEG thumbnail from the video.
+    Tries multiple positions to avoid black frames:
+    1. 10% of duration (avoids black intro)
+    2. 1 second
+    3. 0.1 second (for very short videos)
+    """
+    thumb_path = video_path + ".thumb.jpg"
+
+    # Calculate seek positions to try
+    seek_positions = []
+    if duration > 0:
+        # Try 10% of duration first (avoids black intro/outro)
+        ten_percent = max(0.1, min(duration * 0.1, 5.0))  # Cap at 5 seconds
+        seek_positions.append(str(ten_percent))
+    seek_positions.extend(["1", "0.5", "0.1"])  # Fallback positions
+
+    for seek_time in seek_positions:
+        try:
+            # Clean up any previous attempt
+            if os.path.exists(thumb_path):
+                os.remove(thumb_path)
+
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y",
+                "-ss", seek_time,
+                "-i", video_path,
+                "-frames:v", "1",
+                "-q:v", "5",
+                "-vf", "scale='min(320,iw)':-2",
+                thumb_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+
+            if proc.returncode == 0 and os.path.exists(thumb_path):
+                with open(thumb_path, "rb") as f:
+                    data = f.read()
+
+                # Check if thumbnail is valid (not too small, indicating black/empty frame)
+                if len(data) > 500:  # Good thumbnails are usually > 500 bytes
+                    os.remove(thumb_path)
+                    return data
+                # If thumbnail is very small, it might be a black frame - try next position
+                print(f"[Archive] Thumbnail at {seek_time}s too small ({len(data)} bytes), trying next position")
+
+        except Exception as e:
+            print(f"[Archive] Thumbnail generation error at {seek_time}s: {e}")
+
+    # Clean up
+    if os.path.exists(thumb_path):
+        try:
+            os.remove(thumb_path)
+        except Exception:
+            pass
+    return None
+
+
 async def _process_archive_from_message(
     bot: Client,
     user_client: Client,
@@ -613,6 +718,34 @@ async def _process_archive_from_message(
             await safe_edit(status_msg, f"⬆️ Memuat naik {idx}/{total_files}: {name}...")
 
             try:
+                # For videos, get metadata and thumbnail BEFORE streaming
+                video_meta = None
+                thumb_input_file = None
+                if kind == "video":
+                    video_meta = await _archive_get_video_metadata(file_path)
+                    duration = video_meta.get("duration", 0) if video_meta else 0
+                    thumb_raw = await _archive_generate_video_thumb(file_path, duration)
+                    if thumb_raw and len(thumb_raw) > 100:
+                        # Upload thumbnail using raw API
+                        try:
+                            from pyrogram.raw.functions.upload import SaveFilePart
+                            thumb_file_id = random.randint(0, 2**63 - 1)
+                            await bot.invoke(
+                                SaveFilePart(
+                                    file_id=thumb_file_id,
+                                    file_part=0,
+                                    bytes=thumb_raw,
+                                )
+                            )
+                            thumb_input_file = InputFile(
+                                id=thumb_file_id,
+                                parts=1,
+                                name="thumb.jpg",
+                                md5_checksum=""
+                            )
+                        except Exception as e:
+                            print(f"[Archive] Failed to upload thumbnail: {e}")
+
                 # Create FileStreamer for the extracted file
                 streamer = FileStreamer(file_path, name)
                 input_file = await upload_stream(bot, streamer, name)
@@ -621,12 +754,16 @@ async def _process_archive_from_message(
                 if kind == "photo":
                     media = InputMediaUploadedPhoto(file=input_file)
                 elif kind == "video":
-                    # Get video metadata if possible
+                    # Use actual video metadata
+                    duration = video_meta.get("duration", 0) if video_meta else 0
+                    width = video_meta.get("width", 0) if video_meta else 0
+                    height = video_meta.get("height", 0) if video_meta else 0
+
                     video_attrs = [
                         DocumentAttributeVideo(
-                            duration=0,
-                            w=0,
-                            h=0,
+                            duration=duration,
+                            w=width,
+                            h=height,
                             supports_streaming=True,
                         ),
                         DocumentAttributeFilename(file_name=name),
@@ -635,6 +772,7 @@ async def _process_archive_from_message(
                         file=input_file,
                         mime_type=mime(name),
                         attributes=video_attrs,
+                        thumb=thumb_input_file,
                     )
                 else:
                     # Document
