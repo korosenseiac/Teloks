@@ -33,8 +33,14 @@ from app.torrent.handler import (
     MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
 )
 from app.direct.handler import direct_link_handler, DIRECT_LINK_PATTERN
-from app.utils.media import is_torrent
+from app.utils.media import is_torrent, is_archive, classify, mime, PHOTO_EXTS, VIDEO_EXTS
+from app.mediafire.archive import iter_extract_media, count_media_in_archive
+from app.mediafire.streamer import FileStreamer
 import asyncio
+import tempfile
+import shutil
+import os
+import gc
 
 # Track active processes per user (user_id: True if processing)
 active_user_processes = {}
@@ -508,6 +514,297 @@ async def direct_link_message_handler(client: Client, message: Message):
     await direct_link_handler(client, message)
 
 
+# ---------------------------------------------------------------------------
+# Archive processing helper for telegram forwarder
+# ---------------------------------------------------------------------------
+
+async def _process_archive_from_message(
+    bot: Client,
+    user_client: Client,
+    target_msg: Message,
+    message: Message,
+    status_msg: Message,
+    user_id: int,
+    source_name: str,
+    backup_peer,
+):
+    """
+    Handle archive files (.zip/.rar) from forwarded messages.
+    Downloads the archive, extracts media files, uploads them, and sends to user.
+    """
+    from pyrogram.types import InputMediaPhoto, InputMediaVideo
+
+    doc = target_msg.document
+    file_name = getattr(doc, "file_name", "archive.zip")
+    file_size = getattr(doc, "file_size", 0)
+
+    temp_dir = None
+
+    try:
+        # Create temp directory
+        temp_dir = tempfile.mkdtemp(prefix="tg_archive_")
+        archive_path = os.path.join(temp_dir, file_name)
+        extract_dir = os.path.join(temp_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+
+        # Download the archive file
+        await safe_edit(status_msg, f"⬇️ Memuat turun arkib ({format_file_size(file_size)})...")
+
+        downloaded_path = await user_client.download_media(
+            target_msg,
+            file_name=archive_path,
+        )
+
+        if not downloaded_path or not os.path.exists(archive_path):
+            await safe_edit(status_msg, "❌ Gagal memuat turun arkib.")
+            return
+
+        # Check for cancellation after download
+        if is_cancelled(user_id):
+            await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+            return
+
+        # Count media files in archive
+        await safe_edit(status_msg, "📂 Mengimbas fail media dalam arkib...")
+
+        loop = asyncio.get_running_loop()
+        total_files = await loop.run_in_executor(
+            None, count_media_in_archive, archive_path, False
+        )
+
+        if total_files == 0:
+            await safe_edit(status_msg, "❌ Tiada fail media (foto/video) dijumpai dalam arkib.")
+            return
+
+        await safe_edit(status_msg, f"📤 Memuat naik {total_files} fail media ke Telegram...")
+
+        # Extract and upload each media file
+        uploaded = []  # List of (backup_msg_id, kind, name, size)
+        idx = 0
+
+        async for mf in iter_extract_media(archive_path, extract_dir, False):
+            idx += 1
+
+            if is_cancelled(user_id):
+                await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+                return
+
+            file_path = mf["path"]
+            name = mf["name"]
+            size = mf["size"]
+            kind = mf["kind"]
+
+            # Skip files > 2GB
+            if size > MAX_FILE_SIZE:
+                print(f"[Archive] Skipping {name}: {size} bytes exceeds limit")
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+                continue
+
+            await safe_edit(status_msg, f"⬆️ Memuat naik {idx}/{total_files}: {name}...")
+
+            try:
+                # Create FileStreamer for the extracted file
+                streamer = FileStreamer(file_path, name)
+                input_file = await upload_stream(bot, streamer, name)
+
+                # Determine media type and upload to backup group
+                if kind == "photo":
+                    media = InputMediaUploadedPhoto(file=input_file)
+                elif kind == "video":
+                    # Get video metadata if possible
+                    video_attrs = [
+                        DocumentAttributeVideo(
+                            duration=0,
+                            w=0,
+                            h=0,
+                            supports_streaming=True,
+                        ),
+                        DocumentAttributeFilename(file_name=name),
+                    ]
+                    media = InputMediaUploadedDocument(
+                        file=input_file,
+                        mime_type=mime(name),
+                        attributes=video_attrs,
+                    )
+                else:
+                    # Document
+                    media = InputMediaUploadedDocument(
+                        file=input_file,
+                        mime_type=mime(name),
+                        attributes=[DocumentAttributeFilename(file_name=name)],
+                    )
+
+                # Send to backup group with retry logic
+                result = None
+                for attempt in range(3):
+                    try:
+                        result = await bot.invoke(
+                            SendMedia(
+                                peer=backup_peer,
+                                media=media,
+                                message="",
+                                random_id=random.randint(0, 2**63 - 1),
+                            )
+                        )
+                        break
+                    except FloodWait as fw:
+                        wait = getattr(fw, "value", getattr(fw, "x", 10))
+                        if wait > 120:
+                            print(f"FloodWait {wait}s too long, skipping file")
+                            break
+                        print(f"FloodWait {wait}s on archive upload (attempt {attempt+1}/3)")
+                        await asyncio.sleep(wait + 1)
+
+                if result:
+                    # Extract message ID from result
+                    backup_msg_id = None
+                    for upd in getattr(result, "updates", []):
+                        if isinstance(upd, (UpdateNewMessage, UpdateNewChannelMessage)):
+                            backup_msg_id = upd.message.id
+                            break
+
+                    if backup_msg_id:
+                        uploaded.append((backup_msg_id, kind, name, size))
+
+                        # Log to database
+                        channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
+                        link = f"https://t.me/c/{channel_id}/{backup_msg_id}"
+                        await log_forward(
+                            message.from_user.username, backup_msg_id, size,
+                            f"Archive/{file_name}/{name}", link
+                        )
+
+            except Exception as e:
+                print(f"[Archive] Error uploading {name}: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                # Clean up extracted file immediately
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+
+            gc.collect()
+
+        if not uploaded:
+            await safe_edit(status_msg, "❌ Gagal memuat naik fail media dari arkib.")
+            return
+
+        # Group files by type for album sending
+        photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
+        videos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
+        others = [(mid, k, n, s) for mid, k, n, s in uploaded if k not in ("photo", "video")]
+
+        await safe_edit(status_msg, "⬆️ Menghantar ke anda...")
+
+        # Helper to send as album chunks
+        async def send_album_chunk(items, media_type):
+            CHUNK = 8  # Telegram max 10 per album, use 8 for safety
+
+            for i in range(0, len(items), CHUNK):
+                chunk = items[i:i+CHUNK]
+
+                # Fetch messages from backup group
+                try:
+                    msg_ids = [item[0] for item in chunk]
+                    backup_msgs = await bot.get_messages(BACKUP_GROUP_ID, msg_ids)
+
+                    if len(backup_msgs) == 1:
+                        # Single file - use copy_message
+                        for attempt in range(3):
+                            try:
+                                await bot.copy_message(
+                                    chat_id=user_id,
+                                    from_chat_id=BACKUP_GROUP_ID,
+                                    message_id=backup_msgs[0].id
+                                )
+                                break
+                            except FloodWait as fw:
+                                wait = getattr(fw, "value", getattr(fw, "x", 10))
+                                if wait > 60:
+                                    break
+                                await asyncio.sleep(wait + 1)
+                    else:
+                        # Multiple files - build album
+                        media_list = []
+                        for msg in backup_msgs:
+                            if msg.photo:
+                                media_list.append(InputMediaPhoto(msg.photo.file_id))
+                            elif msg.video:
+                                media_list.append(InputMediaVideo(msg.video.file_id))
+                            elif msg.document:
+                                # For documents, use copy_message individually
+                                pass
+
+                        if media_list:
+                            for attempt in range(3):
+                                try:
+                                    await bot.send_media_group(chat_id=user_id, media=media_list)
+                                    break
+                                except FloodWait as fw:
+                                    wait = getattr(fw, "value", getattr(fw, "x", 10))
+                                    if wait > 60:
+                                        break
+                                    await asyncio.sleep(wait + 1)
+                except Exception as e:
+                    print(f"[Archive] Error sending album: {e}")
+
+        # Send photos as album(s)
+        if photos:
+            await send_album_chunk(photos, "photo")
+
+        # Send videos as album(s)
+        if videos:
+            await send_album_chunk(videos, "video")
+
+        # Send other files individually
+        for mid, kind, name, size in others:
+            try:
+                for attempt in range(3):
+                    try:
+                        await bot.copy_message(
+                            chat_id=user_id,
+                            from_chat_id=BACKUP_GROUP_ID,
+                            message_id=mid
+                        )
+                        break
+                    except FloodWait as fw:
+                        wait = getattr(fw, "value", getattr(fw, "x", 10))
+                        if wait > 60:
+                            break
+                        await asyncio.sleep(wait + 1)
+            except Exception as e:
+                print(f"[Archive] Error sending {name}: {e}")
+
+        total_size = sum(s for _, _, _, s in uploaded)
+        await safe_edit(
+            status_msg,
+            f"✅ **Selesai!**\n\n"
+            f"📂 Arkib: `{file_name}`\n"
+            f"📁 Fail: {len(uploaded)} media\n"
+            f"📦 Jumlah: {format_file_size(total_size)}"
+        )
+
+    except Exception as e:
+        print(f"[Archive] Error processing archive: {e}")
+        import traceback
+        traceback.print_exc()
+        await safe_edit(status_msg, f"❌ Gagal memproses arkib: {e}")
+
+    finally:
+        # Clean up temp directory
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+        gc.collect()
+
+
 @app.on_message(filters.regex(LINK_PATTERN) & filters.private)
 async def link_handler(client: Client, message: Message):
     user_id = message.from_user.id
@@ -634,6 +931,29 @@ async def link_handler(client: Client, message: Message):
 
         # Get source chat name
         source_name = target_msg.chat.title if target_msg.chat and target_msg.chat.title else "Unknown"
+
+        # Check if target is an archive file - extract and send media
+        if target_msg.document:
+            doc = target_msg.document
+            doc_name = getattr(doc, "file_name", "") or ""
+            if is_archive(doc_name):
+                # Get backup group peer
+                backup_peer = await get_backup_group_peer(client)
+                if not backup_peer:
+                    await safe_edit(status_msg, "❌ Backup group tidak dijumpai.")
+                    return
+
+                await _process_archive_from_message(
+                    bot=client,
+                    user_client=user_client,
+                    target_msg=target_msg,
+                    message=message,
+                    status_msg=status_msg,
+                    user_id=user_id,
+                    source_name=source_name,
+                    backup_peer=backup_peer,
+                )
+                return
 
         # Check if this message is part of a media group (album)
         messages_to_process = []
