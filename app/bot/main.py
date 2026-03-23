@@ -527,10 +527,13 @@ async def _process_archive_from_message(
     user_id: int,
     source_name: str,
     backup_peer,
+    skip_non_videos: bool = False,
 ):
     """
     Handle archive files (.zip/.rar) from forwarded messages.
     Downloads the archive, extracts media files, uploads them, and sends to user.
+
+    If skip_non_videos is True, only videos will be extracted (photos skipped).
     """
     from pyrogram.types import InputMediaPhoto, InputMediaVideo
 
@@ -565,24 +568,28 @@ async def _process_archive_from_message(
             return
 
         # Count media files in archive
-        await safe_edit(status_msg, "📂 Mengimbas fail media dalam arkib...")
+        media_type_msg = "video" if skip_non_videos else "media"
+        await safe_edit(status_msg, f"📂 Mengimbas fail {media_type_msg} dalam arkib...")
 
         loop = asyncio.get_running_loop()
         total_files = await loop.run_in_executor(
-            None, count_media_in_archive, archive_path, False
+            None, count_media_in_archive, archive_path, skip_non_videos
         )
 
         if total_files == 0:
-            await safe_edit(status_msg, "❌ Tiada fail media (foto/video) dijumpai dalam arkib.")
+            if skip_non_videos:
+                await safe_edit(status_msg, "❌ Tiada fail video dijumpai dalam arkib.")
+            else:
+                await safe_edit(status_msg, "❌ Tiada fail media (foto/video) dijumpai dalam arkib.")
             return
 
-        await safe_edit(status_msg, f"📤 Memuat naik {total_files} fail media ke Telegram...")
+        await safe_edit(status_msg, f"📤 Memuat naik {total_files} fail {media_type_msg} ke Telegram...")
 
         # Extract and upload each media file
         uploaded = []  # List of (backup_msg_id, kind, name, size)
         idx = 0
 
-        async for mf in iter_extract_media(archive_path, extract_dir, False):
+        async for mf in iter_extract_media(archive_path, extract_dir, skip_non_videos):
             idx += 1
 
             if is_cancelled(user_id):
@@ -937,6 +944,9 @@ async def link_handler(client: Client, message: Message):
             doc = target_msg.document
             doc_name = getattr(doc, "file_name", "") or ""
             if is_archive(doc_name):
+                # Check if user wants to skip photos (only videos)
+                skip_non_videos = "/skip" in message.text.lower()
+
                 # Get backup group peer
                 backup_peer = await get_backup_group_peer(client)
                 if not backup_peer:
@@ -952,6 +962,7 @@ async def link_handler(client: Client, message: Message):
                     user_id=user_id,
                     source_name=source_name,
                     backup_peer=backup_peer,
+                    skip_non_videos=skip_non_videos,
                 )
                 return
 
