@@ -27,7 +27,8 @@ _USER_AGENT = (
 _TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 # Timeout for streaming downloads (generous — large files)
-_STREAM_TIMEOUT = aiohttp.ClientTimeout(total=0, sock_connect=30, sock_read=120)
+# sock_read increased to handle slower proxy connections without timeout
+_STREAM_TIMEOUT = aiohttp.ClientTimeout(total=0, sock_connect=60, sock_read=300)
 
 
 # ---------------------------------------------------------------------------
@@ -51,16 +52,27 @@ class DirectLinkClient:
             if proxy_url:
                 try:
                     from aiohttp_socks import ProxyConnector
-                    connector = ProxyConnector.from_url(proxy_url, limit_per_host=5)
+                    connector = ProxyConnector.from_url(
+                        proxy_url,
+                        limit_per_host=10,  # Increased from 5 for better throughput
+                        limit=100,  # Total connection limit
+                    )
                 except ImportError:
                     print("[DirectLink] 'aiohttp_socks' not installed. Ignoring SOCKS5 proxy.")
-                    connector = aiohttp.TCPConnector(limit_per_host=5)
+                    connector = aiohttp.TCPConnector(
+                        limit_per_host=10,
+                        limit=100,
+                    )
             else:
-                connector = aiohttp.TCPConnector(limit_per_host=5)
-            
+                connector = aiohttp.TCPConnector(
+                    limit_per_host=10,
+                    limit=100,
+                )
+
             self._session = aiohttp.ClientSession(
                 headers={"User-Agent": _USER_AGENT},
                 connector=connector,
+                read_bufsize=2 * 1024 * 1024,  # 2MB read buffer for better throughput
             )
         return self._session
 

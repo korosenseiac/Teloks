@@ -256,33 +256,82 @@ async def _download_video_to_temp(
     Fires on_download_chunk(n) after each chunk so the progress tracker updates
     during the actual network download.
     Returns path to the temp file.
+
+    Uses producer-consumer pattern to avoid TCP buffer drain:
+    - Producer: Downloads chunks into a queue (non-blocking)
+    - Consumer: Writes chunks from queue to disk (parallel)
     """
     temp_file = os.path.join(
         tempfile.gettempdir(),
         f"direct_link_{random.randint(100000, 999999)}_{file_name}"
     )
     loop = asyncio.get_running_loop()
-    
+
+    # Buffer queue: allows download to continue while disk I/O happens
+    # 32 chunks * 1MB = 32MB max buffer - prevents TCP buffer drain
+    write_queue: asyncio.Queue = asyncio.Queue(maxsize=32)
+    write_error: dict = {"error": None}
+    write_done = asyncio.Event()
+
+    async def _disk_writer():
+        """Consumer: writes chunks to disk from the queue."""
+        try:
+            while True:
+                item = await write_queue.get()
+                if item is None:  # Sentinel for EOF
+                    break
+                chunk, chunk_offset = item
+                await loop.run_in_executor(None, _append_bytes, temp_file, chunk)
+                write_queue.task_done()
+        except Exception as e:
+            write_error["error"] = e
+        finally:
+            write_done.set()
+
     retries = 3
     offset = 0
 
     while retries > 0:
+        # Start the disk writer task
+        writer_task = asyncio.create_task(_disk_writer())
+
         try:
             async for chunk in client.download_stream(url, start_offset=offset):
-                # Write chunk to file via executor to avoid blocking the event loop
-                await loop.run_in_executor(None, _append_bytes, temp_file, chunk)
+                # Check if writer encountered an error
+                if write_error["error"]:
+                    raise write_error["error"]
+
+                # Put chunk in queue (will block if queue is full, providing back-pressure)
+                await write_queue.put((chunk, offset))
                 offset += len(chunk)
                 if on_download_chunk:
                     on_download_chunk(len(chunk))
-            
+
+            # Signal EOF to writer and wait for it to finish
+            await write_queue.put(None)
+            await writer_task
+
+            # Check for write errors
+            if write_error["error"]:
+                raise write_error["error"]
+
             # Successfully downloaded
             break
-            
+
         except Exception as e:
+            # Cancel writer task on error
+            if not writer_task.done():
+                await write_queue.put(None)
+                try:
+                    await asyncio.wait_for(writer_task, timeout=5)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    writer_task.cancel()
+
             import aiohttp
             if isinstance(e, (aiohttp.ClientError, ValueError)):
-                print(f"[DirectLink] Temp video download dropped (offset {offset}): {e}. Retries config left: {retries - 1}")
+                print(f"[DirectLink] Temp video download dropped (offset {offset}): {e}. Retries left: {retries - 1}")
                 retries -= 1
+                write_error["error"] = None  # Reset error for retry
                 if retries > 0:
                     await asyncio.sleep(2)
                     continue
@@ -700,19 +749,63 @@ async def _download_archive_to_temp(
     """
     Stream-download the archive from Direct Link into *dest_dir*.
     Returns the path to the downloaded archive file.
+
+    Uses producer-consumer pattern to avoid TCP buffer drain:
+    - Producer: Downloads chunks into a queue (non-blocking)
+    - Consumer: Writes chunks from queue to disk (parallel)
     """
     archive_path = os.path.join(dest_dir, filename)
-    downloaded = 0
+    loop = asyncio.get_running_loop()
 
-    async for chunk in direct_client.download_stream(url):
-        # Write chunk to file (run in executor to avoid blocking)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, _append_bytes, archive_path, chunk
-        )
-        downloaded += len(chunk)
-        if tracker:
-            tracker.add_downloaded(len(chunk))
+    # Buffer queue: allows download to continue while disk I/O happens
+    # 32 chunks * 1MB = 32MB max buffer - prevents TCP buffer drain
+    write_queue: asyncio.Queue = asyncio.Queue(maxsize=32)
+    write_error: dict = {"error": None}
+
+    async def _disk_writer():
+        """Consumer: writes chunks to disk from the queue."""
+        try:
+            while True:
+                item = await write_queue.get()
+                if item is None:  # Sentinel for EOF
+                    break
+                chunk = item
+                await loop.run_in_executor(None, _append_bytes, archive_path, chunk)
+                write_queue.task_done()
+        except Exception as e:
+            write_error["error"] = e
+
+    # Start the disk writer task
+    writer_task = asyncio.create_task(_disk_writer())
+
+    try:
+        async for chunk in direct_client.download_stream(url):
+            # Check if writer encountered an error
+            if write_error["error"]:
+                raise write_error["error"]
+
+            # Put chunk in queue (will block if queue is full, providing back-pressure)
+            await write_queue.put(chunk)
+            if tracker:
+                tracker.add_downloaded(len(chunk))
+
+        # Signal EOF to writer and wait for it to finish
+        await write_queue.put(None)
+        await writer_task
+
+        # Check for write errors
+        if write_error["error"]:
+            raise write_error["error"]
+
+    except Exception as e:
+        # Cancel writer task on error
+        if not writer_task.done():
+            await write_queue.put(None)
+            try:
+                await asyncio.wait_for(writer_task, timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                writer_task.cancel()
+        raise e
 
     return archive_path
 
