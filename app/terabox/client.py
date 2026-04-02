@@ -271,27 +271,43 @@ class TeraBoxClient:
         Mirrors TeraBoxApp#checkLogin (lines 696–729 of api.js).
         Returns True if logged in, False otherwise.
         """
-        url = f"{self.domain}/api/check/login"
-        print(f"[TB] check_login → GET {url}")
-        try:
-            async with self._session_for() as session:
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    allow_redirects=False,
-                ) as resp:
-                    # 302 may carry region-domain-prefix header
-                    new_prefix = resp.headers.get("x-redirect-domain", "")
-                    if new_prefix:
-                        self.domain = f"https://{new_prefix}.terabox.com"
-                        print(f"[TB] check_login → domain redirected to {self.domain}")
-                    data = await resp.json(content_type=None)
-                    print(f"[TB] check_login ← HTTP {resp.status} | {data}")
-                    errno = data.get("errno", -1)
-                    return errno == 0
-        except Exception as e:
-            print(f"[TB] check_login error: {e}")
-            return False
+        candidates: List[str] = []
+        for d in (self.domain, "https://dm.terabox.com", "https://www.terabox.com"):
+            if d and d not in candidates:
+                candidates.append(d)
+
+        for idx, domain in enumerate(candidates):
+            self.domain = domain
+            url = f"{self.domain}/api/check/login"
+            print(f"[TB] check_login → GET {url}")
+
+            # For fallback domains, refresh tokens first so subsequent account
+            # APIs (create_dir/share_transfer/filemanager) use the right domain.
+            if idx > 0:
+                await self.update_app_data()
+
+            try:
+                async with self._session_for() as session:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                        allow_redirects=False,
+                    ) as resp:
+                        # 302 may carry region-domain-prefix header
+                        new_prefix = resp.headers.get("x-redirect-domain", "")
+                        if new_prefix:
+                            self.domain = f"https://{new_prefix}.terabox.com"
+                            print(f"[TB] check_login → domain redirected to {self.domain}")
+                        data = await resp.json(content_type=None)
+                        print(f"[TB] check_login ← HTTP {resp.status} | {data}")
+                        errno = data.get("errno", -1)
+                        if errno == 0:
+                            return True
+                        print(f"[TB] check_login: errno={errno} on {domain}, trying next domain")
+            except Exception as e:
+                print(f"[TB] check_login error on {domain}: {e}")
+
+        return False
 
     # -------------------------------------------------------- short_url_info
 
@@ -1070,18 +1086,6 @@ class TeraBoxClient:
         Create a directory in your TeraBox account.
         Mirrors TeraBoxApp#createDir (lines 1698–1729 of api.js).
         """
-        params = urllib.parse.urlencode(
-            {
-                "a": "commit",
-                "app_id": "250528",
-                "web": "1",
-                "channel": "dubox",
-                "clienttype": "0",
-                "jsToken": self.js_token,
-                "bdstoken": self.bds_token,
-            }
-        )
-        url = f"{self.domain}/api/create?{params}"
         body = urllib.parse.urlencode(
             {
                 "path": remote_dir,
@@ -1089,21 +1093,45 @@ class TeraBoxClient:
                 "block_list": "[]",
             }
         )
-        print(f"[TB] create_dir → POST {url}  (path={remote_dir})")
-        try:
-            async with self._session_for() as session:
-                async with session.post(
-                    url,
-                    data=body,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as resp:
-                    data = await resp.json(content_type=None)
-                    print(f"[TB] create_dir ← HTTP {resp.status} | {data}")
-                    return data
-        except Exception as e:
-            print(f"[TB] create_dir error: {e}")
-            return None
+
+        for attempt in range(2):
+            if not self.js_token or not self.bds_token or attempt > 0:
+                await self.update_app_data()
+
+            params = urllib.parse.urlencode(
+                {
+                    "a": "commit",
+                    "app_id": "250528",
+                    "web": "1",
+                    "channel": "dubox",
+                    "clienttype": "0",
+                    "jsToken": self.js_token,
+                    "bdstoken": self.bds_token,
+                }
+            )
+            url = f"{self.domain}/api/create?{params}"
+            print(f"[TB] create_dir → POST {url}  (path={remote_dir})")
+            try:
+                async with self._session_for() as session:
+                    async with session.post(
+                        url,
+                        data=body,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                        print(f"[TB] create_dir ← HTTP {resp.status} | {data}")
+                        if data.get("errno") == -6 and attempt == 0:
+                            print("[TB] create_dir: errno=-6, re-checking login/domain and retrying once")
+                            await self.check_login()
+                            continue
+                        return data
+            except Exception as e:
+                print(f"[TB] create_dir error (attempt={attempt+1}): {e}")
+                if attempt == 1:
+                    return None
+
+        return None
 
     # -------------------------------------------------------------- get_remote_dir
 
