@@ -689,12 +689,16 @@ async def _deliver_to_user_multi(
             return True
         return False
 
-    media_items = [(mid, k, n, s) for mid, k, n, s in uploaded if k in ("photo", "video")]
+    photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
+    videos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
     others = [(mid, k, n, s) for mid, k, n, s in uploaded
               if k not in ("photo", "video")]
 
-    # Send: all media (photos and videos) together
-    await _send_album_to_user(bot, user_id, media_items, delivered_mids)
+    # Send: photos album first
+    await _send_album_to_user(bot, user_id, photos, delivered_mids)
+
+    # Send: videos album next
+    await _send_album_to_user(bot, user_id, videos, delivered_mids)
 
     # Send: anything else individually
     for mid, k, n, s in others:

@@ -2,10 +2,9 @@ import re
 import random
 import math
 from io import BytesIO
-from pyrogram import Client, filters, ContinueHandling
-from pyrogram.errors import FloodWait, UserNotParticipant
-from pyrogram.enums import ChatMemberStatus
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges, CallbackQuery
+from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
 from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
@@ -114,45 +113,6 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
-
-async def check_membership(client: Client, user_id: int) -> bool:
-    try:
-        member = await client.get_chat_member(BACKUP_GROUP_ID, user_id)
-        if member.status in [ChatMemberStatus.BANNED, ChatMemberStatus.LEFT]:
-            return False
-        return True
-    except UserNotParticipant:
-        return False
-    except Exception:
-        # Prevent blocking if bot is not admin or chat doesn't exist
-        return True
-
-@app.on_message(filters.private, group=-1)
-async def check_membership_message(client: Client, message: Message):
-    if not message.from_user:
-        raise ContinueHandling()
-        
-    text = message.text or ""
-    if text.startswith("/start") or text.startswith("/login"):
-        raise ContinueHandling()
-        
-    if not await check_membership(client, message.from_user.id):
-        await message.reply_text(
-            "⚠️ **Akses Ditolak**\n\nSila join channel/group utama kami terlebih dahulu untuk menggunakan bot ini.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join Channel", url="https://t.me/telokschannel")]])
-        )
-        message.stop_propagation()
-    raise ContinueHandling()
-
-@app.on_callback_query(group=-1)
-async def check_membership_callback(client: Client, callback_query: CallbackQuery):
-    if not callback_query.from_user:
-        raise ContinueHandling()
-        
-    if not await check_membership(client, callback_query.from_user.id):
-        await callback_query.answer("⚠️ Sila join channel/group utama kami terlebih dahulu!", show_alert=True)
-        callback_query.stop_propagation()
-    raise ContinueHandling()
 
 # Cache for backup group peer
 backup_group_peer = None
