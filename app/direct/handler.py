@@ -528,6 +528,9 @@ async def _safe_send(coro_factory, retries: int = 3):
             return await coro_factory()
         except FloodWait as fw:
             wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 10)
+            if wait > 300:
+                print(f"[DirectLink] FloodWait {wait}s too long, skipping...")
+                return None
             print(f"[DirectLink] FloodWait {wait}s (attempt {attempt}/{retries})")
             await asyncio.sleep(wait + 1)
         except Exception as e:
@@ -565,18 +568,21 @@ async def _send_album_to_user(
         if r:
             delivered_mids.add(mid)
             return True
-        return False
-
-    for i in range(0, len(items), CHUNK):
-        chunk = items[i : i + CHUNK]
-        chunk_mids = [mid for mid, *_ in chunk]
-
-        actual_group_id = await get_backup_group_actual_id()
-        backup_msgs = await _safe_send(
-            lambda _ids=chunk_mids: bot.get_messages(actual_group_id, _ids)
-        )
-        if backup_msgs is None:
-            for mid, kind, name, size in chunk:
+                
+            from app.bot.session_manager import manager
+            uc = await manager.get_client(user_id)
+            if uc:
+                try:
+                    me = await bot.get_me()
+                    await uc.forward_messages(
+                        chat_id=me.username,
+                        from_chat_id=actual_from_id,
+                        message_ids=mid
+                    )
+                    delivered_mids.add(mid)
+                    return True
+                except Exception as e:
+                    print(f"[Fallback] user_client failed: {e}")
                 await _send_single(mid)
                 await asyncio.sleep(0.5)
             continue
@@ -620,11 +626,26 @@ async def _send_album_to_user(
                     for vm in valid_mids[:actual]:
                         delivered_mids.add(vm)
             else:
-                print("[DirectLink] Album send failed, falling back to individual sends")
-                for mid in valid_mids:
-                    await _send_single(mid)
-                    await asyncio.sleep(0.5)
-
+                  fallback_album = False
+                  try:
+                      from app.bot.session_manager import manager
+                      from app.bot.main import get_backup_group_actual_id
+                      uc = await manager.get_client(user_id)
+                      if uc:
+                          actual_from_id = await get_backup_group_actual_id()
+                          me = await bot.get_me() if "bot" in locals() else await client.get_me()
+                          await uc.forward_messages(me.username, actual_from_id, valid_mids)
+                          fallback_album = True
+                          for vm in valid_mids:
+                              delivered_mids.add(vm)
+                  except Exception as e:
+                      pass
+                      
+                  if not fallback_album:
+                      print("[DirectLink] Album send failed, falling back to individual sends")
+                      for mid in valid_mids:
+                          await _send_single(mid)
+                          await asyncio.sleep(0.5)
         await asyncio.sleep(1.5)
 
 

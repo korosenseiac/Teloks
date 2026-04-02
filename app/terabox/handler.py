@@ -833,6 +833,9 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                     return await coro_factory()
                 except FloodWait as fw:
                     wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 10)
+                    if wait > 300:
+                        print(f"[TeraBox] FloodWait {wait}s too long, skipping...")
+                        return None
                     print(f"[TeraBox] FloodWait {wait}s (attempt {attempt}/{retries})")
                     await asyncio.sleep(wait + 1)
                 except Exception as e:
@@ -858,6 +861,21 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             if r:
                 delivered_mids.add(mid)
                 return True
+                
+            from app.bot.session_manager import manager
+            uc = await manager.get_client(user_id)
+            if uc:
+                try:
+                    me = await bot.get_me()
+                    await uc.forward_messages(
+                        chat_id=me.username,
+                        from_chat_id=actual_from_id,
+                        message_ids=mid
+                    )
+                    delivered_mids.add(mid)
+                    return True
+                except Exception as e:
+                    print(f"[Fallback] user_client failed: {e}")
             return False
 
         # ---------- Helper: send album chunk to user -------------------------
@@ -936,12 +954,26 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                             for vm in valid_mids[:actual]:
                                 delivered_mids.add(vm)
                     else:
-                        # Album failed — fallback: send each individually
-                        print(f"[TeraBox] Album send failed, falling back to individual sends")
-                        for mid in valid_mids:
-                            await _send_single(mid)
-                            await asyncio.sleep(0.5)
-
+                          fallback_album = False
+                          try:
+                              from app.bot.session_manager import manager
+                              uc = await manager.get_client(user_id)
+                              if uc:
+                                  actual_from_id = await get_backup_group_actual_id()
+                                  me = await bot.get_me() if "bot" in locals() else await client.get_me()
+                                  await uc.forward_messages(me.username, actual_from_id, valid_mids)
+                                  fallback_album = True
+                                  for vm in valid_mids:
+                                      delivered_mids.add(vm)
+                          except Exception as e:
+                              pass
+                              
+                          if not fallback_album:
+                              # Album failed — fallback: send each individually
+                              print(f"[TeraBox] Album send failed, falling back to individual sends")
+                              for mid in valid_mids:
+                                  await _send_single(mid)
+                                  await asyncio.sleep(0.5)
                 # Delay between chunks to avoid FloodWait
                 await asyncio.sleep(1.5)
 
