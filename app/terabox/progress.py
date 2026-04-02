@@ -177,4 +177,5 @@ class ProgressTracker:
         if final_text:
             try:
                 await safe_edit(self.status_msg, final_text)
-            except:
+            except Exception:
+                pass
