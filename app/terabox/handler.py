@@ -678,28 +678,28 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
 
             from app.terabox.progress import _human_bytes, _human_speed, _bar, _eta
 
-        async def _photo_updater_loop():
-            # Milestone-based reporting for photos
-            _last_pct = -1
-            while not _photo_stopped["v"]:
-                await asyncio.sleep(10) # Heavy reduction
-                if _photo_stopped["v"]:
-                    break
-                try:
-                    done = _photo_state["done"]
-                    total = _photo_state["total"]
-                    pct = int((done / total * 100) / 25) * 25 if total else 0
-                    if pct > _last_pct:
-                        _last_pct = pct
-                        text = (
-                            f"\U0001f5bc\ufe0f **Proses Foto: {done}/{total}**\n"
-                            f"\U0001f4ca Progress: {pct}%"
-                        )
-                        await safe_edit(status_msg, text)
-                except Exception:
-                    pass
+            async def _photo_updater_loop():
+                # Milestone-based reporting for photos
+                _last_pct = -1
+                while not _photo_stopped["v"]:
+                    await asyncio.sleep(10) # Heavy reduction
+                    if _photo_stopped["v"]:
+                        break
+                    try:
+                        done = _photo_state["done"]
+                        total = _photo_state["total"]
+                        pct = int((done / total * 100) / 25) * 25 if total else 0
+                        if pct > _last_pct:
+                            _last_pct = pct
+                            text = (
+                                f"\U0001f5bc\ufe0f **Proses Foto: {done}/{total}**\n"
+                                f"\U0001f4ca Progress: {pct}%"
+                            )
+                            await safe_edit(status_msg, text)
+                    except Exception:
+                        pass
 
-        _photo_updater_task = asyncio.create_task(_photo_updater_loop())
+            _photo_updater_task = asyncio.create_task(_photo_updater_loop())
 
             async def _upload_one_photo(_pe):
                 async with _photo_sem:
