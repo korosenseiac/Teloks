@@ -68,10 +68,20 @@ def _eta(remaining_bytes: float, speed: float) -> str:
 
 class ProgressTracker:
     """
-    Milestone-based progress tracker.
-    Updates are sent only at major percentage changes (0%, 25%, 50%, 75%, 100%)
-    to avoid triggering Telegram FloodWait.
+    Shared mutable state that the streamer/uploader write into,
+    and a background task reads from to update the Telegram message.
+
+    Usage
+    -----
+    >>> tracker = ProgressTracker(status_msg, file_name, file_size)
+    >>> tracker.start()                       # spawns updater task
+    >>> ...                                   # worker code calls
+    >>> tracker.add_downloaded(len(chunk))     #   download side
+    >>> tracker.add_uploaded(len(part))        #   upload side
+    >>> await tracker.stop()                  # cancel updater & final edit
     """
+
+    EDIT_INTERVAL: float = 4.5  # seconds between message edits (avoid flood)
 
     def __init__(
         self,
@@ -87,93 +97,134 @@ class ProgressTracker:
         self.file_index = file_index
         self.file_total = file_total
 
+        # Counters (written by workers from any coroutine — single-threaded asyncio is safe)
         self.downloaded: int = 0
         self.uploaded: int = 0
 
+        # Speed tracking
         self._start_time: float = 0.0
         self._dl_samples: list[tuple[float, int]] = []
         self._ul_samples: list[tuple[float, int]] = []
 
-        # Tracks last reported percentage milestones
-        self._last_dl_milestone = -1
-        self._last_ul_milestone = -1
+        self._task: Optional[asyncio.Task] = None
         self._stopped = False
 
     # ------------------------------------------------------------------ API
 
     def add_downloaded(self, n: int) -> None:
-        if self._stopped: return
         now = time.monotonic()
         self.downloaded += n
         self._dl_samples.append((now, self.downloaded))
-        if len(self._dl_samples) > 20:
-            self._dl_samples = self._dl_samples[-20:]
-        
-        # Check for milestone (every 25%)
-        pct = int((self.downloaded / self.file_size * 100) / 25) * 25 if self.file_size else 0
-        if pct > self._last_dl_milestone:
-            self._last_dl_milestone = pct
-            asyncio.create_task(self._trigger_update())
+        # Keep last 30 samples for a rolling average
+        if len(self._dl_samples) > 30:
+            self._dl_samples = self._dl_samples[-30:]
 
     def add_uploaded(self, n: int) -> None:
-        if self._stopped: return
         now = time.monotonic()
         self.uploaded += n
         self._ul_samples.append((now, self.uploaded))
-        if len(self._ul_samples) > 20:
-            self._ul_samples = self._ul_samples[-20:]
+        if len(self._ul_samples) > 30:
+            self._ul_samples = self._ul_samples[-30:]
 
-        pct = int((self.uploaded / self.file_size * 100) / 25) * 25 if self.file_size else 0
-        if pct > self._last_ul_milestone:
-            self._last_ul_milestone = pct
-            asyncio.create_task(self._trigger_update())
+    # ---------------------------------------------------------------- Speed
+
+    @staticmethod
+    def _rolling_speed(samples: list[tuple[float, int]], window: float = 8.0) -> float:
+        """Compute rolling average speed (bytes/sec) over last *window* seconds."""
+        if len(samples) < 2:
+            return 0.0
+        now = samples[-1][0]
+        cutoff = now - window
+        # Find the first sample within the window
+        for i, (t, _) in enumerate(samples):
+            if t >= cutoff:
+                t0, b0 = samples[i][0], samples[i][1]
+                t1, b1 = samples[-1][0], samples[-1][1]
+                dt = t1 - t0
+                if dt <= 0:
+                    return 0.0
+                return (b1 - b0) / dt
+        return 0.0
 
     # ------------------------------------------------------------ Rendering
 
-    async def _trigger_update(self) -> None:
-        """Helper to fire-and-forget an edit to the status message."""
-        try:
-            text = self._render()
-            await safe_edit(self.status_msg, text)
-        except:
-            pass
-
-    @staticmethod
-    def _rolling_speed(samples: list[tuple[float, int]], window: float = 10.0) -> float:
-        if len(samples) < 2: return 0.0
-        t0, b0 = samples[0]
-        t1, b1 = samples[-1]
-        dt = t1 - t0
-        return (b1 - b0) / dt if dt > 0 else 0.0
-
     def _render(self) -> str:
+        """Build the cute progress message text."""
         dl_frac = self.downloaded / self.file_size if self.file_size else 0
         ul_frac = self.uploaded / self.file_size if self.file_size else 0
-        
+
+        dl_speed = self._rolling_speed(self._dl_samples)
+        ul_speed = self._rolling_speed(self._ul_samples)
+
+        dl_remaining = max(0, self.file_size - self.downloaded)
+        ul_remaining = max(0, self.file_size - self.uploaded)
+
+        # Truncate long file names
         display_name = self.file_name
         if len(display_name) > 30:
             display_name = display_name[:27] + "…"
 
+        # Pick a cute icon based on progress
+        if ul_frac >= 1.0:
+            phase_icon = "✅"
+        elif ul_frac > 0.6:
+            phase_icon = "🚀"
+        elif ul_frac > 0.3:
+            phase_icon = "⚡"
+        elif dl_frac > 0:
+            phase_icon = "📡"
+        else:
+            phase_icon = "🌐"
+
         lines = [
-            f"**Fail {self.file_index}/{self.file_total}**",
+            f"{phase_icon} **Fail {self.file_index}/{self.file_total}**",
             f"📄 `{display_name}`",
             f"📦 {_human_bytes(self.file_size)}",
             "",
-            f"⬇️ Muat Turun: {int(dl_frac*100)}%",
-            f"⬆️ Muat Naik: {int(ul_frac*100)}%",
+            f"⬇️ Muat Turun  {_bar(dl_frac)}  {dl_frac*100:.0f}%",
+            f"    {_human_bytes(self.downloaded)} • {_human_speed(dl_speed)} • ETA {_eta(dl_remaining, dl_speed)}",
+            "",
+            f"⬆️ Muat Naik   {_bar(ul_frac)}  {ul_frac*100:.0f}%",
+            f"    {_human_bytes(self.uploaded)} • {_human_speed(ul_speed)} • ETA {_eta(ul_remaining, ul_speed)}",
         ]
+
+        elapsed = time.monotonic() - self._start_time
+        if elapsed >= 1:
+            mins, secs = divmod(int(elapsed), 60)
+            lines.append("")
+            lines.append(f"⏱ Masa: {mins}m {secs}s")
+
         return "\n".join(lines)
 
-    # ------------------------------------------------------------- Control
+    # -------------------------------------------------------- Background task
 
     def start(self) -> None:
-        """Initialize start time."""
+        """Spawn the background message-updater."""
         self._start_time = time.monotonic()
         self._stopped = False
+        self._task = asyncio.create_task(self._updater_loop())
+
+    async def _updater_loop(self) -> None:
+        """Periodically edit the status message."""
+        while not self._stopped:
+            await asyncio.sleep(self.EDIT_INTERVAL)
+            if self._stopped:
+                break
+            try:
+                text = self._render()
+                await safe_edit(self.status_msg, text)
+            except Exception:
+                pass  # FloodWait, message deleted, etc.
 
     async def stop(self, final_text: str | None = None) -> None:
-        """Stop tracking and optionally send final text."""
+        """Cancel the updater and optionally edit one last time."""
         self._stopped = True
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
         if final_text:
             try:
                 await safe_edit(self.status_msg, final_text)

@@ -342,9 +342,8 @@ async def _upload_terabox_file_to_backup(
         print(f"[TeraBox] Response: {updates}")
 
         try:
-            actual_group_id = await get_backup_group_actual_id()
             recent = await bot.get_messages(
-                actual_group_id, list(range(-1, -4, -1))  # last 3 messages
+                BACKUP_GROUP_ID, list(range(-1, -4, -1))  # last 3 messages
             )
             if not isinstance(recent, list):
                 recent = [recent]
@@ -378,7 +377,7 @@ async def _upload_terabox_file_to_backup(
 async def terabox_link_handler(bot: Client, message: Message) -> None:
     """Handler called when a user sends a TeraBox share link."""
     # -- Import here to avoid circular import (app.bot.main imports this file)
-    from app.bot.main import active_user_processes, get_backup_group_peer, get_backup_group_actual_id, is_cancelled, reset_cancel
+    from app.bot.main import active_user_processes, get_backup_group_peer, is_cancelled, reset_cancel
     from app.terabox import get_terabox_client
 
     user_id = message.from_user.id
@@ -679,23 +678,30 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             from app.terabox.progress import _human_bytes, _human_speed, _bar, _eta
 
             async def _photo_updater_loop():
-                # Milestone-based reporting for photos
-                _last_pct = -1
                 while not _photo_stopped["v"]:
-                    await asyncio.sleep(10) # Heavy reduction
+                    await asyncio.sleep(2.5)
                     if _photo_stopped["v"]:
                         break
                     try:
-                        done = _photo_state["done"]
-                        total = _photo_state["total"]
-                        pct = int((done / total * 100) / 25) * 25 if total else 0
-                        if pct > _last_pct:
-                            _last_pct = pct
-                            text = (
-                                f"\U0001f5bc\ufe0f **Proses Foto: {done}/{total}**\n"
-                                f"\U0001f4ca Progress: {pct}%"
-                            )
-                            await safe_edit(status_msg, text)
+                        dl_frac = _photo_state["downloaded"] / _photo_total_size if _photo_total_size else 0
+                        ul_frac = _photo_state["uploaded"] / _photo_total_size if _photo_total_size else 0
+                        dl_speed = _rolling_speed(_photo_state["_dl_samples"])
+                        ul_speed = _rolling_speed(_photo_state["_ul_samples"])
+                        dl_rem = max(0, _photo_total_size - _photo_state["downloaded"])
+                        ul_rem = max(0, _photo_total_size - _photo_state["uploaded"])
+                        elapsed = _time.monotonic() - _photo_start
+                        mins, secs = divmod(int(elapsed), 60)
+                        text = (
+                            f"\U0001f5bc\ufe0f **Foto {_photo_state['done']}/{_photo_state['total']}** "
+                            f"(\U0001f4ca {total_up} jumlah fail)\n"
+                            f"\U0001f4e6 {_human_bytes(_photo_total_size)}\n\n"
+                            f"\u2b07\ufe0f Muat Turun  {_bar(dl_frac)}  {dl_frac*100:.0f}%\n"
+                            f"    {_human_bytes(_photo_state['downloaded'])} \u2022 {_human_speed(dl_speed)} \u2022 ETA {_eta(dl_rem, dl_speed)}\n\n"
+                            f"\u2b06\ufe0f Muat Naik   {_bar(ul_frac)}  {ul_frac*100:.0f}%\n"
+                            f"    {_human_bytes(_photo_state['uploaded'])} \u2022 {_human_speed(ul_speed)} \u2022 ETA {_eta(ul_rem, ul_speed)}\n\n"
+                            f"\u23f1 Masa: {mins}m {secs}s"
+                        )
+                        await safe_edit(status_msg, text)
                     except Exception:
                         pass
 
@@ -833,9 +839,6 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                     return await coro_factory()
                 except FloodWait as fw:
                     wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 10)
-                    if wait > 300:
-                        print(f"[TeraBox] FloodWait {wait}s too long, skipping...")
-                        return None
                     print(f"[TeraBox] FloodWait {wait}s (attempt {attempt}/{retries})")
                     await asyncio.sleep(wait + 1)
                 except Exception as e:
@@ -850,32 +853,16 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # ---------- Helper: send one file individually -----------------------
         async def _send_single(mid: int) -> bool:
             """Send a single backup message to the user. Returns True on success."""
-            actual_from_id = await get_backup_group_actual_id()
             r = await _safe_send(
                 lambda _mid=mid: bot.copy_message(
                     chat_id=user_id,
-                    from_chat_id=actual_from_id,
+                    from_chat_id=BACKUP_GROUP_ID,
                     message_id=_mid,
                 )
             )
             if r:
                 delivered_mids.add(mid)
                 return True
-                
-            from app.bot.session_manager import manager as local_manager
-            uc = await local_manager.get_client(user_id)
-            if uc:
-                try:
-                    me = await bot.get_me()
-                    await uc.forward_messages(
-                        chat_id=me.username,
-                        from_chat_id=actual_from_id,
-                        message_ids=mid
-                    )
-                    delivered_mids.add(mid)
-                    return True
-                except Exception as e:
-                    print(f"[Fallback] user_client failed: {e}")
             return False
 
         # ---------- Helper: send album chunk to user -------------------------
@@ -954,26 +941,12 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                             for vm in valid_mids[:actual]:
                                 delivered_mids.add(vm)
                     else:
-                          fallback_album = False
-                          try:
-                              from app.bot.session_manager import manager as local_manager
-                              uc = await local_manager.get_client(user_id)
-                              if uc:
-                                  actual_from_id = await get_backup_group_actual_id()
-                                  me = await bot.get_me() if "bot" in locals() else await client.get_me()
-                                  await uc.forward_messages(me.username, actual_from_id, valid_mids)
-                                  fallback_album = True
-                                  for vm in valid_mids:
-                                      delivered_mids.add(vm)
-                          except Exception as e:
-                              pass
-                              
-                          if not fallback_album:
-                              # Album failed — fallback: send each individually
-                              print(f"[TeraBox] Album send failed, falling back to individual sends")
-                              for mid in valid_mids:
-                                  await _send_single(mid)
-                                  await asyncio.sleep(0.5)
+                        # Album failed — fallback: send each individually
+                        print(f"[TeraBox] Album send failed, falling back to individual sends")
+                        for mid in valid_mids:
+                            await _send_single(mid)
+                            await asyncio.sleep(0.5)
+
                 # Delay between chunks to avoid FloodWait
                 await asyncio.sleep(1.5)
 

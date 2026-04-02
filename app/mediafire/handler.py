@@ -296,9 +296,8 @@ async def _upload_file_to_backup(
             f"response type={type(updates).__name__} for {file_name}"
         )
         try:
-            actual_group_id = await get_backup_group_actual_id()
             recent = await bot.get_messages(
-                actual_group_id, list(range(-1, -4, -1))
+                BACKUP_GROUP_ID, list(range(-1, -4, -1))
             )
             if not isinstance(recent, list):
                 recent = [recent]
@@ -345,9 +344,6 @@ async def _safe_send(coro_factory, retries: int = 3):
             return await coro_factory()
         except FloodWait as fw:
             wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 10)
-            if wait > 300:
-                print(f"[MediaFire] FloodWait {wait}s too long, skipping...")
-                return None
             print(f"[MediaFire] FloodWait {wait}s (attempt {attempt}/{retries})")
             await asyncio.sleep(wait + 1)
         except Exception as e:
@@ -389,21 +385,6 @@ async def _send_album_to_user(
         if r:
             delivered_mids.add(mid)
             return True
-            
-        from app.bot.session_manager import manager as local_manager
-        uc = await local_manager.get_client(user_id)
-        if uc:
-            try:
-                me = await bot.get_me()
-                await uc.forward_messages(
-                    chat_id=me.username,
-                    from_chat_id=BACKUP_GROUP_ID,
-                    message_ids=mid
-                )
-                delivered_mids.add(mid)
-                return True
-            except Exception as e:
-                print(f"[Fallback] user_client failed: {e}")
         return False
 
     for i in range(0, len(items), CHUNK):
@@ -459,26 +440,12 @@ async def _send_album_to_user(
                     for vm in valid_mids[:actual]:
                         delivered_mids.add(vm)
             else:
-                fallback_album = False
-                try:
-                    from app.bot.session_manager import manager as local_manager
-                    from app.bot.main import get_backup_group_actual_id
-                    uc = await local_manager.get_client(user_id)
-                    if uc:
-                        actual_from_id = await get_backup_group_actual_id()
-                        me = await bot.get_me() if "bot" in locals() else await client.get_me()
-                        await uc.forward_messages(me.username, actual_from_id, valid_mids)
-                        fallback_album = True
-                        for vm in valid_mids:
-                            delivered_mids.add(vm)
-                except Exception as e:
-                    pass
+                print("[MediaFire] Album send failed, falling back to individual sends")
+                for mid in valid_mids:
+                    await _send_single(mid)
+                    await asyncio.sleep(0.5)
 
-                if not fallback_album:
-                    print("[MediaFire] Album send failed, falling back to individual sends")
-                    for mid in valid_mids:
-                        await _send_single(mid)
-                        await asyncio.sleep(0.5)
+        await asyncio.sleep(1.5)
 
 
 # ---------------------------------------------------------------------------
@@ -497,38 +464,21 @@ async def _deliver_to_user(
     Photos are sent as album(s) first, then videos as album(s).
     Includes a safety-net pass for any missed deliveries.
     """
-    from app.bot.main import get_backup_group_actual_id
     await safe_edit(status_msg, "⬆️ Menghantar ke anda…")
 
     delivered_mids: set = set()
 
     async def _send_single(mid: int) -> bool:
-        actual_from_id = await get_backup_group_actual_id()
         r = await _safe_send(
             lambda _mid=mid: bot.copy_message(
                 chat_id=user_id,
-                from_chat_id=actual_from_id,
+                from_chat_id=BACKUP_GROUP_ID,
                 message_id=_mid,
             )
         )
         if r:
             delivered_mids.add(mid)
             return True
-            
-        from app.bot.session_manager import manager as local_manager
-        uc = await local_manager.get_client(user_id)
-        if uc:
-            try:
-                me = await bot.get_me()
-                await uc.forward_messages(
-                    chat_id=me.username,
-                    from_chat_id=actual_from_id,
-                    message_ids=mid
-                )
-                delivered_mids.add(mid)
-                return True
-            except Exception as e:
-                print(f"[Fallback] user_client failed: {e}")
         return False
 
     photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
@@ -624,10 +574,7 @@ def _append_bytes(path: str, data: bytes) -> None:
 
 async def mediafire_link_handler(bot: Client, message: Message) -> None:
     """Handler called when a user sends a MediaFire file link."""
-    from app.bot.main import (
-        active_user_processes, get_backup_group_peer, get_backup_group_actual_id,
-        is_cancelled, reset_cancel
-    )
+    from app.bot.main import active_user_processes, get_backup_group_peer, is_cancelled, reset_cancel
 
     user_id = message.from_user.id
 
@@ -990,23 +937,33 @@ async def _handle_archive(
             return 0.0
 
         async def _batch_updater_loop():
-            # Milestone-based reporting for MediaFire batches
-            _last_pct = -1
             while not _batch_stopped["v"]:
-                await asyncio.sleep(10)
+                await asyncio.sleep(2.5)
                 if _batch_stopped["v"]:
                     break
                 try:
-                    done = _batch_state["done"]
-                    total = _batch_state["batch_count"]
-                    pct = int((done / total * 100) / 25) * 25 if total else 0
-                    if pct > _last_pct:
-                        _last_pct = pct
-                        text = (
-                            f"\U0001f5bc\ufe0f **Proses Fail: {done}/{total}**\n"
-                            f"\U0001f4ca Progress: {pct}%"
-                        )
-                        await safe_edit(status_msg, text)
+                    ts = _batch_state["batch_total_size"]
+                    if ts <= 0:
+                        continue
+                    dl_frac = _batch_state["downloaded"] / ts
+                    ul_frac = _batch_state["uploaded"] / ts
+                    dl_speed = _rolling_speed(_batch_state["_dl_samples"])
+                    ul_speed = _rolling_speed(_batch_state["_ul_samples"])
+                    dl_rem = max(0, ts - _batch_state["downloaded"])
+                    ul_rem = max(0, ts - _batch_state["uploaded"])
+                    elapsed = _time.monotonic() - _batch_start
+                    mins, secs = divmod(int(elapsed), 60)
+                    text = (
+                        f"\U0001f5bc\ufe0f **Foto {_batch_state['done']}/{_batch_state['batch_count']}** "
+                        f"(\U0001f4ca {total_files} jumlah fail)\n"
+                        f"\U0001f4e6 {_human_bytes(ts)}\n\n"
+                        f"\u2b07\ufe0f Muat Turun  {_bar(dl_frac)}  {dl_frac*100:.0f}%\n"
+                        f"    {_human_bytes(_batch_state['downloaded'])} \u2022 {_human_speed(dl_speed)} \u2022 ETA {_eta(dl_rem, dl_speed)}\n\n"
+                        f"\u2b06\ufe0f Muat Naik   {_bar(ul_frac)}  {ul_frac*100:.0f}%\n"
+                        f"    {_human_bytes(_batch_state['uploaded'])} \u2022 {_human_speed(ul_speed)} \u2022 ETA {_eta(ul_rem, ul_speed)}\n\n"
+                        f"\u23f1 Masa: {mins}m {secs}s"
+                    )
+                    await safe_edit(status_msg, text)
                 except Exception:
                     pass
 
