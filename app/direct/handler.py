@@ -568,9 +568,9 @@ async def _send_album_to_user(
         if r:
             delivered_mids.add(mid)
             return True
-                
-            from app.bot.session_manager import manager
-            uc = await manager.get_client(user_id)
+
+            from app.bot.session_manager import manager as local_manager
+            uc = await local_manager.get_client(user_id)
             if uc:
                 try:
                     me = await bot.get_me()
@@ -640,9 +640,9 @@ async def _send_album_to_user(
             else:
                   fallback_album = False
                   try:
-                      from app.bot.session_manager import manager
+                      from app.bot.session_manager import manager as local_manager
                       from app.bot.main import get_backup_group_actual_id
-                      uc = await manager.get_client(user_id)
+                      uc = await local_manager.get_client(user_id)
                       if uc:
                           actual_from_id = await get_backup_group_actual_id()
                           me = await bot.get_me() if "bot" in locals() else await client.get_me()

@@ -1278,8 +1278,8 @@ async def link_handler(client: Client, message: Message):
                         
                         fallback_album = False
                         try:
-                            from app.bot.session_manager import manager
-                            uc = await manager.get_client(user_id)
+                            from app.bot.session_manager import manager as local_manager
+                            uc = await local_manager.get_client(user_id)
                             if uc:
                                 me = await client.get_me()
                                 valid_mids = [msg.id for msg in backup_msgs]
@@ -1305,8 +1305,8 @@ async def link_handler(client: Client, message: Message):
                                             
                                             # User fallback mechanism
                                             try:
-                                                from app.bot.session_manager import manager
-                                                uc = await manager.get_client(user_id)
+                                                from app.bot.session_manager import manager as local_manager
+                                                uc = await local_manager.get_client(user_id)
                                                 if uc:
                                                     me = await client.get_me()
                                                     await uc.forward_messages(
@@ -1372,8 +1372,8 @@ async def link_handler(client: Client, message: Message):
                     
                 if not success:
                     try:
-                        from app.bot.session_manager import manager
-                        uc = await manager.get_client(user_id)
+                        from app.bot.session_manager import manager as local_manager
+                        uc = await local_manager.get_client(user_id)
                         if uc:
                             me = await client.get_me()
                             await uc.forward_messages(
