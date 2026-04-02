@@ -459,27 +459,26 @@ async def _send_album_to_user(
                     for vm in valid_mids[:actual]:
                         delivered_mids.add(vm)
             else:
-                  fallback_album = False
-                  try:
-                      from app.bot.session_manager import manager
-                      from app.bot.main import get_backup_group_actual_id
-                      uc = await manager.get_client(user_id)
-                      if uc:
-                          actual_from_id = await get_backup_group_actual_id()
-                          me = await bot.get_me() if "bot" in locals() else await client.get_me()
-                          await uc.forward_messages(me.username, actual_from_id, valid_mids)
-                          fallback_album = True
-                          for vm in valid_mids:
-                              delivered_mids.add(vm)
-                  except Exception as e:
-                      pass
-                      
-                  if not fallback_album:
-                      print("[MediaFire] Album send failed, falling back to individual sends")
-                      for mid in valid_mids:
-                          await _send_single(mid)
-                          await asyncio.sleep(0.5)
-        await asyncio.sleep(1.5)
+                fallback_album = False
+                try:
+                    from app.bot.session_manager import manager
+                    from app.bot.main import get_backup_group_actual_id
+                    uc = await manager.get_client(user_id)
+                    if uc:
+                        actual_from_id = await get_backup_group_actual_id()
+                        me = await bot.get_me() if "bot" in locals() else await client.get_me()
+                        await uc.forward_messages(me.username, actual_from_id, valid_mids)
+                        fallback_album = True
+                        for vm in valid_mids:
+                            delivered_mids.add(vm)
+                except Exception as e:
+                    pass
+
+                if not fallback_album:
+                    print("[MediaFire] Album send failed, falling back to individual sends")
+                    for mid in valid_mids:
+                        await _send_single(mid)
+                        await asyncio.sleep(0.5)
 
 
 # ---------------------------------------------------------------------------

@@ -583,6 +583,18 @@ async def _send_album_to_user(
                     return True
                 except Exception as e:
                     print(f"[Fallback] user_client failed: {e}")
+            return False
+
+    for i in range(0, len(items), CHUNK):
+        chunk = items[i : i + CHUNK]
+        chunk_mids = [mid for mid, *_ in chunk]
+
+        actual_group_id = await get_backup_group_actual_id()
+        backup_msgs = await _safe_send(
+            lambda _ids=chunk_mids: bot.get_messages(actual_group_id, _ids)
+        )
+        if backup_msgs is None:
+            for mid, kind, name, size in chunk:
                 await _send_single(mid)
                 await asyncio.sleep(0.5)
             continue
