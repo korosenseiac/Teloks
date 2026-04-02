@@ -214,18 +214,24 @@ async def _upload_file_to_backup(
     tracker: Optional[ProgressTracker] = None,
     thumb_raw: Optional[bytes] = None,
     video_meta: Optional[Dict[str, int]] = None,
+    user_client: Optional[Client] = None,
 ) -> Optional[int]:
     """
-    Upload *streamer* to the backup Telegram group using the **bot session**.
+    Upload *streamer* to the backup Telegram group.
     Returns message_id or None on failure.
-
-    For videos, *thumb_raw* (JPEG bytes) and *video_meta* (duration/w/h)
-    are used to set the thumbnail and video attributes.
     """
     try:
         on_ul = tracker.add_uploaded if tracker else None
 
-        input_file = await upload_stream(bot, streamer, file_name, on_upload_chunk=on_ul)
+        if user_client and file_size > 2 * 1024 * 1024 * 1024:
+            upload_client = user_client
+        else:
+            upload_client = bot
+
+        is_sent_to_bot = (upload_client == user_client)
+        upload_peer = bot.me.username if is_sent_to_bot else backup_peer
+
+        input_file = await upload_stream(upload_client, streamer, file_name, on_upload_chunk=on_ul)
 
         kind = _classify(file_name)
         mime_type = _mime(file_name)
@@ -241,7 +247,7 @@ async def _upload_file_to_backup(
             # Upload thumbnail if available
             thumb_input_file = None
             if thumb_raw:
-                thumb_input_file = await _upload_thumb_to_telegram(bot, thumb_raw)
+                thumb_input_file = await _upload_thumb_to_telegram(upload_client, thumb_raw)
                 if thumb_input_file:
                     print(f"[MediaFire] Thumbnail uploaded for {file_name} ({len(thumb_raw)} bytes)")
 
@@ -264,25 +270,75 @@ async def _upload_file_to_backup(
                 attributes=[DocumentAttributeFilename(file_name=file_name)],
             )
 
-        # SendMedia with FloodWait handling — send directly to backup group via bot
-        for _send_attempt in range(1, 4):
+        # Register interceptor future if sending to bot
+        fut = None
+        uid = None
+        if is_sent_to_bot:
+            from app.bot.main import pending_bot_uploads
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            me = await user_client.get_me()
+            uid = me.id
+            if uid not in pending_bot_uploads:
+                pending_bot_uploads[uid] = []
+            pending_bot_uploads[uid].append((file_name, fut))
+
+        # Send directly to backup group (or bot) using selected session
+        SEND_RETRIES = 5
+        updates = None
+        for send_attempt in range(1, SEND_RETRIES + 1):
             try:
-                updates = await bot.invoke(
+                target_peer = (
+                    await upload_client.resolve_peer(upload_peer)
+                    if isinstance(upload_peer, (str, int))
+                    else upload_peer
+                )
+
+                updates = await upload_client.invoke(
                     SendMedia(
-                        peer=backup_peer,
+                        peer=target_peer,
                         media=media,
                         message="",
                         random_id=random.randint(0, 2 ** 63 - 1),
                     )
                 )
-                break
+                break  # success
             except FloodWait as fw:
-                wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 10)
-                print(f"[MediaFire] SendMedia FloodWait {wait}s (attempt {_send_attempt}/3)")
-                await asyncio.sleep(wait + 1)
-        else:
-            print(f"[MediaFire] SendMedia failed after 3 FloodWait retries for {file_name}")
+                wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 15)
+                print(f"[MediaFire] FloodWait {wait}s on SendMedia for {file_name} (attempt {send_attempt}/{SEND_RETRIES})")
+                if send_attempt < SEND_RETRIES:
+                    await asyncio.sleep(wait + 2)
+                else:
+                    return None
+
+        if updates is None:
             return None
+
+        if is_sent_to_bot:
+            try:
+                bot_msg = await asyncio.wait_for(fut, timeout=120)
+                backup_msg_id = None
+                try:
+                    fw_msg = await bot.forward_messages(
+                        chat_id=BACKUP_GROUP_ID,
+                        from_chat_id=bot_msg.chat.id,
+                        message_ids=bot_msg.id
+                    )
+                    if fw_msg:
+                        backup_msg_id = fw_msg.id
+                except Exception as e:
+                    print(f"[MediaFire] Failed to forward bot message {bot_msg.id}: {e}")
+                
+                if backup_msg_id:
+                    return backup_msg_id
+                else:
+                    print("[MediaFire] Failed to forward message to backup group")
+                    return None
+            except asyncio.TimeoutError:
+                print("[MediaFire] Timeout waiting for bot to receive the message")
+                if uid in pending_bot_uploads:
+                    pending_bot_uploads[uid] = [p for p in pending_bot_uploads[uid] if p[1] != fut]
+                return None
 
         # Extract message_id from various Telegram response types
         msg_id = _extract_msg_id(updates)
@@ -531,16 +587,12 @@ async def _deliver_to_user(
                 print(f"[Fallback] user_client failed: {e}")
         return False
 
-    photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
-    videos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
+    media_items = [(mid, k, n, s) for mid, k, n, s in uploaded if k in ("photo", "video")]
     others = [(mid, k, n, s) for mid, k, n, s in uploaded
               if k not in ("photo", "video")]
 
-    # Send: photos album first
-    await _send_album_to_user(bot, user_id, photos, delivered_mids)
-
-    # Send: videos album next
-    await _send_album_to_user(bot, user_id, videos, delivered_mids)
+    # Send: all media (photos and videos) together
+    await _send_album_to_user(bot, user_id, media_items, delivered_mids)
 
     # Send: anything else individually
     for mid, k, n, s in others:
@@ -628,8 +680,10 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
         active_user_processes, get_backup_group_peer, get_backup_group_actual_id,
         is_cancelled, reset_cancel
     )
+    from app.bot.session_manager import manager
 
     user_id = message.from_user.id
+    user_client = await manager.get_client(user_id)
 
     # ---------------------------------------------------------------- Guards
     if active_user_processes.get(user_id):
@@ -754,12 +808,14 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
                 direct_url, filename, file_size,
                 skip_non_videos=skip_non_videos,
                 is_premium=is_premium,
+                user_client=user_client,
             )
         elif is_media(filename):
             await _handle_direct_media(
                 bot, mf_client, backup_peer,
                 message, status_msg, user_id,
                 direct_url, filename, file_size,
+                user_client=user_client,
             )
         else:
             await safe_edit(status_msg, 
@@ -800,6 +856,7 @@ async def _handle_direct_media(
     direct_url: str,
     filename: str,
     file_size: int,
+    user_client: Optional[Client] = None,
 ) -> None:
     """Stream a single media file from MediaFire → backup group → user."""
     from app.bot.main import is_cancelled
@@ -830,7 +887,7 @@ async def _handle_direct_media(
         )
 
         bmid = await _upload_file_to_backup(
-            bot, backup_peer, streamer, filename, file_size, tracker=tracker,
+            bot, backup_peer, streamer, filename, file_size, tracker=tracker, user_client=user_client
         )
 
         await tracker.stop()
@@ -875,6 +932,7 @@ async def _handle_archive(
     file_size: int,
     skip_non_videos: bool = False,
     is_premium: bool = False,
+    user_client: Optional[Client] = None,
 ) -> None:
     """Download archive, extract media ONE AT A TIME, upload each, send albums to user.
 
@@ -1050,6 +1108,7 @@ async def _handle_archive(
                             bot, backup_peer, streamer,
                             mf_entry["name"], mf_entry["size"],
                             tracker=_ul_proxy,
+                            user_client=user_client,
                         )
                         if _bmid:
                             break
@@ -1141,6 +1200,7 @@ async def _handle_archive(
                         tracker=tracker,
                         thumb_raw=thumb_raw,
                         video_meta=video_meta,
+                        user_client=user_client,
                     )
                     if bmid:
                         break
