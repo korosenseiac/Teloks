@@ -203,6 +203,22 @@ async def get_backup_group_peer(client: Client):
 
     return None
 
+
+async def get_backup_group_actual_id():
+    """Returns the actual working ID (integer) of the backup group, even if it was not resolved."""
+    global backup_group_actual_id
+    if backup_group_actual_id:
+        return backup_group_actual_id
+    
+    # Fallback to config but try to ensure -100 prefix if it looks like a supergroup
+    from app.config import BACKUP_GROUP_ID
+    raw_id_str = str(BACKUP_GROUP_ID)
+    if not raw_id_str.startswith("-"):
+        # If it's a positive number, it's likely a channel/supergroup ID without prefix
+        return int(f"-100{raw_id_str}")
+    return BACKUP_GROUP_ID
+
+
 # Regex to extract chat_id and message_id from Telegram links
 # Private: https://t.me/c/1234567890/123
 # Public:  https://t.me/username/123
@@ -1194,10 +1210,11 @@ async def link_handler(client: Client, message: Message):
             try:
                 # Send to backup with FloodWait handling
                 backup_msgs = None
+                actual_group_id = await get_backup_group_actual_id()
                 for attempt in range(3):
                     try:
                         backup_msgs = await client.send_media_group(
-                            chat_id=BACKUP_GROUP_ID,
+                            chat_id=actual_group_id,
                             media=backup_media_list
                         )
                         break
@@ -1257,12 +1274,13 @@ async def link_handler(client: Client, message: Message):
 
                     # Fallback: copy messages individually if album send failed
                     if not album_sent:
+                        actual_from_id = await get_backup_group_actual_id()
                         for backup_msg in backup_msgs:
                             for copy_attempt in range(3):
                                 try:
                                     await client.copy_message(
                                         chat_id=user_id,
-                                        from_chat_id=BACKUP_GROUP_ID,
+                                        from_chat_id=actual_from_id,
                                         message_id=backup_msg.id
                                     )
                                     break
@@ -1309,11 +1327,12 @@ async def link_handler(client: Client, message: Message):
 
             # Forward individual messages to user
             await safe_edit(status_msg, f"⬆️ Mengirim {len(backup_msg_ids)} file(s) ke Anda...")
+            actual_from_id = await get_backup_group_actual_id()
             for backup_msg_id in backup_msg_ids:
                 try:
                     await client.copy_message(
                         chat_id=user_id,
-                        from_chat_id=BACKUP_GROUP_ID,
+                        from_chat_id=actual_from_id,
                         message_id=backup_msg_id,
                         caption=""
                     )

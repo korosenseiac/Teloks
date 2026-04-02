@@ -345,7 +345,9 @@ async def _upload_file_to_backup(
         # Fallback — scan recent messages
         print(f"[Torrent] WARNING: Could not extract msg_id for {file_name}")
         try:
-            recent = await bot.get_messages(BACKUP_GROUP_ID, list(range(-1, -4, -1)))
+            from app.bot.main import get_backup_group_actual_id
+            actual_group_id = await get_backup_group_actual_id()
+            recent = await bot.get_messages(actual_group_id, list(range(-1, -4, -1)))
             if not isinstance(recent, list):
                 recent = [recent]
             for msg in recent:
@@ -395,6 +397,7 @@ async def _send_album_to_user(
 ) -> None:
     if not items:
         return
+    from app.bot.main import get_backup_group_actual_id
     CHUNK = 8
 
     async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
@@ -402,10 +405,11 @@ async def _send_album_to_user(
             delivered_mids.add(mid)
             return True
         else:
+            actual_from_id = await get_backup_group_actual_id()
             r = await _safe_send(
                 lambda _mid=mid: bot.copy_message(
                     chat_id=user_id,
-                    from_chat_id=BACKUP_GROUP_ID,
+                    from_chat_id=actual_from_id,
                     message_id=_mid,
                 )
             )
@@ -608,7 +612,7 @@ def _get_torrent_name(status: Dict[str, Any]) -> str:
 async def torrent_link_handler(bot: Client, message: Message) -> None:
     """Handler for magnet: URIs and HTTP .torrent URLs sent as text."""
     from app.bot.main import (
-        active_user_processes, get_backup_group_peer,
+        active_user_processes, get_backup_group_peer, get_backup_group_actual_id,
         is_cancelled, reset_cancel,
     )
     from app.torrent import get_aria2_client

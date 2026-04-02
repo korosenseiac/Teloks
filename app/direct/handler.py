@@ -554,10 +554,11 @@ async def _send_album_to_user(
     CHUNK = 8
 
     async def _send_single(mid: int) -> bool:
+        actual_from_id = await get_backup_group_actual_id()
         r = await _safe_send(
             lambda _mid=mid: bot.copy_message(
                 chat_id=user_id,
-                from_chat_id=BACKUP_GROUP_ID,
+                from_chat_id=actual_from_id,
                 message_id=_mid,
             )
         )
@@ -570,8 +571,9 @@ async def _send_album_to_user(
         chunk = items[i : i + CHUNK]
         chunk_mids = [mid for mid, *_ in chunk]
 
+        actual_group_id = await get_backup_group_actual_id()
         backup_msgs = await _safe_send(
-            lambda _ids=chunk_mids: bot.get_messages(BACKUP_GROUP_ID, _ids)
+            lambda _ids=chunk_mids: bot.get_messages(actual_group_id, _ids)
         )
         if backup_msgs is None:
             for mid, kind, name, size in chunk:
@@ -924,33 +926,23 @@ async def _handle_archive(
             return 0.0
 
         async def _batch_updater_loop():
+            # Milestone-based reporting for Direct batches
+            _last_pct = -1
             while not _batch_stopped["v"]:
-                await asyncio.sleep(2.5)
+                await asyncio.sleep(10)
                 if _batch_stopped["v"]:
                     break
                 try:
-                    ts = _batch_state["batch_total_size"]
-                    if ts <= 0:
-                        continue
-                    dl_frac = _batch_state["downloaded"] / ts
-                    ul_frac = _batch_state["uploaded"] / ts
-                    dl_speed = _rolling_speed(_batch_state["_dl_samples"])
-                    ul_speed = _rolling_speed(_batch_state["_ul_samples"])
-                    dl_rem = max(0, ts - _batch_state["downloaded"])
-                    ul_rem = max(0, ts - _batch_state["uploaded"])
-                    elapsed = _time.monotonic() - _batch_start
-                    mins, secs = divmod(int(elapsed), 60)
-                    text = (
-                        f"🖼️ **Foto {_batch_state['done']}/{_batch_state['batch_count']}** "
-                        f"(📊 {total_files} jumlah fail)\n"
-                        f"📦 {_human_bytes(ts)}\n\n"
-                        f"⬇️ Muat Turun  {_bar(dl_frac)}  {dl_frac*100:.0f}%\n"
-                        f"    {_human_bytes(_batch_state['downloaded'])} • {_human_speed(dl_speed)} • ETA {_eta(dl_rem, dl_speed)}\n\n"
-                        f"⬆️ Muat Naik   {_bar(ul_frac)}  {ul_frac*100:.0f}%\n"
-                        f"    {_human_bytes(_batch_state['uploaded'])} • {_human_speed(ul_speed)} • ETA {_eta(ul_rem, ul_speed)}\n\n"
-                        f"⏱ Masa: {mins}m {secs}s"
-                    )
-                    await safe_edit(status_msg, text)
+                    done = _batch_state["done"]
+                    total = _batch_state["batch_count"]
+                    pct = int((done / total * 100) / 25) * 25 if total else 0
+                    if pct > _last_pct:
+                        _last_pct = pct
+                        text = (
+                            f"📷 **Proses Fail: {done}/{total}**\n"
+                            f"📊 Progress: {pct}%"
+                        )
+                        await safe_edit(status_msg, text)
                 except Exception:
                     pass
 
@@ -1136,7 +1128,10 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
     6. Copy/send to user
     """
     # Avoid circular import by importing here
-    from app.bot.main import active_user_processes, reset_cancel, is_cancelled
+    from app.bot.main import (
+        active_user_processes, reset_cancel, is_cancelled,
+        get_backup_group_actual_id
+    )
     
     user_id = message.from_user.id
     tracker: Optional[ProgressTracker] = None

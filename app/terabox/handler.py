@@ -342,8 +342,9 @@ async def _upload_terabox_file_to_backup(
         print(f"[TeraBox] Response: {updates}")
 
         try:
+            actual_group_id = await get_backup_group_actual_id()
             recent = await bot.get_messages(
-                BACKUP_GROUP_ID, list(range(-1, -4, -1))  # last 3 messages
+                actual_group_id, list(range(-1, -4, -1))  # last 3 messages
             )
             if not isinstance(recent, list):
                 recent = [recent]
@@ -377,7 +378,7 @@ async def _upload_terabox_file_to_backup(
 async def terabox_link_handler(bot: Client, message: Message) -> None:
     """Handler called when a user sends a TeraBox share link."""
     # -- Import here to avoid circular import (app.bot.main imports this file)
-    from app.bot.main import active_user_processes, get_backup_group_peer, is_cancelled, reset_cancel
+    from app.bot.main import active_user_processes, get_backup_group_peer, get_backup_group_actual_id, is_cancelled, reset_cancel
     from app.terabox import get_terabox_client
 
     user_id = message.from_user.id
@@ -677,35 +678,28 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
 
             from app.terabox.progress import _human_bytes, _human_speed, _bar, _eta
 
-            async def _photo_updater_loop():
-                while not _photo_stopped["v"]:
-                    await asyncio.sleep(2.5)
-                    if _photo_stopped["v"]:
-                        break
-                    try:
-                        dl_frac = _photo_state["downloaded"] / _photo_total_size if _photo_total_size else 0
-                        ul_frac = _photo_state["uploaded"] / _photo_total_size if _photo_total_size else 0
-                        dl_speed = _rolling_speed(_photo_state["_dl_samples"])
-                        ul_speed = _rolling_speed(_photo_state["_ul_samples"])
-                        dl_rem = max(0, _photo_total_size - _photo_state["downloaded"])
-                        ul_rem = max(0, _photo_total_size - _photo_state["uploaded"])
-                        elapsed = _time.monotonic() - _photo_start
-                        mins, secs = divmod(int(elapsed), 60)
+        async def _photo_updater_loop():
+            # Milestone-based reporting for photos
+            _last_pct = -1
+            while not _photo_stopped["v"]:
+                await asyncio.sleep(10) # Heavy reduction
+                if _photo_stopped["v"]:
+                    break
+                try:
+                    done = _photo_state["done"]
+                    total = _photo_state["total"]
+                    pct = int((done / total * 100) / 25) * 25 if total else 0
+                    if pct > _last_pct:
+                        _last_pct = pct
                         text = (
-                            f"\U0001f5bc\ufe0f **Foto {_photo_state['done']}/{_photo_state['total']}** "
-                            f"(\U0001f4ca {total_up} jumlah fail)\n"
-                            f"\U0001f4e6 {_human_bytes(_photo_total_size)}\n\n"
-                            f"\u2b07\ufe0f Muat Turun  {_bar(dl_frac)}  {dl_frac*100:.0f}%\n"
-                            f"    {_human_bytes(_photo_state['downloaded'])} \u2022 {_human_speed(dl_speed)} \u2022 ETA {_eta(dl_rem, dl_speed)}\n\n"
-                            f"\u2b06\ufe0f Muat Naik   {_bar(ul_frac)}  {ul_frac*100:.0f}%\n"
-                            f"    {_human_bytes(_photo_state['uploaded'])} \u2022 {_human_speed(ul_speed)} \u2022 ETA {_eta(ul_rem, ul_speed)}\n\n"
-                            f"\u23f1 Masa: {mins}m {secs}s"
+                            f"\U0001f5bc\ufe0f **Proses Foto: {done}/{total}**\n"
+                            f"\U0001f4ca Progress: {pct}%"
                         )
                         await safe_edit(status_msg, text)
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
-            _photo_updater_task = asyncio.create_task(_photo_updater_loop())
+        _photo_updater_task = asyncio.create_task(_photo_updater_loop())
 
             async def _upload_one_photo(_pe):
                 async with _photo_sem:
@@ -853,10 +847,11 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # ---------- Helper: send one file individually -----------------------
         async def _send_single(mid: int) -> bool:
             """Send a single backup message to the user. Returns True on success."""
+            actual_from_id = await get_backup_group_actual_id()
             r = await _safe_send(
                 lambda _mid=mid: bot.copy_message(
                     chat_id=user_id,
-                    from_chat_id=BACKUP_GROUP_ID,
+                    from_chat_id=actual_from_id,
                     message_id=_mid,
                 )
             )
