@@ -1291,34 +1291,34 @@ async def link_handler(client: Client, message: Message):
                         if not fallback_album:
                             for backup_msg in backup_msgs:
                                 for copy_attempt in range(3):
-                                try:
-                                    await client.copy_message(
-                                        chat_id=user_id,
-                                        from_chat_id=actual_from_id,
-                                        message_id=backup_msg.id
-                                    )
-                                    break
-                                except FloodWait as fw:
-                                    wait = getattr(fw, "value", getattr(fw, "x", 10))
-                                    if wait > 300:
-                                        print(f"FloodWait {wait}s too long for copy, skipping...")
-                                        
-                                        # User fallback mechanism
-                                        try:
-                                            from app.bot.session_manager import manager
-                                            uc = await manager.get_client(user_id)
-                                            if uc:
-                                                me = await client.get_me()
-                                                await uc.forward_messages(
-                                                    chat_id=me.username,
-                                                    from_chat_id=actual_from_id,
-                                                    message_ids=backup_msg.id
-                                                )
-                                        except Exception as e:
-                                            print(f"Fallback copy error: {e}")
-                                            
+                                    try:
+                                        await client.copy_message(
+                                            chat_id=user_id,
+                                            from_chat_id=actual_from_id,
+                                            message_id=backup_msg.id
+                                        )
                                         break
-                                    await asyncio.sleep(wait + 1)
+                                    except FloodWait as fw:
+                                        wait = getattr(fw, "value", getattr(fw, "x", 10))
+                                        if wait > 300:
+                                            print(f"FloodWait {wait}s too long for copy, skipping...")
+                                            
+                                            # User fallback mechanism
+                                            try:
+                                                from app.bot.session_manager import manager
+                                                uc = await manager.get_client(user_id)
+                                                if uc:
+                                                    me = await client.get_me()
+                                                    await uc.forward_messages(
+                                                        chat_id=me.username,
+                                                        from_chat_id=actual_from_id,
+                                                        message_ids=backup_msg.id
+                                                    )
+                                            except Exception as e:
+                                                print(f"Fallback copy error: {e}")
+                                                
+                                            break
+                                        await asyncio.sleep(wait + 1)
                             await asyncio.sleep(0.5)
                     
             except Exception as e:
