@@ -20,16 +20,8 @@ async def safe_edit(message: Message, text: str, reply_markup=None, **kwargs):
         # The message content is the same, no need to update
         pass
     except FloodWait as e:
-        # If wait is short, we can afford to sleep.
-        # If it's long (e.g. 334s), status updates are non-critical, so skip it.
-        if e.value <= 10:
-            logger.warning(f"FloodWait of {e.value}s encountered. Sleeping and retrying...")
-            await asyncio.sleep(e.value + 1)
-            try:
-                return await message.edit_text(text, reply_markup=reply_markup, **kwargs)
-            except Exception:
-                pass
-        else:
-            logger.warning(f"Long FloodWait of {e.value}s encountered. Skipping this status update.")
+        # We skip all FloodWaits for status updates to avoid stalling processes.
+        # The next milestone or update will naturally catch up.
+        logger.warning(f"FloodWait of {e.value}s encountered. Skipping this status update to prevent rate limiting.")
     except Exception as e:
         logger.error(f"Failed to edit message: {e}")

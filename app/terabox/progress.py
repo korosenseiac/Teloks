@@ -12,6 +12,7 @@ import time
 from typing import Optional
 
 from pyrogram.types import Message
+from pyrogram import enums
 
 from app.utils.message import safe_edit
 
@@ -205,16 +206,54 @@ class ProgressTracker:
         self._task = asyncio.create_task(self._updater_loop())
 
     async def _updater_loop(self) -> None:
-        """Periodically edit the status message."""
+        """Periodically update chat action and edit status message at key milestones."""
+        last_dl_milestone = -1
+        last_ul_milestone = -1
+        # Chat actions expire automatically, we send ones every ~4.5s
+        chat_action_interval = self.EDIT_INTERVAL
+        
+        # We only really care about updating the user at these percentages
+        milestones = [0, 10, 25, 50, 75, 90, 100]
+        
+        def get_milestone(pct: float) -> int:
+            for m in reversed(milestones):
+                if pct >= m:
+                    return m
+            return -1
+            
         while not self._stopped:
-            await asyncio.sleep(self.EDIT_INTERVAL)
+            # 1. Provide live native indicator (no rate limit penalty)
+            try:
+                await self.status_msg.chat.send_action(enums.ChatAction.UPLOAD_DOCUMENT)
+            except Exception:
+                pass  # Might not have permission, etc.
+                
+            # 2. Check if we hit a new milestone (drastically drops message edits)
+            dl_pct = (self.downloaded / self.file_size * 100) if self.file_size else 0
+            ul_pct = (self.uploaded / self.file_size * 100) if self.file_size else 0
+            
+            dl_m = get_milestone(dl_pct)
+            ul_m = get_milestone(ul_pct)
+            
+            should_edit = False
+            if dl_m > last_dl_milestone:
+                last_dl_milestone = dl_m
+                should_edit = True
+            if ul_m > last_ul_milestone:
+                last_ul_milestone = ul_m
+                should_edit = True
+                
+            if should_edit:
+                try:
+                    text = self._render()
+                    await safe_edit(self.status_msg, text)
+                except Exception:
+                    pass  # FloodWait safely skipped by safe_edit
+                    
             if self._stopped:
                 break
-            try:
-                text = self._render()
-                await safe_edit(self.status_msg, text)
-            except Exception:
-                pass  # FloodWait, message deleted, etc.
+                
+            await asyncio.sleep(chat_action_interval)
 
     async def stop(self, final_text: str | None = None) -> None:
         """Cancel the updater and optionally edit one last time."""
