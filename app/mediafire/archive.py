@@ -174,6 +174,9 @@ def _list_zip_media_entries(archive_path: str, skip_non_video: bool = False) -> 
             basename = os.path.basename(info.filename)
             if basename and ext(basename) in filter_exts:
                 entries.append(info.filename)
+    
+    # Sort files alphabetically by their name
+    entries.sort(key=lambda x: os.path.basename(x))
     return entries
 
 
@@ -230,6 +233,9 @@ def _list_rar_media_entries(archive_path: str, skip_non_video: bool = False) -> 
             basename = os.path.basename(info.filename)
             if basename and ext(basename) in filter_exts:
                 entries.append(info.filename)
+    
+    # Sort files alphabetically by their name
+    entries.sort(key=lambda x: os.path.basename(x))
     return entries
 
 
@@ -261,7 +267,9 @@ def _sync_extract_zip(archive_path: str, dest_dir: str) -> List[Dict[str, object
     seen_names: Dict[str, int] = {}
 
     with zipfile.ZipFile(archive_path, "r") as zf:
-        for info in zf.infolist():
+        # Sort in-memory list alphabetically by basename
+        infolist = sorted(zf.infolist(), key=lambda info: os.path.basename(info.filename))
+        for info in infolist:
             # Skip directories
             if info.is_dir():
                 continue
@@ -309,7 +317,9 @@ def _sync_extract_rar(archive_path: str, dest_dir: str) -> List[Dict[str, object
     seen_names: Dict[str, int] = {}
 
     with rarfile.RarFile(archive_path, "r") as rf:
-        for info in rf.infolist():
+        # Sort in-memory list alphabetically by basename
+        infolist = sorted(rf.infolist(), key=lambda info: os.path.basename(info.filename))
+        for info in infolist:
             if info.is_dir():
                 continue
 
