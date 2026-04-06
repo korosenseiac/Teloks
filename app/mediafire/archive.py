@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import zipfile
 from typing import AsyncIterator, Dict, List
 
@@ -26,6 +27,12 @@ try:
     _HAS_RAR = True
 except ImportError:
     _HAS_RAR = False
+
+
+def _natural_sort_key(s: str) -> list:
+    """Helper to ensure natural sorting (e.g. 2.mp4 before 10.mp4)."""
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split(r'(\d+)', s)]
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +182,8 @@ def _list_zip_media_entries(archive_path: str, skip_non_video: bool = False) -> 
             if basename and ext(basename) in filter_exts:
                 entries.append(info.filename)
     
-    # Sort files alphabetically by their name
-    entries.sort(key=lambda x: os.path.basename(x))
+    # Sort files naturally by their name (e.g. 2_before_10)
+    entries.sort(key=lambda x: _natural_sort_key(os.path.basename(x)))
     return entries
 
 
@@ -234,8 +241,8 @@ def _list_rar_media_entries(archive_path: str, skip_non_video: bool = False) -> 
             if basename and ext(basename) in filter_exts:
                 entries.append(info.filename)
     
-    # Sort files alphabetically by their name
-    entries.sort(key=lambda x: os.path.basename(x))
+    # Sort files naturally by their name (e.g. 2_before_10)
+    entries.sort(key=lambda x: _natural_sort_key(os.path.basename(x)))
     return entries
 
 
@@ -267,8 +274,8 @@ def _sync_extract_zip(archive_path: str, dest_dir: str) -> List[Dict[str, object
     seen_names: Dict[str, int] = {}
 
     with zipfile.ZipFile(archive_path, "r") as zf:
-        # Sort in-memory list alphabetically by basename
-        infolist = sorted(zf.infolist(), key=lambda info: os.path.basename(info.filename))
+        # Sort in-memory list naturally by basename
+        infolist = sorted(zf.infolist(), key=lambda info: _natural_sort_key(os.path.basename(info.filename)))
         for info in infolist:
             # Skip directories
             if info.is_dir():
@@ -317,8 +324,8 @@ def _sync_extract_rar(archive_path: str, dest_dir: str) -> List[Dict[str, object
     seen_names: Dict[str, int] = {}
 
     with rarfile.RarFile(archive_path, "r") as rf:
-        # Sort in-memory list alphabetically by basename
-        infolist = sorted(rf.infolist(), key=lambda info: os.path.basename(info.filename))
+        # Sort in-memory list naturally by basename
+        infolist = sorted(rf.infolist(), key=lambda info: _natural_sort_key(os.path.basename(info.filename)))
         for info in infolist:
             if info.is_dir():
                 continue
