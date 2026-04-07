@@ -26,7 +26,7 @@ from app.utils.streamer import MediaStreamer, upload_stream
 from app.bot.auth import handle_login_command, handle_auth_message, handle_login_callback, cancel_login, handle_main_menu_callback, handle_profile_callback, handle_profile_age_message, start_profile_setup
 from app.bot.states import user_profile_states, ProfileStep
 from app.utils.message import safe_edit
-from app.terabox.handler import terabox_link_handler, TERABOX_LINK_PATTERN
+from app.terabox.handler import terabox_link_handler, handle_tb_folder_callback, TERABOX_LINK_PATTERN
 from app.mediafire.handler import mediafire_link_handler, MEDIAFIRE_LINK_PATTERN
 from app.torrent.handler import (
     torrent_link_handler, torrent_file_handler,
@@ -437,6 +437,11 @@ async def cancel_callback_handler(client: Client, callback_query):
 async def profile_callback_handler(client: Client, callback_query):
     """Handle profile setup callbacks (gender selection)."""
     await handle_profile_callback(client, callback_query)
+
+@app.on_callback_query(filters.regex(r"^tb_f_"))
+async def tb_folder_callback_handler(client: Client, callback_query):
+    """Handle TeraBox folder selection callbacks."""
+    await handle_tb_folder_callback(client, callback_query)
 
 @app.on_message(filters.text & filters.private, group=1)
 async def auth_message_handler(client: Client, message: Message):

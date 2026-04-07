@@ -371,6 +371,101 @@ async def _upload_terabox_file_to_backup(
 
 
 # ---------------------------------------------------------------------------
+# Folder Selection
+# ---------------------------------------------------------------------------
+import asyncio
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+
+_pending_tb_folders = {}
+
+async def ask_terabox_folder_choice(bot: Client, user_id: int, message: Message, root_items: list) -> list:
+    """
+    Shows an inline keyboard for folder selection if multiple folders exist in the root.
+    Returns: a list of root items to process.
+    """
+    root_folders = [f for f in root_items if str(f.get("isdir", "0")) != "0"]
+    if len(root_folders) <= 1:
+        return root_items  # Only show picker if multiple folders exist, or fallback to all
+    
+    # Check total files (non-folders) at the root
+    root_files = [f for f in root_items if str(f.get("isdir", "0")) == "0"]
+    
+    future = asyncio.Future()
+    _pending_tb_folders[user_id] = future
+    
+    keyboard = []
+    
+    # 1. Option to only download root files
+    if root_files:
+        keyboard.append([InlineKeyboardButton(f"📄 Fail Semasa Sahaja ({len(root_files)})", callback_data=f"tb_f_root_{user_id}")])
+    
+    # 2. Options for each folder
+    for idx, folder in enumerate(root_folders):
+        folder_name = folder.get("server_filename", f"Folder {idx+1}")
+        if len(folder_name) > 30:
+            folder_name = folder_name[:27] + "..."
+        keyboard.append([InlineKeyboardButton(f"📁 {folder_name}", callback_data=f"tb_f_sel_{user_id}_{idx}")])
+        
+    # 3. Option to download all
+    keyboard.append([InlineKeyboardButton("📦 Muat Turun Semua", callback_data=f"tb_f_all_{user_id}")])
+    
+    # 4. Cancel
+    keyboard.append([InlineKeyboardButton("❌ Batal", callback_data=f"tb_f_cancel_{user_id}")])
+    
+    prompt = await message.reply_text(
+        "📂 **Pilih fail/folder untuk dimuat turun:**\n\n"
+        "(Terdapat pelbagai folder dalam pautan ini)",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    try:
+        choice = await asyncio.wait_for(future, timeout=300.0)
+        await prompt.delete()
+        
+        if choice == "cancel":
+            return []
+        elif choice == "all":
+            return root_items
+        elif choice == "root":
+            return root_files
+        elif choice.startswith("sel_"):
+            idx = int(choice.split("_")[1])
+            return [root_folders[idx]]
+    except asyncio.TimeoutError:
+        _pending_tb_folders.pop(user_id, None)
+        await prompt.edit_text("❌ Pemilihan folder tamat tempoh.")
+        return []
+    finally:
+        _pending_tb_folders.pop(user_id, None)
+    
+    return root_items
+
+async def handle_tb_folder_callback(bot: Client, callback_query: CallbackQuery) -> None:
+    user_id = callback_query.from_user.id
+    cb_data = callback_query.data
+    
+    future = _pending_tb_folders.get(user_id)
+    if not future or future.done():
+        await callback_query.answer("⚠️ Sesi pemilihan ini telah tamat", show_alert=True)
+        return
+        
+    if cb_data == f"tb_f_cancel_{user_id}":
+        future.set_result("cancel")
+        await callback_query.answer("Dibatalkan")
+    elif cb_data == f"tb_f_all_{user_id}":
+        future.set_result("all")
+        await callback_query.answer("Semua dipilih")
+    elif cb_data == f"tb_f_root_{user_id}":
+        future.set_result("root")
+        await callback_query.answer("Fail sahaja")
+    elif cb_data.startswith(f"tb_f_sel_{user_id}_"):
+        idx = cb_data.split("_")[-1]
+        future.set_result(f"sel_{idx}")
+        await callback_query.answer("Folder dipilih")
+    else:
+        await callback_query.answer()
+
+# ---------------------------------------------------------------------------
 # Main handler
 # ---------------------------------------------------------------------------
 
@@ -448,10 +543,26 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         from_uk = str(info.get("uk", ""))
         print(f"[TB:handler] share_id={share_id!r} from_uk={from_uk!r}")
 
-        # 3. Transfer share items into a temp folder on YOUR TeraBox account.
+        # 3. Handle specific folder selection if multiple folders exist
+        root_items = info.get("file_list") or info.get("list", [])
+        if not root_items:
+            await safe_edit(status_msg, "❌ Tiada fail dijumpai dalam link ini.")
+            return
+
+        # Prompt user if there are multiple root folders
+        # Delete status msg temporarily so it doesn't look messy
+        await status_msg.delete()
+        selected_items = await ask_terabox_folder_choice(bot, user_id, message, root_items)
+        if not selected_items:
+            # User cancelled or timed out
+            active_user_processes.pop(user_id, None)
+            return
+        root_items = selected_items
+
+        # 4. Transfer selected share items into a temp folder on YOUR TeraBox account.
         #    Inspired by TeraFetch: skip share/list (errno=105 on datacenter IPs)
         #    and transfer root items directly, then list our own files.
-        await safe_edit(status_msg, "📁 Mencipta folder sementara…")
+        status_msg = await message.reply_text("📁 Mencipta folder sementara…")
         temp_folder = f"/terabox_temp_{uuid.uuid4().hex[:12]}"
         cd_result = await tb.create_dir(temp_folder)
         if not cd_result or cd_result.get("errno", -1) != 0:
@@ -461,7 +572,6 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             )
             return
 
-        root_items = info.get("file_list") or info.get("list", [])
         root_fs_ids = [int(f["fs_id"]) for f in root_items]
         root_count = len(root_items)
         print(f"[TB:handler] transferring {root_count} root items: {root_fs_ids}")
