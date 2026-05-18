@@ -438,9 +438,10 @@ async def profile_callback_handler(client: Client, callback_query):
     """Handle profile setup callbacks (gender selection)."""
     await handle_profile_callback(client, callback_query)
 
-@app.on_callback_query(filters.regex(r"^tb_f_"))
+@app.on_callback_query(filters.regex(r"^tb_nav_"))
 async def tb_folder_callback_handler(client: Client, callback_query):
     """Handle TeraBox folder selection callbacks."""
+    from app.terabox.handler import handle_tb_folder_callback
     await handle_tb_folder_callback(client, callback_query)
 
 @app.on_message(filters.text & filters.private, group=1)

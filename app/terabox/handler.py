@@ -131,12 +131,13 @@ async def _collect_own_files(
     tb_client,
     remote_dir: str,
     depth: int = 0,
+    max_depth: int = 5,
 ) -> List[Dict[str, Any]]:
     """
     Recursively list files inside your own TeraBox directory (api/list).
     Handles pagination to ensure ALL files are collected.
     """
-    if depth > 5:
+    if depth > max_depth:
         return []
 
     files: List[Dict[str, Any]] = []
@@ -157,6 +158,7 @@ async def _collect_own_files(
                     tb_client,
                     remote_dir=entry.get("path", ""),
                     depth=depth + 1,
+                    max_depth=max_depth,
                 )
                 files.extend(sub)
             else:
@@ -373,48 +375,115 @@ async def _upload_terabox_file_to_backup(
 # ---------------------------------------------------------------------------
 # Folder Selection
 # ---------------------------------------------------------------------------
-import asyncio
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+# ---------------------------------------------------------------------------
+# Dynamic Folder Navigation for TeraBox temp_folder
+# ---------------------------------------------------------------------------
 
-_pending_tb_folders = {}
-
-async def ask_terabox_folder_choice(bot: Client, user_id: int, message: Message, root_items: list) -> list:
+async def navigate_temp_folder(
+    bot: Client,
+    user_id: int,
+    message: Message,
+    tb_client,
+    current_path: str,
+    depth: int = 0,
+) -> Tuple[str, str]:
     """
-    Shows an inline keyboard for folder selection if multiple folders exist in the root.
-    Returns: a list of root items to process.
+    Recursively navigate through temp_folder using inline keyboard.
+    Queries tb_client.get_remote_dir() at each level and allows user to:
+    - Drill down into subfolders
+    - Select "Fail Semasa Sahaja" (files only from current folder)
+    - Select "Muat Turun Semua" (all files including subfolders)
+    - Cancel with "Batal"
+    
+    Returns: tuple (final_target_path, collect_mode)
+        - final_target_path: path to collect files from
+        - collect_mode: "all" (recursive), "files_only" (current folder only), or "cancel"
     """
-    root_folders = [f for f in root_items if str(f.get("isdir", "0")) != "0"]
-    if len(root_folders) <= 1:
-        return root_items  # Only show picker if multiple folders exist, or fallback to all
+    if depth > 10:
+        return ("", "cancel")  # Safety limit
     
-    # Check total files (non-folders) at the root
-    root_files = [f for f in root_items if str(f.get("isdir", "0")) == "0"]
+    # Query the directory
+    try:
+        result = await tb_client.get_remote_dir(current_path, page=1)
+    except Exception as e:
+        print(f"[TeraBox] navigate_temp_folder error querying {current_path}: {e}")
+        return ("", "cancel")
     
-    future = asyncio.Future()
-    _pending_tb_folders[user_id] = future
+    if not result or result.get("errno", -1) != 0:
+        print(f"[TeraBox] get_remote_dir failed for {current_path}: errno={result.get('errno') if result else 'None'}")
+        return ("", "cancel")
     
+    entries = result.get("list", [])
+    if not entries:
+        # Empty folder — return current path with files_only mode
+        await message.reply_text("📂 Folder kosong. Memilih mode download…")
+        return (current_path, "files_only")
+    
+    # Separate folders and files
+    subfolders = [e for e in entries if str(e.get("isdir", "0")) != "0"]
+    files_here = [e for e in entries if str(e.get("isdir", "0")) == "0"]
+    
+    # Build inline keyboard
     keyboard = []
     
-    # 1. Option to only download root files
-    if root_files:
-        keyboard.append([InlineKeyboardButton(f"📄 Fail Semasa Sahaja ({len(root_files)})", callback_data=f"tb_f_root_{user_id}")])
+    # Row 1: "Fail Semasa Sahaja" (if there are files in this folder)
+    if files_here:
+        btn_text = f"📄 Fail Semasa Sahaja ({len(files_here)})"
+        keyboard.append([
+            InlineKeyboardButton(
+                btn_text,
+                callback_data=f"tb_nav_files_{user_id}_{depth}"
+            )
+        ])
     
-    # 2. Options for each folder
-    for idx, folder in enumerate(root_folders):
+    # Rows 2+: Subfolder buttons
+    for idx, folder in enumerate(subfolders):
         folder_name = folder.get("server_filename", f"Folder {idx+1}")
-        if len(folder_name) > 30:
-            folder_name = folder_name[:27] + "..."
-        keyboard.append([InlineKeyboardButton(f"📁 {folder_name}", callback_data=f"tb_f_sel_{user_id}_{idx}")])
-        
-    # 3. Option to download all
-    keyboard.append([InlineKeyboardButton("📦 Muat Turun Semua", callback_data=f"tb_f_all_{user_id}")])
+        if len(folder_name) > 25:
+            folder_name = folder_name[:22] + "…"
+        btn_text = f"📁 {folder_name}"
+        keyboard.append([
+            InlineKeyboardButton(
+                btn_text,
+                callback_data=f"tb_nav_folder_{user_id}_{depth}_{idx}"
+            )
+        ])
     
-    # 4. Cancel
-    keyboard.append([InlineKeyboardButton("❌ Batal", callback_data=f"tb_f_cancel_{user_id}")])
+    # Row N-1: "Muat Turun Semua" (all files recursive from this point)
+    keyboard.append([
+        InlineKeyboardButton(
+            "📦 Muat Turun Semua",
+            callback_data=f"tb_nav_all_{user_id}_{depth}"
+        )
+    ])
     
+    # Row N: "Batal" (cancel)
+    keyboard.append([
+        InlineKeyboardButton(
+            "❌ Batal",
+            callback_data=f"tb_nav_cancel_{user_id}_{depth}"
+        )
+    ])
+    
+    # Create future for this navigation level and store context
+    future = asyncio.Future()
+    nav_key = f"{user_id}_{depth}"
+    _pending_tb_folders[nav_key] = {
+        "future": future,
+        "current_path": current_path,
+        "subfolders": subfolders,
+        "files_here": files_here,
+        "tb_client": tb_client,
+        "bot": bot,
+        "message": message,
+        "depth": depth,
+    }
+    
+    folder_display = current_path if current_path != "/" else "📂 Root"
     prompt = await message.reply_text(
-        "📂 **Pilih fail/folder untuk dimuat turun:**\n\n"
-        "(Terdapat pelbagai folder dalam pautan ini)",
+        f"📂 **Pilih folder atau mod muat turun:**\n\n"
+        f"Lokasi: `{folder_display}`\n"
+        f"Kandungan: {len(subfolders)} subfolder, {len(files_here)} fail",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
@@ -423,44 +492,68 @@ async def ask_terabox_folder_choice(bot: Client, user_id: int, message: Message,
         await prompt.delete()
         
         if choice == "cancel":
-            return []
+            return ("", "cancel")
+        elif choice == "files":
+            return (current_path, "files_only")
         elif choice == "all":
-            return root_items
-        elif choice == "root":
-            return root_files
-        elif choice.startswith("sel_"):
-            idx = int(choice.split("_")[1])
-            return [root_folders[idx]]
+            return (current_path, "all")
+        elif choice.startswith("folder_"):
+            idx = int(choice.split("_")[-1])
+            subfolder_path = subfolders[idx].get("path", "")
+            if subfolder_path:
+                return await navigate_temp_folder(bot, user_id, message, tb_client, subfolder_path, depth + 1)
+        
+        return (current_path, "files_only")
+        
     except asyncio.TimeoutError:
-        _pending_tb_folders.pop(user_id, None)
+        _pending_tb_folders.pop(nav_key, None)
         await prompt.edit_text("❌ Pemilihan folder tamat tempoh.")
-        return []
+        return ("", "cancel")
     finally:
-        _pending_tb_folders.pop(user_id, None)
-    
-    return root_items
+        _pending_tb_folders.pop(nav_key, None)
+
 
 async def handle_tb_folder_callback(bot: Client, callback_query: CallbackQuery) -> None:
+    """Callback handler for tb_nav_ buttons."""
     user_id = callback_query.from_user.id
     cb_data = callback_query.data
     
-    future = _pending_tb_folders.get(user_id)
-    if not future or future.done():
-        await callback_query.answer("⚠️ Sesi pemilihan ini telah tamat", show_alert=True)
+    parts = cb_data.split("_")
+    if len(parts) < 4:
+        await callback_query.answer()
         return
         
-    if cb_data == f"tb_f_cancel_{user_id}":
+    action = parts[2]
+    stored_user_id = int(parts[3])
+    stored_depth = int(parts[4])
+    
+    if stored_user_id != user_id:
+        await callback_query.answer("❌ Ini bukan untuk anda", show_alert=True)
+        return
+        
+    nav_key = f"{user_id}_{stored_depth}"
+    nav_context = _pending_tb_folders.get(nav_key)
+    
+    if not nav_context:
+        await callback_query.answer("⚠️ Sesi tamat", show_alert=True)
+        return
+        
+    future = nav_context["future"]
+    if future.done():
+        return
+        
+    if action == "cancel":
         future.set_result("cancel")
         await callback_query.answer("Dibatalkan")
-    elif cb_data == f"tb_f_all_{user_id}":
+    elif action == "files":
+        future.set_result("files")
+        await callback_query.answer("Fail sahaja")
+    elif action == "all":
         future.set_result("all")
         await callback_query.answer("Semua dipilih")
-    elif cb_data == f"tb_f_root_{user_id}":
-        future.set_result("root")
-        await callback_query.answer("Fail sahaja")
-    elif cb_data.startswith(f"tb_f_sel_{user_id}_"):
-        idx = cb_data.split("_")[-1]
-        future.set_result(f"sel_{idx}")
+    elif action == "folder":
+        subfolder_idx = int(parts[5])
+        future.set_result(f"folder_{subfolder_idx}")
         await callback_query.answer("Folder dipilih")
     else:
         await callback_query.answer()
@@ -543,32 +636,19 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         from_uk = str(info.get("uk", ""))
         print(f"[TB:handler] share_id={share_id!r} from_uk={from_uk!r}")
 
-        # 3. Handle specific folder selection if multiple folders exist
+        # 3. Transfer ALL share items into a temp folder on YOUR TeraBox account first.
+        #    We do this because share/list throws errno=105, so we navigate locally.
         root_items = info.get("file_list") or info.get("list", [])
         if not root_items:
             await safe_edit(status_msg, "❌ Tiada fail dijumpai dalam link ini.")
             return
 
-        # Prompt user if there are multiple root folders
-        # Delete status msg temporarily so it doesn't look messy
-        await status_msg.delete()
-        selected_items = await ask_terabox_folder_choice(bot, user_id, message, root_items)
-        if not selected_items:
-            # User cancelled or timed out
-            active_user_processes.pop(user_id, None)
-            return
-        root_items = selected_items
-
-        # 4. Transfer selected share items into a temp folder on YOUR TeraBox account.
-        #    Inspired by TeraFetch: skip share/list (errno=105 on datacenter IPs)
-        #    and transfer root items directly, then list our own files.
-        status_msg = await message.reply_text("📁 Mencipta folder sementara…")
         temp_folder = f"/terabox_temp_{uuid.uuid4().hex[:12]}"
+        await safe_edit(status_msg, "📁 Mencipta folder sementara dan memindahkan fail…")
         cd_result = await tb.create_dir(temp_folder)
         if not cd_result or cd_result.get("errno", -1) != 0:
             await safe_edit(status_msg, 
-                "❌ Gagal mencipta folder sementara di TeraBox. "
-                f"(errno={cd_result.get('errno') if cd_result else '?'})"
+                "❌ Gagal mencipta folder sementara di TeraBox."
             )
             return
 
@@ -628,12 +708,22 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         # Give TeraBox a moment to finalise the listing
         await asyncio.sleep(1)
 
-        await safe_edit(status_msg, "📂 Mengimbas fail yang dipindahkan…")
+        # 5. Nested navigation UI
+        await status_msg.delete()
+        target_dir, collect_mode = await navigate_temp_folder(bot, user_id, message, tb, temp_folder)
+        
+        if collect_mode == "cancel":
+            active_user_processes.pop(user_id, None)
+            return
+            
+        status_msg = await message.reply_text("📂 Menyusun senarai fail…")
 
-        # Retry _collect_own_files a few times in case listing is delayed
         all_files: List[Dict[str, Any]] = []
+        # If files_only, we don't recurse. If all, we do deeply.
+        max_depth = 100 if collect_mode == "all" else 0
+        
         for list_attempt in range(5):
-            all_files = await _collect_own_files(tb, temp_folder)
+            all_files = await _collect_own_files(tb, target_dir, depth=0, max_depth=max_depth)
             print(f"[TB:handler] collected {len(all_files)} file(s) from own dir (attempt {list_attempt+1})")
             if all_files:
                 break
