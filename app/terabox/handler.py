@@ -43,7 +43,7 @@ from pyrogram.raw.types import (
     UpdateShortSentMessage,
     UpdateMessageID,
 )
-from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument
+from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 from app.config import BACKUP_GROUP_ID
 from app.database.db import log_forward, get_user_session, get_user_profile
@@ -378,6 +378,8 @@ async def _upload_terabox_file_to_backup(
 # ---------------------------------------------------------------------------
 # Dynamic Folder Navigation for TeraBox temp_folder
 # ---------------------------------------------------------------------------
+
+_pending_tb_folders = {}
 
 async def navigate_temp_folder(
     bot: Client,
