@@ -245,7 +245,7 @@ async def _upload_file_to_backup(
         is_sent_to_bot = (upload_client == user_client)
         upload_peer = bot.me.username if is_sent_to_bot else backup_peer
         
-        input_file = await upload_stream(upload_client, streamer, file_name, on_upload_chunk=on_ul)
+        input_file = await upload_stream(upload_client, streamer, file_name, on_upload_chunk=on_ul, is_premium=True)
 
         kind = _classify(file_name)
         mime_type = _mime(file_name)

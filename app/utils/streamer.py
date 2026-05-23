@@ -122,7 +122,7 @@ class MediaStreamer:
     def seek(self, offset, whence=0):
         pass # Streaming doesn't support seeking
 
-async def upload_stream(client: Client, streamer, file_name: str, on_upload_chunk=None):
+async def upload_stream(client: Client, streamer, file_name: str, on_upload_chunk=None, is_premium: bool = False):
     """
     Manually uploads a stream to Telegram using raw API calls.
     Returns an InputFile or InputFileBig.
@@ -134,15 +134,20 @@ async def upload_stream(client: Client, streamer, file_name: str, on_upload_chun
     ----------
     on_upload_chunk : callable(int) | None
         Optional callback invoked with byte count after each part is uploaded.
+    is_premium : bool
+        Whether the uploading client is a Telegram Premium user account.
+        Premium accounts can upload up to 8000 parts (4 GB with 512 KB chunks).
+        Non-premium / bot accounts are limited to 4000 parts (2 GB with 512 KB chunks).
     """
     file_id = random.randint(0, 1000000000)
     file_size = streamer.file_size
     is_big = file_size > 10 * 1024 * 1024
 
-    # Telegram limits file_total_parts to ~8000 (Premium).
+    # Telegram limits file_total_parts based on account type:
+    #   - Premium user accounts: 8000 parts max (4 GB with 512 KB chunks)
+    #   - Non-premium / bot accounts: 4000 parts max (2 GB with 512 KB chunks)
     # chunk_size is hard-capped at 512 KB — Telegram's absolute per-part limit.
-    # Using more parts (up to 8000) is always safer than exceeding the size cap.
-    MAX_PARTS = 8000
+    MAX_PARTS = 8000 if is_premium else 4000
     MAX_CHUNK = 512 * 1024   # Telegram hard limit per part — must never exceed
     MIN_CHUNK = 512 * 1024   # 512 KB — Telegram minimum for big files
     chunk_size = max(MIN_CHUNK, math.ceil(file_size / MAX_PARTS))

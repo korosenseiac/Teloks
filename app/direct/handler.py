@@ -362,9 +362,11 @@ async def _upload_file_to_backup(
     try:
         on_ul = tracker.add_uploaded if tracker else None
         
-        # Use bot session (sends directly to backup group) for files <= 2GB.
-        # Use user session (sends to bot chat, then forwards) for files > 2GB.
-        if file_size <= 2 * 1024 * 1024 * 1024:
+        # Bot (non-premium) is limited to 4000 parts × 512 KB = 2,097,152,000 bytes.
+        # User (premium) can handle up to 8000 parts × 512 KB = 4,194,304,000 bytes.
+        # Route to user_client for anything the bot can't handle.
+        BOT_MAX_UPLOAD = 4000 * 512 * 1024  # 2,097,152,000 bytes (~1.95 GiB)
+        if file_size <= BOT_MAX_UPLOAD:
             upload_client = bot
         else:
             upload_client = user_client
@@ -373,7 +375,7 @@ async def _upload_file_to_backup(
         is_sent_to_bot = (upload_client == user_client)
         upload_peer = bot.me.username if is_sent_to_bot else backup_peer
         
-        input_file = await upload_stream(upload_client, streamer, file_name, on_upload_chunk=on_ul)
+        input_file = await upload_stream(upload_client, streamer, file_name, on_upload_chunk=on_ul, is_premium=is_sent_to_bot)
         kind = _classify(file_name)
         mime_type = _mime(file_name)
 
