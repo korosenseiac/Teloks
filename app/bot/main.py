@@ -956,6 +956,223 @@ async def _process_archive_from_message(
         gc.collect()
 
 
+# Maximum number of telegram links a user can send in a single message
+MAX_LINKS_PER_MESSAGE = 50
+# Telegram media group (album) hard limit
+ALBUM_CHUNK_SIZE = 10
+
+
+async def fetch_target_msg(user_client, chat_id, msg_id, is_public_link, status_msg):
+    """Fetch a single message from a source chat, with fallbacks for public/private links.
+
+    Returns (target_msg, resolved_chat_id) on success, or (None, chat_id) on failure.
+    Updates status_msg with progress. Resolved chat_id may differ from input for private
+    links resolved via dialog scan.
+    """
+    try:
+        target_msg = await user_client.get_messages(chat_id, msg_id)
+        return target_msg, chat_id
+    except Exception as e:
+        if is_public_link:
+            try:
+                await safe_edit(status_msg, f"🔄 Resolving @{chat_id}...")
+                target_msg = await user_client.get_messages(f"@{chat_id}", msg_id)
+                return target_msg, chat_id
+            except Exception as e2:
+                print(f"DEBUG: Failed to resolve @{chat_id}: {e2}")
+                return None, chat_id
+        else:
+            await safe_edit(status_msg, f"🔄 Scanning... ({e})")
+            found_chat = None
+            debug_ids = []
+            try:
+                async for dialog in user_client.get_dialogs():
+                    d_id = dialog.chat.id
+                    if len(debug_ids) < 5:
+                        debug_ids.append(str(d_id))
+                    if d_id == chat_id:
+                        found_chat = dialog.chat
+                        break
+                    raw_id = int(str(chat_id).replace("-100", ""))
+                    if str(d_id).endswith(str(raw_id)):
+                        found_chat = dialog.chat
+                        chat_id = d_id
+                        break
+                if not found_chat:
+                    print(f"DEBUG: Chat {chat_id} not found in dialogs. First 5 IDs: {', '.join(debug_ids)}")
+                    return None, chat_id
+                target_msg = await user_client.get_messages(chat_id, msg_id)
+                return target_msg, chat_id
+            except Exception as e2:
+                print(f"DEBUG: Dialog scan failed: {e2}")
+                return None, chat_id
+
+
+def _media_type_of(target_msg):
+    """Classify a message's media into a coarse bucket used for album grouping.
+
+    Returns one of: 'photo', 'video', 'animation', 'audio', 'document',
+    'voice', 'video_note', 'sticker', or None if no media.
+    """
+    if target_msg.photo:
+        return "photo"
+    if target_msg.video:
+        return "video"
+    if target_msg.animation:
+        return "animation"
+    if target_msg.audio:
+        return "audio"
+    if target_msg.voice:
+        return "voice"
+    if target_msg.video_note:
+        return "video_note"
+    if target_msg.sticker:
+        return "sticker"
+    if target_msg.document:
+        return "document"
+    return None
+
+
+async def send_album_to_user(client, user_id, items, source_name, username, status_msg):
+    """Send a list of uploaded media items to the user as chunked albums.
+
+    `items` is a list of (file_id, media_type, file_size, metadata) tuples
+    (as returned by upload_single_media_for_group). Media is chunked into
+    groups of ALBUM_CHUNK_SIZE (10). Each chunk is uploaded to the backup
+    group as an album, then forwarded to the user as an album (with
+    copy_message fallback on FloodWait).
+
+    Returns the list of backup message ids created.
+    """
+    from pyrogram.types import (
+        InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
+    )
+
+    backup_msg_ids = []
+    if not items:
+        return backup_msg_ids
+
+    total_chunks = math.ceil(len(items) / ALBUM_CHUNK_SIZE)
+
+    for chunk_idx in range(total_chunks):
+        chunk = items[chunk_idx * ALBUM_CHUNK_SIZE:(chunk_idx + 1) * ALBUM_CHUNK_SIZE]
+
+        # Build InputMedia list using file_ids for backup group
+        backup_media_list = []
+        for file_id, media_type, _file_size, metadata in chunk:
+            if media_type == "photo":
+                backup_media_list.append(InputMediaPhoto(file_id))
+            elif media_type in ("video", "animation"):
+                backup_media_list.append(InputMediaVideo(
+                    file_id,
+                    duration=metadata.get("duration", 0),
+                    width=metadata.get("width", 0),
+                    height=metadata.get("height", 0),
+                ))
+            elif media_type == "audio":
+                backup_media_list.append(InputMediaAudio(
+                    file_id,
+                    duration=metadata.get("duration", 0),
+                    title=metadata.get("title", ""),
+                    performer=metadata.get("performer", ""),
+                ))
+            else:
+                backup_media_list.append(InputMediaDocument(file_id))
+
+        await safe_edit(
+            status_msg,
+            f"📤 Menghantar album {chunk_idx + 1}/{total_chunks}...",
+        )
+
+        # Send to backup with FloodWait handling
+        backup_msgs = None
+        try:
+            for attempt in range(3):
+                try:
+                    backup_msgs = await client.send_media_group(
+                        chat_id=BACKUP_GROUP_ID,
+                        media=backup_media_list,
+                    )
+                    break
+                except FloodWait as fw:
+                    wait = getattr(fw, "value", getattr(fw, "x", 10))
+                    if wait > 300:
+                        print(f"FloodWait too long ({wait}s) for backup send, skipping chunk...")
+                        raise
+                    print(f"FloodWait {wait}s on backup send (attempt {attempt+1}/3)")
+                    await asyncio.sleep(wait + 1)
+            if not backup_msgs:
+                raise Exception("Failed to send media group after retries")
+        except Exception as e:
+            print(f"DEBUG: Failed to send media group to backup (chunk {chunk_idx + 1}): {e}")
+            import traceback
+            traceback.print_exc()
+            continue  # skip this chunk, try the next
+
+        for backup_msg in backup_msgs:
+            backup_msg_ids.append(backup_msg.id)
+
+        # Log the album (first message id represents it)
+        total_album_size = sum(item[2] for item in chunk)
+        first_msg_id = backup_msgs[0].id
+        channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
+        backup_message_link = f"https://t.me/c/{channel_id}/{first_msg_id}"
+        try:
+            await log_forward(username, first_msg_id, total_album_size, source_name, backup_message_link)
+        except Exception as e:
+            print(f"DEBUG: log_forward failed: {e}")
+
+        # Build media list using file_ids from backup messages (no re-upload)
+        user_media_list = []
+        for backup_msg in backup_msgs:
+            if backup_msg.photo:
+                user_media_list.append(InputMediaPhoto(backup_msg.photo.file_id))
+            elif backup_msg.video:
+                user_media_list.append(InputMediaVideo(backup_msg.video.file_id))
+            elif backup_msg.audio:
+                user_media_list.append(InputMediaAudio(backup_msg.audio.file_id))
+            elif backup_msg.document:
+                user_media_list.append(InputMediaDocument(backup_msg.document.file_id))
+
+        await safe_edit(status_msg, f"⬆️ Menghantar album {chunk_idx + 1}/{total_chunks} ke anda...")
+
+        if user_media_list:
+            album_sent = False
+            for attempt in range(3):
+                try:
+                    await client.send_media_group(chat_id=user_id, media=user_media_list)
+                    album_sent = True
+                    break
+                except FloodWait as fw:
+                    wait = getattr(fw, "value", getattr(fw, "x", 10))
+                    if wait > 60:
+                        print(f"FloodWait {wait}s too long for album, using copy_message fallback...")
+                        break
+                    print(f"FloodWait {wait}s on user album (attempt {attempt+1}/3)")
+                    await asyncio.sleep(wait + 1)
+
+            # Fallback: copy messages individually if album send failed
+            if not album_sent:
+                for backup_msg in backup_msgs:
+                    for copy_attempt in range(3):
+                        try:
+                            await client.copy_message(
+                                chat_id=user_id,
+                                from_chat_id=BACKUP_GROUP_ID,
+                                message_id=backup_msg.id,
+                            )
+                            break
+                        except FloodWait as fw:
+                            wait = getattr(fw, "value", getattr(fw, "x", 10))
+                            if wait > 300:
+                                print(f"FloodWait {wait}s too long for copy, skipping...")
+                                break
+                            await asyncio.sleep(wait + 1)
+                    await asyncio.sleep(0.5)
+
+    return backup_msg_ids
+
+
 @app.on_message(filters.regex(LINK_PATTERN) & filters.private)
 async def link_handler(client: Client, message: Message):
     user_id = message.from_user.id
@@ -995,27 +1212,30 @@ async def link_handler(client: Client, message: Message):
         }
         return
     
-    match = LINK_PATTERN.search(message.text)
-    if not match:
+    # --- Phase 1: Parse all telegram links in the message (one per line supported) ---
+    all_matches = LINK_PATTERN.findall(message.text)
+    if not all_matches:
         return
 
-    # Determine chat_id based on link type
-    if match.group(1):
-        # Private channel link: t.me/c/<channel_id>/<msg_id>
-        chat_id = int("-100" + match.group(1))
-        is_public_link = False
-        print(f"DEBUG: Private Link ID: {match.group(1)} -> Chat ID: {chat_id}")
-    else:
-        # Public channel/group link: t.me/<username>/<msg_id>
-        chat_id = match.group(2)  # Use username string directly
-        is_public_link = True
-        print(f"DEBUG: Public Link Username: @{chat_id}")
-    msg_id = int(match.group(3))
+    # Deduplicate links preserving order (by the full matched tuple)
+    seen = set()
+    unique_links = []
+    for m in all_matches:
+        key = (m[0], m[1], m[2])
+        if key not in seen:
+            seen.add(key)
+            unique_links.append(m)
 
-    print(f"DEBUG: Message ID: {msg_id}")
-    print(f"DEBUG: Backup Group ID: {BACKUP_GROUP_ID}")
+    if len(unique_links) > MAX_LINKS_PER_MESSAGE:
+        await message.reply_text(
+            f"❌ **Terlalu banyak link!**\n\n"
+            f"Link dihantar: {len(unique_links)}\n"
+            f"Maksimum: {MAX_LINKS_PER_MESSAGE} link per mesej.\n\n"
+            f"Sila kurangkan jumlah link dan cuba lagi."
+        )
+        return
 
-    # Mark user as having an active process
+    # Mark user as having an active process (one lock for the whole batch)
     active_user_processes[user_id] = asyncio.current_task()
     reset_cancel(user_id)
 
@@ -1029,309 +1249,191 @@ async def link_handler(client: Client, message: Message):
         return
 
     try:
-        # 2. Fetch Message using User Client
-        try:
-            target_msg = await user_client.get_messages(chat_id, msg_id)
-        except Exception as e:
-            if is_public_link:
-                # For public links, try resolving with @ prefix
-                try:
-                    await safe_edit(status_msg, f"🔄 Resolving @{chat_id}...")
-                    target_msg = await user_client.get_messages(f"@{chat_id}", msg_id)
-                except Exception as e2:
-                    await safe_edit(status_msg, f"❌ Tidak dapat akses @{chat_id}: {e2}")
-                    return
-            else:
-                await safe_edit(status_msg, f"🔄 Scanning... ({e})")
-                
-                found_chat = None
-                debug_ids = []
-                try:
-                    async for dialog in user_client.get_dialogs():
-                        d_id = dialog.chat.id
-                        if len(debug_ids) < 5:
-                            debug_ids.append(str(d_id))
-                        
-                        # Check exact match
-                        if d_id == chat_id:
-                            found_chat = dialog.chat
-                            break
-                        
-                        # Check loose match (if ID format differs)
-                        # e.g. if d_id is -100123 and raw_id is 123
-                        raw_id = int(str(chat_id).replace("-100", ""))
-                        if str(d_id).endswith(str(raw_id)):
-                            found_chat = dialog.chat
-                            chat_id = d_id # Update chat_id to the one found
-                            break
-                    
-                    if not found_chat:
-                        ids_sample = ", ".join(debug_ids)
-                        await safe_edit(status_msg, f"❌ Chat {chat_id} tidak dijumpai. First 5 IDs: {ids_sample}")
-                        return
+        # --- Phase 2: Fetch & collect media from all links ---
+        collected_messages = []   # list of source Message objects to upload
+        skipped_archives = []      # list of file names skipped because they are archives
+        fetch_errors = []          # list of human-readable error strings
+        seen_msg_ids = set()       # dedup by (chat_id, msg_id) to avoid double-counting album media
 
-                    # Try again with the found chat_id
-                    target_msg = await user_client.get_messages(chat_id, msg_id)
-                except Exception as e2:
-                    await safe_edit(status_msg, f"❌ Error: {e2}")
-                    return
-        
-        if not target_msg or not target_msg.media:
-            await safe_edit(status_msg, "❌ Bukan media/file.")
-            return
-
-        # Get source chat name
-        source_name = target_msg.chat.title if target_msg.chat and target_msg.chat.title else "Unknown"
-
-        # Check if target is an archive file - extract and send media
-        if target_msg.document:
-            doc = target_msg.document
-            doc_name = getattr(doc, "file_name", "") or ""
-            if is_archive(doc_name):
-                # Check if user wants to skip photos (only videos)
-                skip_non_videos = "/skip" in message.text.lower()
-
-                # Get backup group peer
-                backup_peer = await get_backup_group_peer(client)
-                if not backup_peer:
-                    await safe_edit(status_msg, "❌ Backup group tidak dijumpai.")
-                    return
-
-                await _process_archive_from_message(
-                    bot=client,
-                    user_client=user_client,
-                    target_msg=target_msg,
-                    message=message,
-                    status_msg=status_msg,
-                    user_id=user_id,
-                    source_name=source_name,
-                    backup_peer=backup_peer,
-                    skip_non_videos=skip_non_videos,
-                )
+        total_links = len(unique_links)
+        for link_idx, match in enumerate(unique_links, 1):
+            if is_cancelled(user_id):
+                await safe_edit(status_msg, "🚫 **Proses dibatalkan!**")
                 return
 
-        # Check if this message is part of a media group (album)
-        messages_to_process = []
-        if target_msg.media_group_id:
-            await safe_edit(status_msg, "📂 Detected media group, memproses semua files...")
-            # Fetch all messages in the media group
-            media_group_msgs = await user_client.get_media_group(chat_id, msg_id)
-            messages_to_process = media_group_msgs
-            print(f"DEBUG: Memproses {len(messages_to_process)} files")
-        else:
-            messages_to_process = [target_msg]
+            # Determine chat_id based on link type
+            if match[0]:
+                # Private channel link: t.me/c/<channel_id>/<msg_id>
+                chat_id = int("-100" + match[0])
+                is_public_link = False
+            else:
+                # Public channel/group link: t.me/<username>/<msg_id>
+                chat_id = match[1]
+                is_public_link = True
+            msg_id = int(match[2])
 
-        # Check file size limit for all files before processing
+            await safe_edit(status_msg, f"🔄 Memproses link {link_idx}/{total_links}...")
+
+            target_msg, resolved_chat_id = await fetch_target_msg(
+                user_client, chat_id, msg_id, is_public_link, status_msg
+            )
+
+            if not target_msg or not target_msg.media:
+                fetch_errors.append(f"Link {link_idx}: bukan media/file")
+                continue
+
+            # Skip archive files in multi-link mode (user must send archives separately)
+            if target_msg.document:
+                doc_name = getattr(target_msg.document, "file_name", "") or ""
+                if is_archive(doc_name):
+                    skipped_archives.append(f"Link {link_idx}: {doc_name}")
+                    continue
+
+            # Expand media groups (albums) so all media in a source album is collected
+            if target_msg.media_group_id:
+                try:
+                    media_group_msgs = await user_client.get_media_group(resolved_chat_id, msg_id)
+                except Exception as e:
+                    print(f"DEBUG: get_media_group failed for link {link_idx}: {e}")
+                    fetch_errors.append(f"Link {link_idx}: gagal dapat media group ({e})")
+                    continue
+                for mg_msg in media_group_msgs:
+                    key = (resolved_chat_id, mg_msg.id)
+                    if key not in seen_msg_ids:
+                        seen_msg_ids.add(key)
+                        collected_messages.append(mg_msg)
+            else:
+                key = (resolved_chat_id, target_msg.id)
+                if key not in seen_msg_ids:
+                    seen_msg_ids.add(key)
+                    collected_messages.append(target_msg)
+
+        # If nothing collectable, summarize and stop
+        if not collected_messages:
+            summary = "❌ **Tiada media berjaya dikumpul.**\n"
+            if skipped_archives:
+                summary += "\n📂 **Arkib dilangkau (hantar secara berasingan):**\n"
+                summary += "\n".join(f"  • {s}" for s in skipped_archives)
+            if fetch_errors:
+                summary += "\n\n⚠️ **Ralat:**\n"
+                summary += "\n".join(f"  • {e}" for e in fetch_errors)
+            await safe_edit(status_msg, summary)
+            return
+
+        # --- Phase 3: Validate file sizes (batch) ---
         oversized_files = []
-        for msg in messages_to_process:
+        for msg in collected_messages:
             file_size = get_media_file_size(msg)
             if file_size > MAX_FILE_SIZE:
-                media_obj = (msg.document or msg.video or msg.audio or 
+                media_obj = (msg.document or msg.video or msg.audio or
                              msg.photo or msg.voice or msg.video_note or
                              msg.animation or msg.sticker)
                 file_name = getattr(media_obj, "file_name", None) or "file"
                 oversized_files.append((file_name, file_size))
-        
+
         if oversized_files:
-            error_msg = "❌ **File melebihi had saiz (600MB)!**\n\n"
+            error_msg = "❌ **File melebihi had saiz!**\n\n"
             for fname, fsize in oversized_files:
                 error_msg += f"📁 `{fname}`: {format_file_size(fsize)}\n"
-            error_msg += f"\n⚠️ Had maksimum: 600MB"
+            error_msg += f"\n⚠️ Had maksimum: {format_file_size(MAX_FILE_SIZE)}"
             await safe_edit(status_msg, error_msg)
             return
 
-        total_files = len(messages_to_process)
-        backup_msg_ids = []
-        
-        # Check if this is a media group that should be sent together
-        is_media_group = target_msg.media_group_id is not None and len(messages_to_process) > 1
+        # Use the first collected message's chat title as the source name for logging
+        first_msg = collected_messages[0]
+        source_name = (first_msg.chat.title if first_msg.chat and first_msg.chat.title
+                       else "Unknown")
+        username = message.from_user.username
 
-        if is_media_group:
-            # Process as media group - upload all files and send as album to both backup and user
-            from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
-            
-            uploaded_media = []  # List of (file_id, media_type, file_size, metadata)
-            
-            for idx, msg_to_process in enumerate(messages_to_process, 1):
-                # Check for cancellation
-                if is_cancelled(user_id):
-                    await safe_edit(status_msg, "🚫 **Proses dibatalkan!**")
-                    return
+        # --- Phase 4: Upload all media ---
+        # uploaded_media: list of (file_id, media_type, file_size, metadata) for album-able types
+        uploaded_media = []
+        # others_backup_ids: list of backup message ids for non-album-able types
+        # (voice/video_note/sticker) sent via process_single_media + copy_message
+        others_backup_ids = []
+        total_files = len(collected_messages)
 
+        for idx, msg_to_process in enumerate(collected_messages, 1):
+            if is_cancelled(user_id):
+                await safe_edit(status_msg, "🚫 **Proses dibatalkan!**")
+                return
+
+            # Throttle status edits to avoid FloodWait on large batches
+            if idx == 1 or idx == total_files or idx % 5 == 0:
                 await safe_edit(status_msg, f"⬇️ Memuat naik {idx}/{total_files}...")
-                
-                # Upload each file and get file_id
-                result = await upload_single_media_for_group(
-                    client, user_client, msg_to_process, idx, total_files
-                )
-                
-                if result:
-                    uploaded_media.append(result)
-            
-            if not uploaded_media:
-                await safe_edit(status_msg, "❌ Gagal memproses media/file.")
-                return
-            
-            # Build InputMedia list using file_ids
-            backup_media_list = []
-            for file_id, media_type, file_size, metadata in uploaded_media:
-                if media_type == "photo":
-                    backup_media_list.append(InputMediaPhoto(file_id))
-                elif media_type == "video":
-                    backup_media_list.append(InputMediaVideo(
-                        file_id,
-                        duration=metadata.get("duration", 0),
-                        width=metadata.get("width", 0),
-                        height=metadata.get("height", 0)
-                    ))
-                elif media_type == "audio":
-                    backup_media_list.append(InputMediaAudio(
-                        file_id,
-                        duration=metadata.get("duration", 0),
-                        title=metadata.get("title", ""),
-                        performer=metadata.get("performer", "")
-                    ))
-                else:
-                    backup_media_list.append(InputMediaDocument(file_id))
-            
-            # Send as media group to backup group
-            await safe_edit(status_msg, f"📤 ...")
 
-            try:
-                # Send to backup with FloodWait handling
-                backup_msgs = None
-                for attempt in range(3):
-                    try:
-                        backup_msgs = await client.send_media_group(
-                            chat_id=BACKUP_GROUP_ID,
-                            media=backup_media_list
-                        )
-                        break
-                    except FloodWait as fw:
-                        wait = getattr(fw, "value", getattr(fw, "x", 10))
-                        if wait > 300:  # Skip if wait > 5 minutes
-                            print(f"FloodWait too long ({wait}s) for backup send, skipping...")
-                            raise
-                        print(f"FloodWait {wait}s on backup send (attempt {attempt+1}/3)")
-                        await asyncio.sleep(wait + 1)
+            media_type = _media_type_of(msg_to_process)
 
-                if not backup_msgs:
-                    raise Exception("Failed to send media group after retries")
-                
-                # Collect all message IDs
-                for backup_msg in backup_msgs:
-                    backup_msg_ids.append(backup_msg.id)
-                
-                # Log only the first message ID (represents the album)
-                # Calculate total file size for the album
-                total_album_size = sum(item[2] for item in uploaded_media)
-                first_msg_id = backup_msgs[0].id
-                channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
-                backup_message_link = f"https://t.me/c/{channel_id}/{first_msg_id}"
-                await log_forward(message.from_user.username, first_msg_id, total_album_size, source_name, backup_message_link)
-                
-                # Forward as album to user
-                await safe_edit(status_msg, f"⬆️ Menghantar album ke anda...")
-
-                # Build media list using file_ids from backup messages (no re-upload)
-                user_media_list = []
-                for backup_msg in backup_msgs:
-                    if backup_msg.photo:
-                        user_media_list.append(InputMediaPhoto(backup_msg.photo.file_id))
-                    elif backup_msg.video:
-                        user_media_list.append(InputMediaVideo(backup_msg.video.file_id))
-                    elif backup_msg.audio:
-                        user_media_list.append(InputMediaAudio(backup_msg.audio.file_id))
-                    elif backup_msg.document:
-                        user_media_list.append(InputMediaDocument(backup_msg.document.file_id))
-
-                # Try send_media_group first (preserves album), fallback to copy_message
-                if user_media_list:
-                    album_sent = False
-                    for attempt in range(3):
-                        try:
-                            await client.send_media_group(chat_id=user_id, media=user_media_list)
-                            album_sent = True
-                            break
-                        except FloodWait as fw:
-                            wait = getattr(fw, "value", getattr(fw, "x", 10))
-                            if wait > 60:  # If wait > 1 minute, fall back to copy_message
-                                print(f"FloodWait {wait}s too long for album, using copy_message fallback...")
-                                break
-                            print(f"FloodWait {wait}s on user album (attempt {attempt+1}/3)")
-                            await asyncio.sleep(wait + 1)
-
-                    # Fallback: copy messages individually if album send failed
-                    if not album_sent:
-                        for backup_msg in backup_msgs:
-                            for copy_attempt in range(3):
-                                try:
-                                    await client.copy_message(
-                                        chat_id=user_id,
-                                        from_chat_id=BACKUP_GROUP_ID,
-                                        message_id=backup_msg.id
-                                    )
-                                    break
-                                except FloodWait as fw:
-                                    wait = getattr(fw, "value", getattr(fw, "x", 10))
-                                    if wait > 300:
-                                        print(f"FloodWait {wait}s too long for copy, skipping...")
-                                        break
-                                    await asyncio.sleep(wait + 1)
-                            await asyncio.sleep(0.5)
-                    
-            except Exception as e:
-                print(f"DEBUG: Failed to send media group to backup: {e}")
-                import traceback
-                traceback.print_exc()
-                await safe_edit(status_msg, f"❌ Gagal menghantar album: {e}")
-                return
-        else:
-            # Process single file individually
-            for idx, msg_to_process in enumerate(messages_to_process, 1):
-                # Check for cancellation
-                if is_cancelled(user_id):
-                    await safe_edit(status_msg, "🚫 **Proses dibatalkan!**")
-                    return
-
-                await safe_edit(status_msg, f"⬇️ Memproses {idx}/{total_files}...")
-                
-                # Process single media file
+            # "Others" types don't have a clean InputMedia* album wrapper in the
+            # existing code path; route them through process_single_media which
+            # keeps the backup message, then copy_message to the user.
+            if media_type in ("voice", "video_note", "sticker"):
                 backup_msg_id, file_name, file_size = await process_single_media(
                     client, user_client, msg_to_process, message, status_msg, idx, total_files
                 )
-                
                 if backup_msg_id:
-                    backup_msg_ids.append(backup_msg_id)
-                    # Construct backup message link
+                    others_backup_ids.append(backup_msg_id)
                     channel_id = str(BACKUP_GROUP_ID).replace("-100", "")
                     backup_message_link = f"https://t.me/c/{channel_id}/{backup_msg_id}"
-                    # Log each file
-                    await log_forward(message.from_user.username, backup_msg_id, file_size, source_name, backup_message_link)
+                    try:
+                        await log_forward(username, backup_msg_id, file_size, source_name, backup_message_link)
+                    except Exception as e:
+                        print(f"DEBUG: log_forward failed: {e}")
+                continue
 
-            if not backup_msg_ids:
-                await safe_edit(status_msg, "❌ Gagal memproses media/file.")
-                return
+            # Album-able types: upload and keep only the file_id
+            result = await upload_single_media_for_group(
+                client, user_client, msg_to_process, idx, total_files
+            )
+            if result:
+                uploaded_media.append(result)
 
-            # Forward individual messages to user
-            await safe_edit(status_msg, f"⬆️ Mengirim {len(backup_msg_ids)} file(s) ke Anda...")
-            for backup_msg_id in backup_msg_ids:
+        if not uploaded_media and not others_backup_ids:
+            await safe_edit(status_msg, "❌ Gagal memproses media/file.")
+            return
+
+        # --- Phase 5: Group by type & send as chunked albums ---
+        # Bucket album-able media by type so each album is homogeneous
+        # (Telegram cannot mix photos and documents in one album).
+        visual_items = [m for m in uploaded_media if m[1] in ("photo", "video", "animation")]
+        audio_items = [m for m in uploaded_media if m[1] == "audio"]
+        document_items = [m for m in uploaded_media if m[1] == "document"]
+
+        if visual_items:
+            await send_album_to_user(client, user_id, visual_items, source_name, username, status_msg)
+        if audio_items:
+            await send_album_to_user(client, user_id, audio_items, source_name, username, status_msg)
+        if document_items:
+            await send_album_to_user(client, user_id, document_items, source_name, username, status_msg)
+
+        # Send "others" (voice/video_note/sticker) individually via copy_message
+        if others_backup_ids:
+            await safe_edit(status_msg, f"⬆️ Mengirim {len(others_backup_ids)} file(s) ke Anda...")
+            for backup_msg_id in others_backup_ids:
                 try:
                     await client.copy_message(
                         chat_id=user_id,
                         from_chat_id=BACKUP_GROUP_ID,
                         message_id=backup_msg_id,
-                        caption=""
+                        caption="",
                     )
                 except Exception as e:
                     print(f"DEBUG: Failed to copy message {backup_msg_id}: {e}")
-        
-        await status_msg.delete()
+
+        # --- Phase 6: Finalize ---
+        total_media = len(uploaded_media) + len(others_backup_ids)
+        total_size = sum(m[2] for m in uploaded_media)
+        summary = f"✅ **Selesai!**\n\n📁 Media: {total_media}\n📦 Jumlah: {format_file_size(total_size)}"
+        if skipped_archives:
+            summary += f"\n\n📂 Arkib dilangkau: {len(skipped_archives)}"
+        if fetch_errors:
+            summary += f"\n⚠️ Ralat: {len(fetch_errors)}"
+        await safe_edit(status_msg, summary)
 
     except asyncio.CancelledError:
         print(f"[Main] Process cancelled by user {user_id}")
     except Exception as e:
-        await safe_edit(status_msg, f"....")
+        await safe_edit(status_msg, f"❌ {e}")
         import traceback
         traceback.print_exc()
     finally:
