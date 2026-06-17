@@ -1122,15 +1122,25 @@ async def send_album_to_user(client, user_id, items, source_name, username, stat
         except Exception as e:
             print(f"DEBUG: log_forward failed: {e}")
 
-        # Build media list using file_ids from backup messages (no re-upload)
+        # Build media list using file_ids from backup messages (no re-upload).
+        # Preserve video duration/dimensions so Telegram renders the album
+        # preview (including thumbnail) correctly.
         user_media_list = []
         for backup_msg in backup_msgs:
             if backup_msg.photo:
                 user_media_list.append(InputMediaPhoto(backup_msg.photo.file_id))
             elif backup_msg.video:
-                user_media_list.append(InputMediaVideo(backup_msg.video.file_id))
+                user_media_list.append(InputMediaVideo(
+                    backup_msg.video.file_id,
+                    duration=backup_msg.video.duration or 0,
+                    width=backup_msg.video.width or 0,
+                    height=backup_msg.video.height or 0,
+                ))
             elif backup_msg.audio:
-                user_media_list.append(InputMediaAudio(backup_msg.audio.file_id))
+                user_media_list.append(InputMediaAudio(
+                    backup_msg.audio.file_id,
+                    duration=backup_msg.audio.duration or 0,
+                ))
             elif backup_msg.document:
                 user_media_list.append(InputMediaDocument(backup_msg.document.file_id))
 
@@ -1442,6 +1452,84 @@ async def link_handler(client: Client, message: Message):
         reset_cancel(user_id)
 
 
+async def _generate_video_thumbnail(media_source):
+    """Generate a JPEG thumbnail from a video file using ffmpeg.
+
+    `media_source` may be a file path (str) or a BytesIO. Returns a rewound
+    BytesIO containing the JPEG thumbnail, or None if generation fails (e.g.
+    ffmpeg not installed or not a real video file). Runs ffmpeg in a thread
+    to avoid blocking the event loop.
+    """
+    import shutil as _shutil
+    from io import BytesIO as _BytesIO
+    import tempfile as _tempfile
+    import os as _os
+
+    if _shutil.which("ffmpeg") is None:
+        return None
+
+    temp_dir = None
+    temp_input = None
+    temp_output = None
+    is_path = isinstance(media_source, str)
+
+    try:
+        temp_dir = _tempfile.mkdtemp(prefix="thumb_")
+        if is_path:
+            temp_input = media_source
+        else:
+            # BytesIO: write to a temp file so ffmpeg can read it
+            temp_input = _os.path.join(temp_dir, "input.bin")
+            media_source.seek(0)
+            with open(temp_input, "wb") as f:
+                f.write(media_source.read())
+
+        temp_output = _os.path.join(temp_dir, "thumb.jpg")
+
+        # Extract a frame at ~1 second (or start if video is shorter).
+        cmd = [
+            "ffmpeg", "-y", "-ss", "1", "-i", temp_input,
+            "-frames:v", "1", "-vf", "scale=320:-1",
+            "-q:v", "4", temp_output,
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return None
+
+        if proc.returncode != 0 or not _os.path.exists(temp_output):
+            return None
+
+        with open(temp_output, "rb") as f:
+            thumb_bytes = f.read()
+
+        if not thumb_bytes:
+            return None
+
+        buf = _BytesIO(thumb_bytes)
+        buf.name = "thumb.jpg"
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        print(f"DEBUG: _generate_video_thumbnail error: {e}")
+        return None
+    finally:
+        if temp_dir and _os.path.exists(temp_dir) and not is_path:
+            try:
+                import shutil as _s
+                _s.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
 async def upload_single_media_for_group(client: Client, user_client: Client, target_msg: Message,
                                          current_idx: int, total_count: int):
     """Upload a single media file to Telegram and return file_id with media type info.
@@ -1496,10 +1584,25 @@ async def upload_single_media_for_group(client: Client, user_client: Client, tar
                         thumb_data = await user_client.download_media(
                             video.thumbs[0].file_id, in_memory=True
                         )
+                        # CRITICAL: rewind the BytesIO before passing to send_video,
+                        # otherwise Pyrogram reads from EOF and the thumbnail is
+                        # empty/invalid -> Telegram shows a black thumbnail.
+                        if thumb_data is not None and hasattr(thumb_data, "seek"):
+                            thumb_data.seek(0)
                 except Exception as e:
                     print(f"DEBUG: Failed to download video thumbnail: {e}")
                     thumb_data = None
-                
+
+                # If the source video has no thumbnail, try to generate one from
+                # the downloaded file using ffmpeg. Without this, some videos end
+                # up with a black thumbnail in the final album.
+                if thumb_data is None and media_source is not None:
+                    try:
+                        thumb_data = await _generate_video_thumbnail(media_source)
+                    except Exception as e:
+                        print(f"DEBUG: Failed to generate video thumbnail: {e}")
+                        thumb_data = None
+
                 sent_msg = await client.send_video(
                     BACKUP_GROUP_ID, 
                     video=media_source,
