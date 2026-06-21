@@ -7,6 +7,9 @@ from pyrogram.file_id import FileId, PHOTO_TYPES
 from pyrogram.raw.functions.upload import GetFile, SaveFilePart, SaveBigFilePart
 from pyrogram.raw.types import InputFileLocation, InputFile, InputFileBig, InputDocumentFileLocation, InputPhotoFileLocation
 
+# Re-export so handlers can import SessionInvalidError from a single place.
+from app.bot.session_manager import is_session_invalid_error, SessionInvalidError  # noqa: E402,F401
+
 class MediaStreamer:
     """
     A custom file-like object that bridges the gap between 
@@ -200,6 +203,19 @@ async def upload_stream(client: Client, streamer, file_name: str, on_upload_chun
                         raise  # Re-raise to abort entire upload
                     print(f"FloodWait {wait}s on part {part_idx} (attempt {attempt+1}/3)")
                     await asyncio.sleep(wait + 1)
+                except Exception as e:
+                    # A dead/revoked session cannot be recovered by retrying.
+                    # Surface a dedicated error so handlers can invalidate the
+                    # session and tell the user to re-login instead of looping.
+                    if is_session_invalid_error(e):
+                        print(f"[Upload] Session invalid on part {part_idx}: {e}")
+                        raise SessionInvalidError(str(e)) from e
+                    # Other errors: retry up to 3 times.
+                    if attempt < 2:
+                        print(f"[Upload] Error on part {part_idx} (attempt {attempt+1}/3): {e}")
+                        await asyncio.sleep(2)
+                    else:
+                        raise
 
     # --- Read & upload loop --------------------------------------------------
     part_count = 0

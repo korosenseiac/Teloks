@@ -51,7 +51,7 @@ from pyrogram.types import (
 
 from app.config import BACKUP_GROUP_ID, TORRENT_MAX_SIZE
 from app.database.db import log_forward, get_user_session, get_user_profile
-from app.utils.streamer import upload_stream
+from app.utils.streamer import upload_stream, SessionInvalidError
 from app.utils.media import (
     PHOTO_EXTS, VIDEO_EXTS, AUDIO_EXTS,
     MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM,
@@ -359,6 +359,17 @@ async def _upload_file_to_backup(
             print(f"[Torrent] Fallback search failed: {fb_err}")
 
         return None, False
+    except SessionInvalidError as e:
+        # The user_client's session is dead (revoked/deactivated/etc).
+        # Invalidate the cached client + DB session and re-raise so the
+        # outer handler can tell the user to re-login. Do NOT retry here.
+        print(f"[Torrent] Session invalid during upload ({file_name}): {e}")
+        if user_client is not None:
+            for uid, cached in manager.clients.items():
+                if cached is user_client:
+                    await manager.invalidate(uid)
+                    break
+        raise
     except Exception as e:
         print(f"[Torrent] _upload_file_to_backup error ({file_name}): {e}")
         import traceback
@@ -691,6 +702,13 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
             pass
     except asyncio.CancelledError:
         print(f"[Torrent] Handler cancelled for user {user_id}")
+    except SessionInvalidError as e:
+        # Session already invalidated inside _upload_file_to_backup.
+        print(f"[Torrent] Session invalid for user {user_id}: {e}")
+        try:
+            await status_msg.edit("❌ Sesi anda telah tamat. Sila /start dan login semula.")
+        except Exception:
+            pass
     except Exception as e:
         print(f"[Torrent] Handler error: {e}")
         import traceback
@@ -784,6 +802,13 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
             pass
     except asyncio.CancelledError:
         print(f"[Torrent] Handler cancelled for user {user_id}")
+    except SessionInvalidError as e:
+        # Session already invalidated inside _upload_file_to_backup.
+        print(f"[Torrent] Session invalid for user {user_id}: {e}")
+        try:
+            await status_msg.edit("❌ Sesi anda telah tamat. Sila /start dan login semula.")
+        except Exception:
+            pass
     except Exception as e:
         print(f"[Torrent] Handler error: {e}")
         import traceback

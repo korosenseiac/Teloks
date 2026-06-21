@@ -46,7 +46,7 @@ from app.database.db import (
     log_forward,
 )
 from app.bot.session_manager import manager
-from app.utils.streamer import upload_stream
+from app.utils.streamer import upload_stream, SessionInvalidError
 from app.utils.media import (
     classify as _classify,
     mime as _mime,
@@ -501,6 +501,22 @@ async def _upload_file_to_backup(
             print(f"[DirectLink] Fallback search failed: {e}")
 
         return None, False
+    except SessionInvalidError as e:
+        # The user_client's session is dead (revoked/deactivated/etc).
+        # Invalidate the cached client + DB session and re-raise so the
+        # outer handler can tell the user to re-login. Do NOT retry here —
+        # retrying with the same dead key is pointless.
+        print(f"[DirectLink] Session invalid during upload: {e}")
+        # user_client may be None when this function was called for the
+        # bot-client path (archive photo batches pass user_client=None).
+        # In that case there is nothing to invalidate here.
+        if user_client is not None:
+            # Find the user_id owning this client by scanning the cache.
+            for uid, cached in manager.clients.items():
+                if cached is user_client:
+                    await manager.invalidate(uid)
+                    break
+        raise
     except Exception as e:
         print(f"[DirectLink] Upload error: {e}")
         import traceback
@@ -1377,6 +1393,15 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             await tracker.stop("❌ Dibatalkan oleh pengguna.")
         else:
             await safe_edit(status_msg, "❌ Dibatalkan oleh pengguna.")
+    except SessionInvalidError as e:
+        # The user's saved session is dead (revoked/deactivated/etc).
+        # The session has already been invalidated inside _upload_file_to_backup.
+        # Tell the user to re-login and abort — do NOT retry.
+        print(f"[DirectLink] Session invalid for user {user_id}: {e}")
+        if tracker:
+            await tracker.stop("❌ Sesi anda telah tamat. Sila /start dan login semula.")
+        else:
+            await safe_edit(status_msg, "❌ Sesi anda telah tamat. Sila /start dan login semula.")
     except Exception as e:
         print(f"[DirectLink] Handler error: {e}")
         import traceback

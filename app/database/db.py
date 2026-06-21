@@ -70,6 +70,10 @@ async def save_user_session(user_id, session_string, api_id, api_hash):
 async def get_user_session(user_id):
     return await sessions_collection.find_one({"user_id": user_id})
 
+async def delete_user_session(user_id):
+    """Delete a user's session (used when the session is revoked/dead)."""
+    await sessions_collection.delete_one({"user_id": user_id})
+
 async def log_forward(username, backup_msg_id, file_size, source_name, backup_message_link):
     # Convert file_size to MB format
     file_size_mb = round(file_size / (1024 * 1024), 2) if file_size else 0
