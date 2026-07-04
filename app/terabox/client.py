@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import ssl
+import time
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
@@ -96,6 +98,8 @@ class TeraBoxClient:
         self._randsk: str = ""
         # Domain that actually served the share data (after redirects)
         self._share_domain: str = ""
+        # All domains seen during share page scraping (for fallback)
+        self._scrape_seen_domains: List[str] = []
         # Share auth tokens from shorturlinfo (needed for share/list)
         self._share_uk: str = ""
         self._share_id: str = ""
@@ -103,6 +107,12 @@ class TeraBoxClient:
         self._share_timestamp: str = ""
 
     # ---------------------------------------------------------------- helpers
+
+    BROWSER_UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
 
     @property
     def _headers(self) -> Dict[str, str]:
@@ -112,6 +122,12 @@ class TeraBoxClient:
             "Referer": self.domain + "/",
             "Accept-Encoding": "identity",
         }
+
+    def _generate_logid(self) -> str:
+        """Generate a logid similar to the TeraBox web client."""
+        ts = str(int(time.time() * 1000))
+        raw = f"{ts}{self.ndus_token[:8]}"
+        return hashlib.md5(raw.encode()).hexdigest().upper()
 
     def _session_for(self, restricted: bool = False) -> aiohttp.ClientSession:
         """Return a fresh one-shot session (each call creates a new one)."""
@@ -558,6 +574,8 @@ class TeraBoxClient:
 
                 # Collect redirect-target domains seen during page visits
                 seen_domains: list[str] = []
+                # Also store on the client for later use by share_transfer
+                self._scrape_seen_domains = []
 
                 for url, ua, desc in endpoints:
                     print(f"[TB]   try {desc} → GET {url}")
@@ -572,6 +590,7 @@ class TeraBoxClient:
                             resp_domain = f"{resp.url.scheme}://{resp.url.host}"
                             if resp_domain not in seen_domains:
                                 seen_domains.append(resp_domain)
+                                self._scrape_seen_domains.append(resp_domain)
                             print(
                                 f"[TB]   {desc} ← HTTP {resp.status} | len={len(html)} "
                                 f"| final={resp.url}"
@@ -942,21 +961,46 @@ class TeraBoxClient:
         """
         Copy shared files into *your* TeraBox account at dest_path.
 
-        Strategy: try the **account domain** first (dm.terabox.com) where our
-        jsToken / bdstoken are valid.  If that returns errno=-6 (auth fail),
-        fall back to the **share domain** with a merged cookie header.
+        Strategy: try the **share domain** first (where share cookies/session
+        are valid), then the account domain, then any other domains seen
+        during scraping.  Always merge share-session cookies into the request.
         """
         decoded_sekey = urllib.parse.unquote(self._randsk) if self._randsk else ""
 
-        # Domains to try: account domain first, then share domain (if different)
-        domains_to_try = [self.domain]
-        if self._share_domain and self._share_domain != self.domain:
+        # Build domain list: share domain first, then account domain, then
+        # any additional domains observed during the scrape redirect chain.
+        domains_to_try: List[str] = []
+        if self._share_domain:
             domains_to_try.append(self._share_domain)
+        if self.domain not in domains_to_try:
+            domains_to_try.append(self.domain)
+        # Add scrape-seen domains as additional fallbacks
+        for sd in getattr(self, "_scrape_seen_domains", []):
+            if sd not in domains_to_try:
+                domains_to_try.append(sd)
+
+        # Ensure we always have the account domain
+        if not domains_to_try:
+            domains_to_try = [self.domain]
+
+        print(f"[TB] share_transfer → domains_to_try: {domains_to_try}")
 
         for domain_idx, transfer_domain in enumerate(domains_to_try):
             for attempt in range(2):
-                if not self.js_token or not self.bds_token:
+                # Fetch jsToken/bdsToken for the TRANSFER domain specifically
+                if transfer_domain != self.domain or not self.js_token or not self.bds_token or attempt > 0:
+                    saved_domain = self.domain
+                    self.domain = transfer_domain
                     await self.update_app_data()
+                    transfer_js_token = self.js_token
+                    transfer_bds_token = self.bds_token
+                    self.domain = saved_domain
+                else:
+                    transfer_js_token = self.js_token
+                    transfer_bds_token = self.bds_token
+
+                # Generate a fresh logid for session tracking
+                logid = self._generate_logid()
 
                 params = urllib.parse.urlencode(
                     {
@@ -964,14 +1008,14 @@ class TeraBoxClient:
                         "web": "1",
                         "channel": "dubox",
                         "clienttype": "0",
-                        "jsToken": self.js_token,
+                        "jsToken": transfer_js_token,
                         "shareid": share_id,
                         "from": from_uk,
                         "sekey": decoded_sekey,
                         "ondup": "newcopy",
                         "async": "1",
-                        "bdstoken": self.bds_token,
-                        "logid": self.logid,
+                        "bdstoken": transfer_bds_token,
+                        "logid": logid,
                     }
                 )
                 url = f"{transfer_domain}/share/transfer?{params}"
@@ -982,31 +1026,35 @@ class TeraBoxClient:
                     }
                 )
 
-                # Build cookie header.  For the account domain just use
-                # the normal NDUS cookie; for the share domain merge in
-                # the share-session jar.
+                # Build cookie header: ALWAYS merge share-session jar cookies
+                # so that browserid, csrfToken, PANWEB, etc. are present.
                 cookie_parts: Dict[str, str] = {
                     "lang": "en",
                     "ndus": self.ndus_token,
                 }
-                if domain_idx > 0 and self._share_jar:
+                if self._share_jar:
                     for c in self._share_jar:
                         cookie_parts[c.key] = c.value
+                # Ensure ndus is never overwritten by share jar
+                cookie_parts["ndus"] = self.ndus_token
                 if decoded_sekey:
                     cookie_parts["TSID"] = decoded_sekey
                 cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_parts.items())
 
                 headers = {
-                    "User-Agent": self.USER_AGENT,
+                    "User-Agent": self.BROWSER_UA,
                     "Cookie": cookie_header,
                     "Referer": transfer_domain + "/",
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Accept-Encoding": "identity",
+                    "Origin": transfer_domain,
+                    "Accept": "application/json, text/plain, */*",
                 }
                 print(f"[TB] share_transfer → POST {transfer_domain}/share/transfer")
                 print(f"[TB] share_transfer   domain={transfer_domain}  domain_idx={domain_idx}  attempt={attempt+1}")
                 print(f"[TB] share_transfer   fs_ids={fs_ids}  dest={dest_path}  sekey_len={len(decoded_sekey)}")
                 print(f"[TB] share_transfer   cookies={list(cookie_parts.keys())}")
+                print(f"[TB] share_transfer   jsToken={'OK' if transfer_js_token else 'MISSING'}  bdstoken={'OK' if transfer_bds_token else 'MISSING'}  logid={logid[:12]}...")
                 try:
                     connector = _default_connector()
                     async with aiohttp.ClientSession(connector=connector) as session:
@@ -1019,15 +1067,31 @@ class TeraBoxClient:
                             result = await resp.json(content_type=None)
                             print(f"[TB] share_transfer ← HTTP {resp.status} | {result}")
                             errno = result.get("errno", -1)
+
+                            if errno == 0 or errno == 12:
+                                return result  # success or already-exists
+
                             if errno == 400810 and attempt == 0:
                                 print("[TB] share_transfer: errno=400810 → refreshing tokens")
                                 self.js_token = ""
                                 self.bds_token = ""
-                                await self.update_app_data()
                                 continue
+
+                            if errno == 400141:
+                                print(f"[TB] share_transfer: errno=400141 'need verify' on {transfer_domain} (attempt {attempt+1})")
+                                if domain_idx < len(domains_to_try) - 1:
+                                    # Try next domain
+                                    print(f"[TB] share_transfer: trying next domain...")
+                                    break
+                                # Last domain — return with split hint
+                                if len(fs_ids) > 1:
+                                    result["_retry_split"] = True
+                                return result
+
                             if errno in (-6, -1) and domain_idx < len(domains_to_try) - 1:
                                 print(f"[TB] share_transfer: errno={errno} on {transfer_domain} → trying next domain")
                                 break  # break inner loop, try next domain
+
                             return result
                 except Exception as e:
                     print(f"[TB] share_transfer error (attempt={attempt+1}): {e}")
@@ -1346,35 +1410,48 @@ class TeraBoxClient:
 
             await client.filemanager("delete", ["/terabox_temp_abc123"])
         """
-        params = urllib.parse.urlencode(
-            {
-                "app_id": "250528",
-                "web": "1",
-                "channel": "dubox",
-                "clienttype": "0",
-                "opera": operation,
-                "jsToken": self.js_token,
-                "bdstoken": self.bds_token,
-                "logid": self.logid,
-            }
-        )
-        url = f"{self.domain}/api/filemanager?{params}"
-        body = urllib.parse.urlencode({"filelist": json.dumps(fm_params)})
-        print(f"[TB] filemanager → POST {url}  (opera={operation}, params={fm_params})")
-        try:
-            async with self._session_for() as session:
-                async with session.post(
-                    url,
-                    data=body,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as resp:
-                    data = await resp.json(content_type=None)
-                    print(f"[TB] filemanager ← HTTP {resp.status} | {data}")
-                    return data
-        except Exception as e:
-            print(f"[TB] filemanager error: {e}")
-            return None
+        for fm_attempt in range(2):
+            if not self.js_token or not self.bds_token or fm_attempt > 0:
+                await self.update_app_data()
+
+            logid = self._generate_logid()
+            params = urllib.parse.urlencode(
+                {
+                    "app_id": "250528",
+                    "web": "1",
+                    "channel": "dubox",
+                    "clienttype": "0",
+                    "opera": operation,
+                    "jsToken": self.js_token,
+                    "bdstoken": self.bds_token,
+                    "logid": logid,
+                }
+            )
+            url = f"{self.domain}/api/filemanager?{params}"
+            body = urllib.parse.urlencode({"filelist": json.dumps(fm_params)})
+            print(f"[TB] filemanager → POST {url}  (opera={operation}, params={fm_params}, attempt={fm_attempt+1})")
+            try:
+                async with self._session_for() as session:
+                    async with session.post(
+                        url,
+                        data=body,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                        print(f"[TB] filemanager ← HTTP {resp.status} | {data}")
+                        errno = data.get("errno", -1)
+                        if errno in (450016, -6) and fm_attempt == 0:
+                            print(f"[TB] filemanager: errno={errno} → refreshing tokens and retrying")
+                            self.js_token = ""
+                            self.bds_token = ""
+                            continue
+                        return data
+            except Exception as e:
+                print(f"[TB] filemanager error (attempt={fm_attempt+1}): {e}")
+                if fm_attempt == 1:
+                    return None
+        return None
 
     # -------------------------------------------------- download_file_stream
 

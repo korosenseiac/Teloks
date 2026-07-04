@@ -663,6 +663,31 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         )
         transfer_result = await tb.share_transfer(share_id, from_uk, root_fs_ids, temp_folder)
         print(f"[TB:handler] share_transfer result: {transfer_result}")
+
+        # Handle errno=400141 with batch-split retry: transfer files one at a time
+        if (transfer_result and transfer_result.get("errno") == 400141
+                and transfer_result.get("_retry_split") and len(root_fs_ids) > 1):
+            print(f"[TB:handler] errno=400141 with split hint, retrying {len(root_fs_ids)} files individually")
+            await safe_edit(status_msg, 
+                f"⚠️ Pemindahan pukal gagal, mencuba satu per satu ({root_count} fail)…"
+            )
+            split_ok = True
+            for idx_single, single_fid in enumerate(root_fs_ids, 1):
+                await safe_edit(status_msg, 
+                    f"➡️ Memindahkan fail {idx_single}/{root_count}…"
+                )
+                single_result = await tb.share_transfer(share_id, from_uk, [single_fid], temp_folder)
+                single_errno = single_result.get("errno", -1) if single_result else -1
+                print(f"[TB:handler] single transfer fs_id={single_fid}: errno={single_errno}")
+                if single_errno not in (0, 12):
+                    print(f"[TB:handler] single transfer failed: {single_result}")
+                    split_ok = False
+                    break
+                await asyncio.sleep(1.5)  # Rate limit between individual transfers
+            if split_ok:
+                transfer_result = {"errno": 0, "_split": True}
+            # If split failed, fall through to the error check below
+
         if not transfer_result or transfer_result.get("errno", -1) != 0:
             errno = transfer_result.get("errno") if transfer_result else "?"
             extra = transfer_result.get("task_id", "") if transfer_result else ""
