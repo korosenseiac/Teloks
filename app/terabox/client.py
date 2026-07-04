@@ -969,19 +969,28 @@ class TeraBoxClient:
 
         # Build domain list: share domain first, then account domain, then
         # any additional domains observed during the scrape redirect chain.
-        domains_to_try: List[str] = []
+        raw_domains: List[str] = []
         if self._share_domain:
-            domains_to_try.append(self._share_domain)
-        if self.domain not in domains_to_try:
-            domains_to_try.append(self.domain)
+            raw_domains.append(self._share_domain)
+        if self.domain not in raw_domains:
+            raw_domains.append(self.domain)
         # Add scrape-seen domains as additional fallbacks
         for sd in getattr(self, "_scrape_seen_domains", []):
-            if sd not in domains_to_try:
-                domains_to_try.append(sd)
+            if sd not in raw_domains:
+                raw_domains.append(sd)
 
-        # Ensure we always have the account domain
-        if not domains_to_try:
-            domains_to_try = [self.domain]
+        # Filter to only keep domains where our ndus cookie is valid (i.e. *.terabox.com)
+        domains_to_try: List[str] = []
+        for d in raw_domains:
+            parsed = urllib.parse.urlparse(d)
+            host = parsed.hostname or ""
+            if host == "terabox.com" or host.endswith(".terabox.com"):
+                domains_to_try.append(d)
+
+        # Always fallback/include dm.terabox.com and www.terabox.com
+        for d in ("https://dm.terabox.com", "https://www.terabox.com"):
+            if d not in domains_to_try:
+                domains_to_try.append(d)
 
         print(f"[TB] share_transfer → domains_to_try: {domains_to_try}")
 
