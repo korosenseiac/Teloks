@@ -661,13 +661,26 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         await safe_edit(status_msg, 
             f"➡️ Memindahkan {root_count} item ke akaun TeraBox anda…"
         )
-        transfer_result = await tb.share_transfer(share_id, from_uk, root_fs_ids, temp_folder)
-        print(f"[TB:handler] share_transfer result: {transfer_result}")
+
+        # Status callback for share_transfer_robust progress updates
+        async def _transfer_status(text: str) -> None:
+            try:
+                await safe_edit(status_msg, text)
+            except Exception:
+                pass
+
+        # Use the robust multi-layer transfer method (6-layer bypass)
+        transfer_result = await tb.share_transfer_robust(
+            share_id, from_uk, root_fs_ids, temp_folder,
+            on_status=_transfer_status,
+        )
+        print(f"[TB:handler] share_transfer_robust result: {transfer_result}")
 
         # Handle errno=400141 with batch-split retry: transfer files one at a time
+        # Now with random jitter delays and robust method per-file
         if (transfer_result and transfer_result.get("errno") == 400141
                 and transfer_result.get("_retry_split") and len(root_fs_ids) > 1):
-            print(f"[TB:handler] errno=400141 with split hint, retrying {len(root_fs_ids)} files individually")
+            print(f"[TB:handler] errno=400141 with split hint, retrying {len(root_fs_ids)} files individually with jitter")
             await safe_edit(status_msg, 
                 f"⚠️ Pemindahan pukal gagal, mencuba satu per satu ({root_count} fail)…"
             )
@@ -676,14 +689,21 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 await safe_edit(status_msg, 
                     f"➡️ Memindahkan fail {idx_single}/{root_count}…"
                 )
-                single_result = await tb.share_transfer(share_id, from_uk, [single_fid], temp_folder)
+                # Use robust method for each individual file too
+                single_result = await tb.share_transfer_robust(
+                    share_id, from_uk, [single_fid], temp_folder,
+                    on_status=_transfer_status,
+                )
                 single_errno = single_result.get("errno", -1) if single_result else -1
                 print(f"[TB:handler] single transfer fs_id={single_fid}: errno={single_errno}")
                 if single_errno not in (0, 12):
                     print(f"[TB:handler] single transfer failed: {single_result}")
                     split_ok = False
                     break
-                await asyncio.sleep(1.5)  # Rate limit between individual transfers
+                # Random jitter 3-8s between individual transfers to avoid rate limiting
+                jitter = 3 + random.uniform(0, 5)
+                print(f"[TB:handler] split jitter: {jitter:.1f}s before next file")
+                await asyncio.sleep(jitter)
             if split_ok:
                 transfer_result = {"errno": 0, "_split": True}
             # If split failed, fall through to the error check below

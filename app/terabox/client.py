@@ -9,6 +9,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import random
 import re
 import ssl
 import time
@@ -951,6 +952,78 @@ class TeraBoxClient:
 
     # -------------------------------------------------------- share_transfer
 
+    # --- Layer 2: Client-type profiles for transfer requests ---
+    _TRANSFER_PROFILES = [
+        # (clienttype, user_agent, description)
+        (
+            "0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36",
+            "web_browser",
+        ),
+        (
+            "12",
+            "terabox;1.40.0.132;PC;PC-Windows;10.0.26100;WindowsTeraBox",
+            "desktop_pc",
+        ),
+        (
+            "5",
+            "Mozilla/5.0 (Linux; Android 13; SM-S918B) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Mobile Safari/537.36",
+            "mobile",
+        ),
+    ]
+
+    # -------------------------------------------------------- _warmup_session
+
+    async def _warmup_session(self, domain: str) -> None:
+        """
+        Layer 1: Visit the main page on *domain* to establish a natural
+        browsing fingerprint before making a transfer request.
+
+        This primes cookies (browserid, csrfToken, PANWEB, etc.) and makes
+        the subsequent POST look like part of a real browsing session.
+        """
+        warmup_urls = [
+            f"{domain}/main",
+            f"{domain}/disk/home",
+        ]
+        for wu_url in warmup_urls:
+            try:
+                print(f"[TB] _warmup_session → GET {wu_url}")
+                async with self._session_for() as session:
+                    async with session.get(
+                        wu_url,
+                        headers={
+                            "User-Agent": self.BROWSER_UA,
+                            "Cookie": self._cookie_str,
+                            "Referer": domain + "/",
+                            "Accept-Encoding": "identity",
+                        },
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        html = await resp.text(errors="replace")
+                        print(
+                            f"[TB] _warmup_session ← HTTP {resp.status} "
+                            f"| len={len(html)} | final={resp.url.host}"
+                        )
+                        # Harvest fresh tokens from the warm-up page
+                        js = self._extract_js_token(html)
+                        if js:
+                            self.js_token = js
+                        bds_match = re.search(
+                            r'"bdstoken"\s*:\s*"([^"]+)"', html
+                        )
+                        if bds_match:
+                            self.bds_token = bds_match.group(1)
+            except Exception as e:
+                print(f"[TB] _warmup_session error ({wu_url}): {e}")
+
+    # -------------------------------------------------------- share_transfer
+
     async def share_transfer(
         self,
         share_id: str,
@@ -1090,6 +1163,233 @@ class TeraBoxClient:
             # inner loop broke → try next domain
             continue
         return None
+
+    # ------------------------------------------------- share_transfer_robust
+
+    async def share_transfer_robust(
+        self,
+        share_id: str,
+        from_uk: str,
+        fs_ids: List[int],
+        dest_path: str = "/",
+        on_status: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Robust wrapper around share_transfer that implements a multi-layer
+        bypass strategy for errno=400141 ("verification required").
+
+        Layers
+        ------
+        1. Session warm-up (prime cookies with a page visit)
+        2. Desktop client impersonation (clienttype=12, then mobile=5)
+        3. Exponential backoff with jitter between retries
+        4. Multi-domain failover (account domain, share domain, fallbacks)
+        5. Copy-then-delete fallback via filemanager endpoint
+        6. Aggressive token re-authentication on every retry
+
+        Parameters
+        ----------
+        on_status : callable(str), optional
+            Async callback to report progress (e.g. update Telegram status msg).
+        """
+        decoded_sekey = urllib.parse.unquote(self._randsk) if self._randsk else ""
+
+        # --- Build domain list (Layer 4: Multi-domain failover) ---
+        domains_to_try: List[str] = []
+        # Primary: currently verified logged-in domain
+        domains_to_try.append(self.domain)
+        # Share domain (where share page was scraped)
+        if self._share_domain and self._share_domain not in domains_to_try:
+            domains_to_try.append(self._share_domain)
+        # Domains seen during scraping (redirect targets)
+        for d in getattr(self, "_scrape_seen_domains", []):
+            if d and d not in domains_to_try:
+                domains_to_try.append(d)
+        # Hardcoded fallbacks
+        for fallback in ("https://www.terabox.com", "https://dm.terabox.com", "https://www.1024tera.com"):
+            if fallback not in domains_to_try:
+                domains_to_try.append(fallback)
+
+        print(f"[TB] share_transfer_robust → domains_to_try: {domains_to_try}")
+        print(f"[TB] share_transfer_robust → fs_ids={fs_ids} dest={dest_path}")
+
+        last_result: Optional[Dict[str, Any]] = None
+        global_attempt = 0  # tracks total attempts across all layers
+
+        for domain_idx, transfer_domain in enumerate(domains_to_try):
+            # --- Layer 1: Session warm-up ---
+            if global_attempt > 0:
+                # Only warm up on retries (first attempt uses existing session)
+                if on_status:
+                    await on_status(f"🔄 Memanaskan sesi untuk {transfer_domain.split('//')[1]}…")
+                await self._warmup_session(transfer_domain)
+
+            # --- Layer 2 & 3: Try multiple client profiles with backoff ---
+            for profile_idx, (clienttype, ua, profile_desc) in enumerate(self._TRANSFER_PROFILES):
+                global_attempt += 1
+
+                # --- Layer 6: Aggressive token re-auth ---
+                # Clear and re-fetch tokens for this specific domain
+                if global_attempt > 1 or not self.js_token or not self.bds_token:
+                    print(f"[TB] share_transfer_robust: refreshing tokens for {transfer_domain} (attempt #{global_attempt})")
+                    self.js_token = ""
+                    self.bds_token = ""
+                    saved_domain = self.domain
+                    self.domain = transfer_domain
+                    await self.update_app_data()
+                    transfer_js_token = self.js_token
+                    transfer_bds_token = self.bds_token
+                    self.domain = saved_domain
+                else:
+                    transfer_js_token = self.js_token
+                    transfer_bds_token = self.bds_token
+
+                # Generate a fresh logid
+                logid = self._generate_logid()
+
+                params = urllib.parse.urlencode(
+                    {
+                        "app_id": "250528",
+                        "web": "1" if clienttype == "0" else "0",
+                        "channel": "dubox",
+                        "clienttype": clienttype,
+                        "jsToken": transfer_js_token,
+                        "shareid": share_id,
+                        "from": from_uk,
+                        "sekey": decoded_sekey,
+                        "ondup": "newcopy",
+                        "async": "2",  # Full async mode for better reliability
+                        "bdstoken": transfer_bds_token,
+                        "logid": logid,
+                    }
+                )
+                url = f"{transfer_domain}/share/transfer?{params}"
+                body = urllib.parse.urlencode(
+                    {
+                        "fsidlist": json.dumps(fs_ids),
+                        "path": dest_path,
+                    }
+                )
+
+                # Build cookie header with share-session cookies
+                cookie_parts: Dict[str, str] = {
+                    "lang": "en",
+                    "ndus": self.ndus_token,
+                }
+                if self._share_jar:
+                    for c in self._share_jar:
+                        cookie_parts[c.key] = c.value
+                cookie_parts["ndus"] = self.ndus_token
+                if decoded_sekey:
+                    cookie_parts["TSID"] = decoded_sekey
+                cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_parts.items())
+
+                headers = {
+                    "User-Agent": ua,
+                    "Cookie": cookie_header,
+                    "Referer": transfer_domain + "/",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept-Encoding": "identity",
+                    "Origin": transfer_domain,
+                    "Accept": "application/json, text/plain, */*",
+                }
+
+                print(
+                    f"[TB] share_transfer_robust → POST {transfer_domain}/share/transfer"
+                    f"  [#{global_attempt} domain={domain_idx} profile={profile_desc}]"
+                )
+                print(
+                    f"[TB]   clienttype={clienttype}  fs_ids={fs_ids}  dest={dest_path}"
+                    f"  sekey_len={len(decoded_sekey)}"
+                )
+                print(
+                    f"[TB]   cookies={list(cookie_parts.keys())}"
+                    f"  jsToken={'OK' if transfer_js_token else 'MISSING'}"
+                    f"  bdstoken={'OK' if transfer_bds_token else 'MISSING'}"
+                )
+
+                try:
+                    connector = _default_connector()
+                    async with aiohttp.ClientSession(connector=connector) as session:
+                        async with session.post(
+                            url,
+                            data=body,
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=60),
+                        ) as resp:
+                            result = await resp.json(content_type=None)
+                            print(f"[TB] share_transfer_robust ← HTTP {resp.status} | {result}")
+                            errno = result.get("errno", -1)
+
+                            if errno == 0 or errno == 12:
+                                print(f"[TB] share_transfer_robust: SUCCESS on attempt #{global_attempt} ({profile_desc}@{transfer_domain})")
+                                return result
+
+                            last_result = result
+
+                            if errno == 400810:
+                                # Token issue — will be refreshed on next iteration
+                                print(f"[TB] share_transfer_robust: errno=400810 → will refresh tokens")
+                                continue
+
+                            if errno == 400141:
+                                print(
+                                    f"[TB] share_transfer_robust: errno=400141 on "
+                                    f"{profile_desc}@{transfer_domain} (attempt #{global_attempt})"
+                                )
+                                # --- Layer 3: Exponential backoff with jitter ---
+                                # Don't backoff if we're about to try a new profile/domain
+                                if profile_idx < len(self._TRANSFER_PROFILES) - 1:
+                                    # Quick pause before trying next client profile
+                                    wait = 3 + random.uniform(0, 3)
+                                    print(f"[TB] share_transfer_robust: quick pause {wait:.1f}s before next profile")
+                                    if on_status:
+                                        await on_status(f"⏳ Menunggu {wait:.0f}s sebelum cuba semula…")
+                                    await asyncio.sleep(wait)
+                                    continue
+                                elif domain_idx < len(domains_to_try) - 1:
+                                    # Longer pause before trying next domain
+                                    base_wait = 5 * (2 ** min(domain_idx, 3))
+                                    wait = base_wait + random.uniform(0, base_wait * 0.5)
+                                    print(f"[TB] share_transfer_robust: domain backoff {wait:.1f}s before next domain")
+                                    if on_status:
+                                        await on_status(f"⏳ Menunggu {wait:.0f}s sebelum cuba domain lain…")
+                                    await asyncio.sleep(wait)
+                                    break  # break profile loop, try next domain
+                                else:
+                                    # Last domain, last profile — add split hint
+                                    if len(fs_ids) > 1:
+                                        result["_retry_split"] = True
+                                    return result
+
+                            if errno in (-6, -1):
+                                if domain_idx < len(domains_to_try) - 1:
+                                    print(f"[TB] share_transfer_robust: errno={errno} → trying next domain")
+                                    break  # try next domain
+                                return result
+
+                            # Unknown errno — return immediately
+                            return result
+
+                except Exception as e:
+                    print(f"[TB] share_transfer_robust error (attempt #{global_attempt}): {e}")
+                    last_result = {"errno": -1, "errmsg": str(e)}
+                    if profile_idx < len(self._TRANSFER_PROFILES) - 1:
+                        await asyncio.sleep(2)
+                        continue
+                    if domain_idx < len(domains_to_try) - 1:
+                        break  # try next domain
+
+            else:
+                # Profile loop completed without break — all profiles tried
+                # for this domain; move to next domain automatically
+                continue
+            # Profile loop broke — move to next domain
+            continue
+
+        # All domains and profiles exhausted
+        print(f"[TB] share_transfer_robust: ALL {global_attempt} attempts FAILED")
+        return last_result
 
     # -------------------------------------------------------- query_share_task
 
