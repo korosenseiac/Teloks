@@ -1298,6 +1298,7 @@ async def link_handler(client: Client, message: Message):
                 if is_archive(doc_name):
                     if total_links == 1:
                         # Single link with archive: process it directly
+                        skip_non_videos = "/skip" in message.text.lower()
                         source_name = (target_msg.chat.title if target_msg.chat and target_msg.chat.title
                                        else "Unknown")
                         backup_peer = await get_backup_group_peer(client)
@@ -1313,6 +1314,7 @@ async def link_handler(client: Client, message: Message):
                             user_id=user_id,
                             source_name=source_name,
                             backup_peer=backup_peer,
+                            skip_non_videos=skip_non_videos,
                         )
                         return
                     else:
