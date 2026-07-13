@@ -1292,12 +1292,33 @@ async def link_handler(client: Client, message: Message):
                 fetch_errors.append(f"Link {link_idx}: bukan media/file")
                 continue
 
-            # Skip archive files in multi-link mode (user must send archives separately)
+            # Handle archive files
             if target_msg.document:
                 doc_name = getattr(target_msg.document, "file_name", "") or ""
                 if is_archive(doc_name):
-                    skipped_archives.append(f"Link {link_idx}: {doc_name}")
-                    continue
+                    if total_links == 1:
+                        # Single link with archive: process it directly
+                        source_name = (target_msg.chat.title if target_msg.chat and target_msg.chat.title
+                                       else "Unknown")
+                        backup_peer = await get_backup_group_peer(client)
+                        if not backup_peer:
+                            await safe_edit(status_msg, "❌ Backup group belum di-setup.")
+                            return
+                        await _process_archive_from_message(
+                            bot=client,
+                            user_client=user_client,
+                            target_msg=target_msg,
+                            message=message,
+                            status_msg=status_msg,
+                            user_id=user_id,
+                            source_name=source_name,
+                            backup_peer=backup_peer,
+                        )
+                        return
+                    else:
+                        # Multi-link mode: skip archives (user must send archives separately)
+                        skipped_archives.append(f"Link {link_idx}: {doc_name}")
+                        continue
 
             # Expand media groups (albums) so all media in a source album is collected
             if target_msg.media_group_id:
