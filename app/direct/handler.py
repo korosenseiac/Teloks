@@ -222,6 +222,58 @@ async def _get_video_metadata(video_path: str) -> Dict[str, int]:
     return meta
 
 
+async def _split_video_part(
+    video_path: str,
+    start_sec: float,
+    duration_sec: float,
+    out_path: str,
+) -> bool:
+    """Cut a segment of video using ffmpeg.
+    
+    Tries fast stream copy (-c copy) first. If that fails or output size is 0,
+    falls back to default re-encoding.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-ss", str(start_sec),
+            "-i", video_path,
+            "-t", str(duration_sec),
+            "-c", "copy",
+            "-map", "0",
+            out_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return True
+
+        # Fallback to re-encoding if copy failed
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-ss", str(start_sec),
+            "-i", video_path,
+            "-t", str(duration_sec),
+            out_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        return proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    except Exception as e:
+        print(f"[DirectLink] Video split error: {e}")
+        return False
+
+
 async def _upload_thumb_to_telegram(bot: Client, thumb_raw: bytes) -> Optional[InputFile]:
     """Upload thumbnail bytes and return InputFile."""
     try:
@@ -1220,27 +1272,34 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         is_premium = getattr(message.from_user, "is_premium", False) or False
         size_limit = MAX_FILE_SIZE_PREMIUM if is_premium else MAX_FILE_SIZE
         
-        # [MODIFIED] Move size limit check for archives to extraction phase
-        # Allow archives up to 10 GB during initial download
         is_arch = is_archive(file_name)
-        hard_limit = 10 * 1024 * 1024 * 1024  # 10 GB
-        
-        effective_limit = hard_limit if is_arch else size_limit
+        is_video = _ext(file_name) in VIDEO_EXTS
+        hard_limit = 10 * 1024 * 1024 * 1024  # 10 GB limit for archives
 
-        if file_size > effective_limit:
-            limit_gb = effective_limit / (1024 * 1024 * 1024)
+        # Allow videos and archives to exceed standard limit during initial download
+        # (videos will be split into parts if > size_limit)
+        if file_size > size_limit and not is_arch and not is_video:
+            limit_gb = size_limit / (1024 * 1024 * 1024)
+            actual_gb = file_size / (1024 * 1024 * 1024)
+            user_type = "Premium" if is_premium else "Biasa"
+            msg = (
+                f"❌ **Fail terlalu besar!**\n\n"
+                f"Had Maksimum: {limit_gb:.1f} GB\n"
+                f"Fail ini: {actual_gb:.2f} GB\n"
+                f"(User {user_type})"
+            )
+            await safe_edit(status_msg, msg)
+            return
+
+        if file_size > hard_limit and is_arch:
+            limit_gb = hard_limit / (1024 * 1024 * 1024)
             actual_gb = file_size / (1024 * 1024 * 1024)
             msg = (
                 f"❌ **Fail terlalu besar!**\n\n"
                 f"Had Maksimum: {limit_gb:.1f} GB\n"
-                f"Fail ini: {actual_gb:.2f} GB"
+                f"Fail ini: {actual_gb:.2f} GB\n"
+                f"(Saiz arkib melebihi had sistem 10GB)"
             )
-            if is_arch:
-                msg += "\n(Saiz arkib melebihi had sistem 10GB)"
-            else:
-                user_type = "Premium" if is_premium else "Biasa"
-                msg += f"\n(User {user_type})"
-                
             await safe_edit(status_msg, msg)
             return
 
@@ -1265,7 +1324,6 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         tracker.start()
 
         # Check if file is a video
-        is_video = _ext(file_name) in VIDEO_EXTS
         thumb_raw = None
         video_meta: Optional[Dict[str, int]] = None
         temp_video_path = None
@@ -1312,18 +1370,130 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
                 video_meta = await _get_video_metadata(temp_video_path)
                 print(f"[DirectLink] Video metadata: {video_meta}")
 
-                # Generate thumbnail at 10% of duration
-                duration = video_meta.get("duration", 0)
-                if not thumb_raw:
-                    thumb_raw = await _generate_video_thumb(temp_video_path, duration)
-                    if thumb_raw:
-                        print(f"[DirectLink] Thumbnail generated: {len(thumb_raw)} bytes")
-                else:
-                    print(f"[DirectLink] Skipping thumbnail generation, using custom thumbnail.")
+                actual_video_size = os.path.getsize(temp_video_path)
 
-                # Upload from temp file — download is already fully counted,
-                # so don't pass on_download_chunk to FileStreamer.
-                streamer = FileStreamer(temp_video_path, file_name)
+                if actual_video_size > size_limit:
+                    # MULTI-PART SPLITTING FLOW
+                    import math
+                    target_part_size = int(size_limit * 0.95)
+                    num_parts = math.ceil(actual_video_size / target_part_size)
+                    total_duration = video_meta.get("duration", 0)
+                    part_duration = total_duration / num_parts if total_duration > 0 else 3600
+
+                    await tracker.stop()
+                    await safe_edit(
+                        status_msg,
+                        f"✂️ Fail video melebihi had ({actual_video_size / (1024**3):.2f} GB > {size_limit / (1024**3):.1f} GB).\n"
+                        f"Memotong video kepada {num_parts} bahagian…"
+                    )
+
+                    custom_thumb_raw = thumb_raw
+                    split_dir = tempfile.mkdtemp(prefix="direct_split_")
+                    base_name, ext_str = os.path.splitext(file_name)
+                    delivered_count = 0
+
+                    try:
+                        for i in range(num_parts):
+                            if is_cancelled(user_id):
+                                raise asyncio.CancelledError()
+
+                            part_num = i + 1
+                            part_filename = f"{base_name} (Part {part_num}){ext_str}"
+                            part_path = os.path.join(split_dir, part_filename)
+
+                            start_sec = i * part_duration
+                            dur_sec = part_duration if part_num < num_parts else (total_duration - start_sec)
+                            if dur_sec <= 0:
+                                dur_sec = part_duration
+
+                            await safe_edit(
+                                status_msg,
+                                f"✂️ Memotong Bahagian {part_num}/{num_parts}: `{part_filename}`…"
+                            )
+
+                            ok = await _split_video_part(temp_video_path, start_sec, dur_sec, part_path)
+                            if not ok:
+                                raise Exception(f"Gagal memotong bahagian {part_num}")
+
+                            part_size = os.path.getsize(part_path)
+
+                            # If user provided a custom thumbnail, use it ONLY for Part 1.
+                            # Subsequent parts (Part 2+) use a snapshot at 10% of that part's clip.
+                            if part_num == 1 and custom_thumb_raw:
+                                part_thumb = custom_thumb_raw
+                            else:
+                                part_thumb = await _generate_video_thumb(part_path, int(dur_sec))
+
+                            part_meta = await _get_video_metadata(part_path)
+
+                            part_tracker = ProgressTracker(status_msg, part_filename, part_size)
+                            part_tracker.start()
+
+                            part_streamer = FileStreamer(part_path, part_filename)
+
+                            msg_id, is_sent_to_bot = await _upload_file_to_backup(
+                                bot, user_client, backup_peer, part_streamer, part_filename, part_size,
+                                tracker=part_tracker,
+                                thumb_raw=part_thumb,
+                                video_meta=part_meta
+                            )
+
+                            if hasattr(part_streamer, "close"):
+                                await part_streamer.close()
+
+                            if not msg_id:
+                                await part_tracker.stop(f"❌ Gagal memuat naik bahagian {part_num}.")
+                                return
+
+                            await part_tracker.stop(f"⬆️ Menghantar bahagian {part_num}/{num_parts}…")
+                            delivered = await _send_to_user(bot, user_id, msg_id, is_sent_to_bot)
+
+                            if delivered:
+                                delivered_count += 1
+                                try:
+                                    channel_id_str = str(BACKUP_GROUP_ID).replace("-100", "")
+                                    link = f"https://t.me/c/{channel_id_str}/{msg_id}" if not is_sent_to_bot else None
+                                    await log_forward(
+                                        message.from_user.username or "Unknown",
+                                        msg_id,
+                                        part_size,
+                                        f"DirectLink/{part_filename}",
+                                        link
+                                    )
+                                except Exception as e:
+                                    print(f"[DirectLink] Part logging error: {e}")
+
+                            if os.path.exists(part_path):
+                                try:
+                                    os.remove(part_path)
+                                except Exception:
+                                    pass
+
+                        if delivered_count == num_parts:
+                            try:
+                                await status_msg.delete()
+                            except Exception:
+                                pass
+                        else:
+                            await safe_edit(status_msg, f"⚠️ Selesai! {delivered_count}/{num_parts} bahagian berjaya dihantar.")
+                        return
+                    finally:
+                        if os.path.exists(split_dir):
+                            shutil.rmtree(split_dir, ignore_errors=True)
+
+                else:
+                    # Generate thumbnail at 10% of duration
+                    duration = video_meta.get("duration", 0)
+                    if not thumb_raw:
+                        thumb_raw = await _generate_video_thumb(temp_video_path, duration)
+                        if thumb_raw:
+                            print(f"[DirectLink] Thumbnail generated: {len(thumb_raw)} bytes")
+                    else:
+                        print(f"[DirectLink] Skipping thumbnail generation, using custom thumbnail.")
+
+                    # Upload from temp file — download is already fully counted,
+                    # so don't pass on_download_chunk to FileStreamer.
+                    streamer = FileStreamer(temp_video_path, file_name)
             except Exception as e:
                 print(f"[DirectLink] Video processing error: {e}")
                 await tracker.stop(f"❌ Ralat pemprosesan video: {e}")
