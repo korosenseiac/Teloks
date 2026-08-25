@@ -11,6 +11,11 @@ isolated from the Python bot.  Key flags keep resource usage low:
   --file-allocation=none (no pre-allocation → instant start)
   --disk-cache=16M       (small RAM footprint)
   --max-concurrent-downloads=2
+
+Peer discovery is tuned for reliability:
+  --enable-dht=true / --enable-peer-exchange=true / --bt-enable-lpd=true
+  --bt-tracker=<public tracker> × N   (fallback for bare magnet links)
+  --bt-stop-timeout=0                 (never auto-abort a stalled torrent)
 """
 from __future__ import annotations
 
@@ -19,7 +24,7 @@ import os
 import shutil
 import signal
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -28,6 +33,24 @@ from app.config import (
     ARIA2_RPC_SECRET,
     TORRENT_DOWNLOAD_DIR,
 )
+
+
+# Public BitTorrent trackers used as a fallback for magnet links that carry no
+# `tr=` parameters. Giving aria2 a bootstrap set of trackers dramatically
+# improves peer discovery and torrent-metadata resolution.
+BT_TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.moeking.me:6969/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.internetwarriors.net:1337/announce",
+    "udp://tracker.tiny-vps.com:6969/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+    "https://tracker.gbitt.info/announce",
+]
 
 
 class Aria2Error(Exception):
@@ -72,10 +95,18 @@ class Aria2Client:
             "--max-overall-download-limit=0",
             "--file-allocation=none",
             "--disk-cache=16M",
-            "--bt-stop-timeout=600",         # stop stalled torrents after 10 min
-            "--bt-tracker-connect-timeout=10",
-            "--bt-tracker-timeout=10",
-            "--summary-interval=0",          # no periodic console output
+            # Peer discovery: DHT + peer exchange + local peer discovery, plus
+            # a fallback list of public trackers (helps bare magnet links that
+            # carry no `tr=` params resolve metadata and find peers).
+            "--enable-dht=true",
+            "--dht-listen-port=6881-6999",
+            "--listen-port=6881-6999",
+            "--enable-peer-exchange=true",
+            "--bt-enable-lpd=true",
+            "--bt-tracker-connect-timeout=30",
+            "--bt-tracker-timeout=30",
+            "--bt-stop-timeout=0",          # never auto-abort a stalled torrent
+            "--summary-interval=0",         # no periodic console output
             "--auto-save-interval=0",
             "--console-log-level=warn",
             f"--dir={download_dir}",
@@ -83,6 +114,8 @@ class Aria2Client:
             "--auto-file-renaming=false",
             "--check-integrity=false",
         ]
+        for tracker in BT_TRACKERS:
+            cmd.append(f"--bt-tracker={tracker}")
 
         if self.secret:
             cmd.append(f"--rpc-secret={self.secret}")
@@ -239,8 +272,13 @@ class Aria2Client:
         poll_interval: float = 2.0,
         on_progress: Optional[Any] = None,  # callable(completed, total, speed)
         cancel_check: Optional[Any] = None,  # callable() -> bool
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], str]:
         """Poll until download completes, errors, or is cancelled.
+
+        Magnet links and `.torrent` URLs make aria2 spawn a "followed-by"
+        download once the metadata (or the .torrent file) has been fetched.
+        This method transparently follows that chain and reports the status of
+        the GID that actually finished the download.
 
         Parameters
         ----------
@@ -251,13 +289,18 @@ class Aria2Client:
 
         Returns
         -------
-        dict  — final status from ``get_status()``.
+        (final_status, final_gid)
+            The final status dict from ``get_status()`` and the GID that
+            actually completed (so callers can clean the correct download).
+            The status dict also includes ``completedLength``/``totalLength``
+            in bytes, ``errorCode``/``errorMessage``, and ``dir``.
 
         Raises
         ------
         Aria2Error  — on download error or cancellation.
         """
         active_gid = gid
+        seen_gids: set = set()
 
         while True:
             await asyncio.sleep(poll_interval)
@@ -279,12 +322,18 @@ class Aria2Client:
 
             if state == "complete":
                 # Magnet links first resolve metadata, then spawn a
-                # "followed-by" GID for the actual data download.
+                # "followed-by" GID for the actual data download. Keep
+                # following until we reach a GID that completed on its own.
                 followed = status.get("followedBy")
                 if followed:
-                    active_gid = followed[0]
+                    next_gid = followed[0]
+                    if next_gid == active_gid or next_gid in seen_gids:
+                        # Safety net: never loop forever on a follow cycle.
+                        return status, active_gid
+                    seen_gids.add(active_gid)
+                    active_gid = next_gid
                     continue
-                return status
+                return status, active_gid
 
             if state == "error":
                 code = status.get("errorCode", "?")

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import math
 import os
 import random
 import re
@@ -81,6 +82,9 @@ _UPLOADABLE_EXTS = PHOTO_EXTS | VIDEO_EXTS | AUDIO_EXTS | {
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".txt", ".srt", ".ass", ".sub", ".epub",
 }
+
+# Upload attempts per file before giving up
+MAX_RETRIES = 3
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +197,59 @@ async def _get_video_metadata(video_path: str) -> Dict[str, int]:
     except Exception as e:
         print(f"[Torrent] _get_video_metadata error: {e}")
     return meta
+
+
+async def _split_video_part(
+    video_path: str,
+    start_sec: float,
+    duration_sec: float,
+    out_path: str,
+) -> bool:
+    """Cut a segment of a video using ffmpeg.
+
+    Tries fast stream copy (`-c copy`) first; if that fails or produces an
+    empty output, falls back to a full re-encode. Mirrors the Direct Link
+    feature's splitting behaviour.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-ss", str(start_sec),
+            "-i", video_path,
+            "-t", str(duration_sec),
+            "-c", "copy",
+            "-map", "0",
+            out_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return True
+
+        # Fallback to re-encoding if copy failed
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-ss", str(start_sec),
+            "-i", video_path,
+            "-t", str(duration_sec),
+            out_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+        return proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    except Exception as e:
+        print(f"[Torrent] Video split error: {e}")
+        return False
 
 
 async def _upload_thumb_to_telegram(
@@ -375,6 +432,210 @@ async def _upload_file_to_backup(
         import traceback
         traceback.print_exc()
         return None, False
+
+
+# ---------------------------------------------------------------------------
+# Upload a local file (with retries + logging), then delete it from disk
+# ---------------------------------------------------------------------------
+
+async def _upload_local_file(
+    bot: Client,
+    user_client: Client,
+    backup_peer,
+    message: Message,
+    file_path: str,
+    file_name: str,
+    file_size: int,
+    torrent_name: str,
+    uploaded: List[Tuple[int, str, str, int, bool]],
+    status_msg: Message,
+    file_index: int = 1,
+    file_total: int = 1,
+    thumb_raw: Optional[bytes] = None,
+    video_meta: Optional[Dict[str, int]] = None,
+) -> bool:
+    """Upload one local file to the backup group with retries, log it, delete it.
+
+    Returns True if the file was uploaded successfully.
+    """
+    file_kind = _classify(file_name)
+
+    tracker = ProgressTracker(
+        status_msg=status_msg,
+        file_name=file_name,
+        file_size=file_size,
+        file_index=file_index,
+        file_total=file_total,
+    )
+    tracker.start()
+
+    bmid = None
+    is_sent_to_bot = False
+    streamer = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        streamer = TorrentFileStreamer(
+            file_path, file_name,
+            on_read_chunk=tracker.add_downloaded,
+        )
+        bmid, is_sent_to_bot = await _upload_file_to_backup(
+            bot, user_client, backup_peer, streamer,
+            file_name, file_size,
+            tracker=tracker,
+            thumb_raw=thumb_raw,
+            video_meta=video_meta,
+        )
+        if bmid:
+            break
+        print(f"[Torrent] Upload failed for {file_name} (attempt {attempt}/{MAX_RETRIES})")
+        if attempt < MAX_RETRIES:
+            tracker.downloaded = 0
+            tracker.uploaded = 0
+            tracker._dl_samples.clear()
+            tracker._ul_samples.clear()
+            await asyncio.sleep(3)
+
+    await tracker.stop()
+
+    if bmid:
+        uploaded.append((bmid, file_kind, file_name, file_size, is_sent_to_bot))
+        channel_id_str = str(BACKUP_GROUP_ID).replace("-100", "")
+        link = f"https://t.me/c/{channel_id_str}/{bmid}" if not is_sent_to_bot else None
+        try:
+            await log_forward(
+                message.from_user.username, bmid, file_size,
+                f"Torrent/{torrent_name}/{file_name}", link
+            )
+        except Exception as e:
+            print(f"[Torrent] Log forward error for {file_name}: {e}")
+    else:
+        print(f"[Torrent] Skipping {file_name} — upload failed after {MAX_RETRIES} attempts.")
+
+    if hasattr(streamer, "close"):
+        await streamer.close()
+
+    # Delete the file from disk immediately after upload
+    try:
+        os.remove(file_path)
+    except OSError:
+        pass
+
+    return bool(bmid)
+
+
+# ---------------------------------------------------------------------------
+# Split an oversized video into parts and upload each part (Direct Link style)
+# ---------------------------------------------------------------------------
+
+async def _split_and_upload_video(
+    bot: Client,
+    user_client: Client,
+    backup_peer,
+    message: Message,
+    video_path: str,
+    file_name: str,
+    file_size: int,
+    torrent_name: str,
+    uploaded: List[Tuple[int, str, str, int, bool]],
+    status_msg: Message,
+    size_limit: int,
+) -> None:
+    """Split a video larger than *size_limit* and upload every part.
+
+    Mirrors the Direct Link feature: target part size is 95% of the per-user
+    Telegram limit (2 GB regular / 4 GB Premium), parts are cut with ffmpeg
+    (stream copy first, re-encode fallback), and each part is uploaded with
+    its own thumbnail + metadata and logged individually.
+    """
+    from app.bot.main import is_cancelled
+
+    user_id = message.from_user.id
+
+    # Thumbnail + metadata for the source video (Part 1 reuses this thumbnail)
+    base_thumb = await _generate_video_thumb(video_path)
+    video_meta = await _get_video_metadata(video_path)
+    total_duration = video_meta.get("duration", 0)
+
+    target_part_size = int(size_limit * 0.95)
+    num_parts = max(1, math.ceil(file_size / target_part_size))
+    part_duration = total_duration / num_parts if total_duration > 0 else 3600
+
+    split_dir = tempfile.mkdtemp(prefix="torrent_split_")
+    base_name, ext_str = os.path.splitext(file_name)
+    uploaded_count = 0
+
+    try:
+        for i in range(num_parts):
+            if is_cancelled(user_id):
+                raise asyncio.CancelledError()
+
+            part_num = i + 1
+            part_filename = f"{base_name} (Part {part_num}){ext_str}"
+            part_path = os.path.join(split_dir, part_filename)
+
+            start_sec = i * part_duration
+            dur_sec = part_duration if part_num < num_parts else (total_duration - start_sec)
+            if dur_sec <= 0:
+                dur_sec = part_duration
+
+            try:
+                await status_msg.edit(
+                    f"✂️ Memotong Bahagian {part_num}/{num_parts}: `{part_filename}`…"
+                )
+            except Exception:
+                pass
+
+            ok = await _split_video_part(video_path, start_sec, dur_sec, part_path)
+            if not ok:
+                raise Exception(f"Gagal memotong bahagian {part_num}")
+
+            part_size = os.path.getsize(part_path)
+
+            # Part 1 reuses the source thumbnail; later parts get a fresh one
+            if part_num == 1 and base_thumb:
+                part_thumb = base_thumb
+            else:
+                part_thumb = await _generate_video_thumb(part_path)
+            part_meta = await _get_video_metadata(part_path)
+
+            ok_up = await _upload_local_file(
+                bot, user_client, backup_peer, message,
+                part_path, part_filename, part_size,
+                torrent_name, uploaded, status_msg,
+                file_index=part_num, file_total=num_parts,
+                thumb_raw=part_thumb, video_meta=part_meta,
+            )
+            if ok_up:
+                uploaded_count += 1
+
+            await asyncio.sleep(1)
+
+        if uploaded_count < num_parts:
+            try:
+                await status_msg.edit(
+                    f"⚠️ Video `{file_name}`: {uploaded_count}/{num_parts} bahagian berjaya dimuat naik."
+                )
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[Torrent] Video split error for {file_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await status_msg.edit(f"❌ Ralat memotong video `{file_name}`: {e}")
+        except Exception:
+            pass
+    finally:
+        try:
+            shutil.rmtree(split_dir, ignore_errors=True)
+        except Exception as e:
+            print(f"[Torrent] Failed to clean split dir {split_dir}: {e}")
+        # Remove the source video
+        try:
+            os.remove(video_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +1159,12 @@ async def _process_torrent(
 
     def _on_progress(completed: int, total: int, speed: int):
         nonlocal total_known
+        if completed < download_tracker.downloaded:
+            # aria2 switched to a followed-by download (magnet / .torrent URL):
+            # completedLength restarts from 0 — reset the progress baseline so
+            # the tracker doesn't report negative/stuck progress.
+            download_tracker.downloaded = 0
+            total_known = False
         if total > 0 and not total_known:
             download_tracker.file_size = total
             total_known = True
@@ -911,7 +1178,7 @@ async def _process_torrent(
 
     try:
         # 5. Wait for download to complete
-        final_status = await aria2.wait_for_download(
+        final_status, final_gid = await aria2.wait_for_download(
             gid,
             poll_interval=2.0,
             on_progress=_on_progress,
@@ -939,8 +1206,8 @@ async def _process_torrent(
     torrent_name = _get_torrent_name(final_status) or torrent_name
     print(f"[Torrent] Download complete: {torrent_name} ({_format_size(total_size)})")
 
-    # Clean the download result from aria2's memory
-    await aria2.remove_result(gid)
+    # Clean the download result from aria2's memory (the GID that completed)
+    await aria2.remove_result(final_gid)
 
     # 6. Collect uploadable files
     if is_cancelled(user_id):
@@ -962,11 +1229,15 @@ async def _process_torrent(
     size_limit = MAX_FILE_SIZE_PREMIUM if is_premium else MAX_FILE_SIZE
     print(f"[Torrent] User premium={is_premium}, size_limit={_format_size(size_limit)}")
 
-    skipped = []
-    valid_files = []
+    skipped = []        # non-video files over the limit → skipped
+    valid_files = []    # files within the limit → upload as-is
+    split_videos = []   # videos over the limit → split into parts (Direct Link style)
     for f in files:
         if f["size"] > size_limit:
-            skipped.append(f)
+            if f["kind"] == "video":
+                split_videos.append(f)
+            else:
+                skipped.append(f)
         else:
             valid_files.append(f)
 
@@ -976,7 +1247,13 @@ async def _process_torrent(
             skipped_names += f" +{len(skipped) - 3} lagi"
         print(f"[Torrent] Skipping {len(skipped)} oversized files: {skipped_names}")
 
-    if not valid_files:
+    if split_videos:
+        split_names = ", ".join(f["name"] for f in split_videos[:3])
+        if len(split_videos) > 3:
+            split_names += f" +{len(split_videos) - 3} lagi"
+        print(f"[Torrent] Splitting {len(split_videos)} oversized videos: {split_names}")
+
+    if not valid_files and not split_videos:
         await status_msg.edit(
             f"❌ Semua {len(files)} fail melebihi had saiz Telegram ({_format_size(size_limit)}).\n\n"
             f"Fail terbesar: {files[0]['name']} ({_format_size(files[0]['size'])})"
@@ -990,14 +1267,14 @@ async def _process_torrent(
         return
 
     # 8. Upload each file
-    total_files = len(valid_files)
-    await status_msg.edit(
-        f"📤 Memuat naik {total_files} fail ke Telegram…\n"
-        f"🧲 {torrent_name}"
-    )
+    uploaded: List[Tuple[int, str, str, int, bool]] = []
 
-    uploaded: List[Tuple[int, str, str, int]] = []
-    MAX_RETRIES = 3
+    total_files = len(valid_files)
+    if total_files:
+        await status_msg.edit(
+            f"📤 Memuat naik {total_files} fail ke Telegram…\n"
+            f"🧲 {torrent_name}"
+        )
 
     for idx, finfo in enumerate(valid_files, 1):
         if is_cancelled(user_id):
@@ -1007,69 +1284,21 @@ async def _process_torrent(
         file_path = finfo["path"]
         file_name = finfo["name"]
         file_size = finfo["size"]
-        file_kind = finfo["kind"]
 
         # Generate video metadata if applicable
         thumb_raw = None
         video_meta = None
-        if file_kind == "video":
+        if finfo["kind"] == "video":
             thumb_raw = await _generate_video_thumb(file_path)
             video_meta = await _get_video_metadata(file_path)
 
-        tracker = ProgressTracker(
-            status_msg=status_msg,
-            file_name=file_name,
-            file_size=file_size,
-            file_index=idx,
-            file_total=total_files,
+        await _upload_local_file(
+            bot, user_client, backup_peer, message,
+            file_path, file_name, file_size,
+            torrent_name, uploaded, status_msg,
+            file_index=idx, file_total=total_files,
+            thumb_raw=thumb_raw, video_meta=video_meta,
         )
-        tracker.start()
-
-        bmid = None
-        is_sent_to_bot = False
-        for attempt in range(1, MAX_RETRIES + 1):
-            streamer = TorrentFileStreamer(
-                file_path, file_name,
-                on_read_chunk=tracker.add_downloaded,
-            )
-            bmid, is_sent_to_bot = await _upload_file_to_backup(
-                bot, user_client, backup_peer, streamer,
-                file_name, file_size,
-                tracker=tracker,
-                thumb_raw=thumb_raw,
-                video_meta=video_meta,
-            )
-            if bmid:
-                break
-            print(f"[Torrent] Upload failed for {file_name} (attempt {attempt}/{MAX_RETRIES})")
-            if attempt < MAX_RETRIES:
-                tracker.downloaded = 0
-                tracker.uploaded = 0
-                tracker._dl_samples.clear()
-                tracker._ul_samples.clear()
-                await asyncio.sleep(3)
-
-        await tracker.stop()
-
-        if bmid:
-            uploaded.append((bmid, file_kind, file_name, file_size, is_sent_to_bot))
-            channel_id_str = str(BACKUP_GROUP_ID).replace("-100", "")
-            link = f"https://t.me/c/{channel_id_str}/{bmid}" if not is_sent_to_bot else None
-            await log_forward(
-                message.from_user.username, bmid, file_size,
-                f"Torrent/{torrent_name}/{file_name}", link
-            )
-        else:
-            print(f"[Torrent] Skipping {file_name} — upload failed after {MAX_RETRIES} attempts.")
-
-        if hasattr(streamer, "close"):
-            await streamer.close()
-
-        # Delete the file from disk immediately after upload
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
 
         thumb_raw = None
         video_meta = None
@@ -1078,6 +1307,28 @@ async def _process_torrent(
         # Brief pause between files to avoid flood
         if idx < total_files:
             await asyncio.sleep(2)
+
+    # Split & upload videos that exceed the Telegram limit (2 GB / 4 GB Premium)
+    if split_videos:
+        try:
+            await status_msg.edit(
+                f"✂️ Memotong {len(split_videos)} video besar kepada bahagian…\n"
+                f"🧲 {torrent_name}"
+            )
+        except Exception:
+            pass
+
+    for finfo in split_videos:
+        if is_cancelled(user_id):
+            await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+            return
+
+        await _split_and_upload_video(
+            bot, user_client, backup_peer, message,
+            finfo["path"], finfo["name"], finfo["size"],
+            torrent_name, uploaded, status_msg, size_limit,
+        )
+        gc.collect()
 
     if not uploaded:
         await status_msg.edit("❌ Semua fail gagal dimuat naik.")
