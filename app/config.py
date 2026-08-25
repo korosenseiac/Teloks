@@ -21,7 +21,10 @@ TERABOX_NDUS = os.getenv("TERABOX_NDUS", "")
 # Torrent (aria2c)
 ARIA2_RPC_PORT = int(os.getenv("ARIA2_RPC_PORT", "6800"))
 ARIA2_RPC_SECRET = os.getenv("ARIA2_RPC_SECRET", "")
-TORRENT_MAX_SIZE = int(os.getenv("TORRENT_MAX_SIZE", str(4 * 1024 * 1024 * 1024)))  # 4 GB default
+# Hard ceiling for the TOTAL torrent size. Oversized videos are split into
+# parts automatically (2 GB regular / 4 GB premium per-file limit), so this
+# only guards against absurdly large multi-hundred-GB torrents.
+TORRENT_MAX_SIZE = int(os.getenv("TORRENT_MAX_SIZE", str(50 * 1024 * 1024 * 1024)))  # 50 GB default
 TORRENT_DOWNLOAD_DIR = os.getenv("TORRENT_DOWNLOAD_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "tmp", "torrent_downloads"))
 
 # Torrent timeouts (seconds)
