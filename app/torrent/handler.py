@@ -50,7 +50,12 @@ from pyrogram.types import (
     InputMediaDocument,
 )
 
-from app.config import BACKUP_GROUP_ID, TORRENT_MAX_SIZE
+from app.config import (
+    BACKUP_GROUP_ID,
+    TORRENT_MAX_SIZE,
+    TORRENT_STALL_TIMEOUT,
+    TORRENT_TOTAL_TIMEOUT,
+)
 from app.database.db import log_forward, get_user_session, get_user_profile
 from app.utils.streamer import upload_stream, SessionInvalidError
 from app.utils.media import (
@@ -69,7 +74,8 @@ from app.bot.session_manager import manager
 
 # Magnet URIs — e.g.  magnet:?xt=urn:btih:abc123…
 MAGNET_LINK_PATTERN = re.compile(
-    r"magnet:\?xt=urn:[a-z0-9]+:[a-zA-Z0-9]+"
+    r"magnet:\?xt=urn:[a-z0-9]+:[a-zA-Z0-9]+",
+    re.IGNORECASE,
 )
 
 # HTTP(S) URLs ending in .torrent (with optional query string)
@@ -885,43 +891,60 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
     """Handler for magnet: URIs and HTTP .torrent URLs sent as text."""
     from app.bot.main import (
         active_user_processes, get_backup_group_peer, get_backup_group_actual_id,
-        is_cancelled, reset_cancel,
+        handled_torrent_messages, is_cancelled, reset_cancel,
     )
     from app.torrent import get_aria2_client
 
     user_id = message.from_user.id
 
+    # Mark this message as routed to the torrent handler so fallback
+    # handlers don't process the same message a second time.
+    handled_torrent_messages.add((message.chat.id, message.id))
+
+    print(f"[Torrent] Link handler invoked: user={user_id} "
+          f"text={message.text[:120]!r}")
+
     # ---------------------------------------------------------------- Guards
-    if active_user_processes.get(user_id):
-        await message.reply_text(
-            "⚠️ **Ada proses yang sedang berjalan!**\n\n"
-            "Sila tunggu proses sebelumnya selesai sebelum menghantar link baru."
-        )
-        return
+    try:
+        if active_user_processes.get(user_id):
+            await message.reply_text(
+                "⚠️ **Ada proses yang sedang berjalan!**\n\n"
+                "Sila tunggu proses sebelumnya selesai sebelum menghantar link baru."
+            )
+            return
 
-    user_session = await get_user_session(user_id)
-    if not user_session:
-        await message.reply_text("❌ Belum login. Sila /start untuk login.")
-        return
+        user_session = await get_user_session(user_id)
+        if not user_session:
+            await message.reply_text("❌ Belum login. Sila /start untuk login.")
+            return
 
-    user_profile = await get_user_profile(user_id)
-    if not user_profile:
-        from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        from app.bot.states import user_profile_states, ProfileStep
-        await message.reply_text(
-            "⚠️ **Profile belum lengkap!**\n\nSila set profile anda terlebih dahulu.\n\n"
-            "👇 **Pilih jantina anda:**",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("👨 Lelaki", callback_data="profile_gender_lelaki"),
-                InlineKeyboardButton("👩 Perempuan", callback_data="profile_gender_perempuan"),
-            ]]),
-        )
-        user_profile_states[user_id] = {"step": ProfileStep.ASK_GENDER, "data": {}}
-        return
+        user_profile = await get_user_profile(user_id)
+        if not user_profile:
+            from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+            from app.bot.states import user_profile_states, ProfileStep
+            await message.reply_text(
+                "⚠️ **Profile belum lengkap!**\n\nSila set profile anda terlebih dahulu.\n\n"
+                "👇 **Pilih jantina anda:**",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("👨 Lelaki", callback_data="profile_gender_lelaki"),
+                    InlineKeyboardButton("👩 Perempuan", callback_data="profile_gender_perempuan"),
+                ]]),
+            )
+            user_profile_states[user_id] = {"step": ProfileStep.ASK_GENDER, "data": {}}
+            return
 
-    user_client = await manager.get_client(user_id)
-    if not user_client:
-        await message.reply_text("❌ Sesi tidak sah. Sila login semula.")
+        user_client = await manager.get_client(user_id)
+        if not user_client:
+            await message.reply_text("❌ Sesi tidak sah. Sila login semula.")
+            return
+    except Exception as e:
+        print(f"[Torrent] Guard error for user {user_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await message.reply_text(f"❌ Ralat memproses permintaan: {e}")
+        except Exception:
+            pass
         return
 
     # ---------------------------------------------------------------- Detect link type
@@ -1002,6 +1025,8 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
     from app.torrent import get_aria2_client
 
     user_id = message.from_user.id
+    print(f"[Torrent] File handler invoked: user={user_id} "
+          f"file={getattr(message.document, 'file_name', '?')}")
 
     # ---------------------------------------------------------------- Guards
     if active_user_processes.get(user_id):
@@ -1183,6 +1208,8 @@ async def _process_torrent(
             poll_interval=2.0,
             on_progress=_on_progress,
             cancel_check=lambda: is_cancelled(user_id),
+            stall_timeout=TORRENT_STALL_TIMEOUT,
+            total_timeout=TORRENT_TOTAL_TIMEOUT,
         )
     except Aria2Error as e:
         await download_tracker.stop()

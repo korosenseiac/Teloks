@@ -24,6 +24,7 @@ import os
 import shutil
 import signal
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -272,6 +273,8 @@ class Aria2Client:
         poll_interval: float = 2.0,
         on_progress: Optional[Any] = None,  # callable(completed, total, speed)
         cancel_check: Optional[Any] = None,  # callable() -> bool
+        stall_timeout: float = 600.0,   # abort after N seconds with zero activity
+        total_timeout: float = 7200.0,  # abort after N seconds overall
     ) -> Tuple[Dict[str, Any], str]:
         """Poll until download completes, errors, or is cancelled.
 
@@ -286,6 +289,13 @@ class Aria2Client:
             Called each poll with bytes completed, total, and download speed.
         cancel_check : callable() -> bool | None
             If returns True, the download is force-cancelled.
+        stall_timeout : float
+            Abort with an error after this many seconds with no activity
+            (no bytes downloaded and no download speed). Prevents torrents
+            that can't find peers/metadata from hanging forever.
+        total_timeout : float
+            Abort with an error after this many seconds overall. Set 0 to
+            disable.
 
         Returns
         -------
@@ -297,10 +307,14 @@ class Aria2Client:
 
         Raises
         ------
-        Aria2Error  — on download error or cancellation.
+        Aria2Error  — on download error, cancellation, stall, or timeout.
         """
         active_gid = gid
         seen_gids: set = set()
+
+        start_time = time.monotonic()
+        last_activity = start_time
+        last_completed = -1
 
         while True:
             await asyncio.sleep(poll_interval)
@@ -317,6 +331,26 @@ class Aria2Client:
             completed = int(status.get("completedLength", 0))
             speed = int(status.get("downloadSpeed", 0))
 
+            now = time.monotonic()
+
+            # Overall timeout
+            if total_timeout > 0 and now - start_time > total_timeout:
+                await self.cancel(active_gid)
+                mins = int((now - start_time) / 60)
+                raise Aria2Error(f"Torrent timed out after {mins} min.")
+
+            # Stall detection (no bytes downloaded and no speed for a while)
+            if speed > 0 or completed != last_completed:
+                last_activity = now
+                last_completed = completed
+            elif stall_timeout > 0 and now - last_activity > stall_timeout:
+                await self.cancel(active_gid)
+                mins = int(stall_timeout / 60)
+                raise Aria2Error(
+                    f"Torrent tersekat (tiada kemajuan selama {mins} minit). "
+                    "Sila cuba torrent lain atau semak rangkaian."
+                )
+
             if on_progress and total > 0:
                 on_progress(completed, total, speed)
 
@@ -332,6 +366,9 @@ class Aria2Client:
                         return status, active_gid
                     seen_gids.add(active_gid)
                     active_gid = next_gid
+                    # Fresh activity clock for the new download
+                    last_activity = now
+                    last_completed = -1
                     continue
                 return status, active_gid
 

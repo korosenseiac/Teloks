@@ -51,6 +51,10 @@ cancel_events = {}
 # Track pending bot uploads for Option 2 (user_id -> list of (file_name, asyncio.Future))
 pending_bot_uploads = {}
 
+# Track messages already routed to the torrent handler ((chat_id, msg_id)).
+# Used so the magnet fallback handler doesn't process the same message twice.
+handled_torrent_messages: set = set()
+
 def is_cancelled(user_id: int) -> bool:
     """Check if the user's process has been cancelled."""
     event = cancel_events.get(user_id)
@@ -472,6 +476,22 @@ async def torrent_magnet_handler(client: Client, message: Message):
 
 @app.on_message(filters.regex(TORRENT_URL_PATTERN) & filters.private)
 async def torrent_url_handler(client: Client, message: Message):
+    await torrent_link_handler(client, message)
+
+
+@app.on_message(filters.text & filters.private, group=3)
+async def magnet_fallback_handler(client: Client, message: Message):
+    """Safety net: route private text containing a magnet link to the torrent
+    handler even if the primary regex filter didn't match (e.g. uppercase
+    MAGNET:, leading text, unusual formatting)."""
+    key = (message.chat.id, message.id)
+    if key in handled_torrent_messages:
+        return  # already processed by the main magnet handler
+    # Each message is dispatched only once, so pruning is safe.
+    if len(handled_torrent_messages) > 5000:
+        handled_torrent_messages.clear()
+    if "magnet:" not in (message.text or "").lower():
+        return
     await torrent_link_handler(client, message)
 
 

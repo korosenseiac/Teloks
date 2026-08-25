@@ -23,3 +23,7 @@ ARIA2_RPC_PORT = int(os.getenv("ARIA2_RPC_PORT", "6800"))
 ARIA2_RPC_SECRET = os.getenv("ARIA2_RPC_SECRET", "")
 TORRENT_MAX_SIZE = int(os.getenv("TORRENT_MAX_SIZE", str(4 * 1024 * 1024 * 1024)))  # 4 GB default
 TORRENT_DOWNLOAD_DIR = os.getenv("TORRENT_DOWNLOAD_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "tmp", "torrent_downloads"))
+
+# Torrent timeouts (seconds)
+TORRENT_STALL_TIMEOUT = int(os.getenv("TORRENT_STALL_TIMEOUT", "600"))   # abort after Ns with no progress
+TORRENT_TOTAL_TIMEOUT = int(os.getenv("TORRENT_TOTAL_TIMEOUT", "7200"))  # abort after Ns overall wait
