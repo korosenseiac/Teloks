@@ -55,6 +55,19 @@ echo -e "${BLUE}Running fresh installation...${NC}"
 apt update
 apt install -y python3.12 python3.12-venv python3-pip unrar ffmpeg aria2
 
+# Open the torrent listen port in the firewall (peer discovery).
+# aria2c binds ONE fixed port (default 51413, see TORRENT_LISTEN_PORT in .env)
+# for incoming peer connections (TCP) and DHT (UDP). Without this the bot can
+# only make outbound connections — a common cause of "many seeders but no peers".
+TORRENT_PORT="${TORRENT_LISTEN_PORT:-51413}"
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow ${TORRENT_PORT}/tcp >/dev/null 2>&1 || true
+    ufw allow ${TORRENT_PORT}/udp >/dev/null 2>&1 || true
+    echo "ufw: opened ${TORRENT_PORT}/tcp+udp (BitTorrent/DHT)"
+else
+    echo "WARNING: ufw not found — open TCP+UDP ${TORRENT_PORT} (or your TORRENT_LISTEN_PORT) on your VPS firewall / security group"
+fi
+
 # Create user
 if ! id "$BOT_USER" &>/dev/null; then
     useradd -r -m -s /bin/bash $BOT_USER
@@ -90,6 +103,7 @@ BOT_TOKEN=your_bot_token_here
 MONGO_URI=mongodb+srv://username:password@cluster.xxxxx.mongodb.net/telegram_forwarder?retryWrites=true&w=majority
 BACKUP_GROUP_ID=-1001234567890
 OWNER_ID=your_telegram_id_here
+TORRENT_LISTEN_PORT=51413
 EOF
     chown $BOT_USER:$BOT_USER $BOT_DIR/.env
     chmod 600 $BOT_DIR/.env

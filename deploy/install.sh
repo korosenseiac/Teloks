@@ -64,6 +64,22 @@ apt install -y python3.12 python3.12-venv python3-pip git curl wget unrar ffmpeg
 
 print_status "System dependencies installed"
 
+# Step 1b: Open the torrent listen port in the firewall (peer discovery)
+# aria2c binds ONE fixed port (default 51413, override via TORRENT_LISTEN_PORT
+# in .env) for incoming peer connections (TCP) and DHT (UDP). Without this the
+# bot can only make outbound connections — a very common cause of "many
+# seeders but the bot can't find any peers".
+echo ""
+echo -e "${BLUE}Step 1b: Opening torrent port in firewall...${NC}"
+TORRENT_PORT="${TORRENT_LISTEN_PORT:-51413}"
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow ${TORRENT_PORT}/tcp >/dev/null 2>&1 && echo "ufw: allowed ${TORRENT_PORT}/tcp (BitTorrent peers)"
+    ufw allow ${TORRENT_PORT}/udp >/dev/null 2>&1 && echo "ufw: allowed ${TORRENT_PORT}/udp (DHT)"
+    print_status "Torrent port ${TORRENT_PORT} opened in ufw"
+else
+    print_warning "ufw not found — open TCP+UDP ${TORRENT_PORT} (or your TORRENT_LISTEN_PORT) on your VPS firewall / cloud security group"
+fi
+
 # Step 2: Create bot user (if not exists)
 echo ""
 echo -e "${BLUE}Step 2: Creating bot user...${NC}"
@@ -127,6 +143,11 @@ BACKUP_GROUP_ID=-1001234567890
 
 # Owner Telegram ID
 OWNER_ID=your_telegram_id_here
+
+# Torrent (aria2c) — peer-discovery port. Open this port TCP+UDP on your
+# firewall/security group so the bot can receive peers and DHT responses.
+# Default 51413; keep it in sync with deploy firewall rules.
+TORRENT_LISTEN_PORT=51413
 EOF
     chown $BOT_USER:$BOT_USER $BOT_DIR/.env
     chmod 600 $BOT_DIR/.env

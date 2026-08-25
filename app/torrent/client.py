@@ -14,8 +14,10 @@ isolated from the Python bot.  Key flags keep resource usage low:
 
 Peer discovery is tuned for reliability:
   --enable-dht=true / --enable-peer-exchange=true / --bt-enable-lpd=true
-  --bt-tracker=<public tracker> × N   (fallback for bare magnet links)
-  --bt-stop-timeout=0                 (never auto-abort a stalled torrent)
+  --dht-entry-point=<bootstrap node> × N   (explicit DHT bootstrap)
+  --bt-tracker=<public tracker> × N         (fallback for bare magnet links)
+  --bt-stop-timeout=0                        (never auto-abort a stalled torrent)
+  --disable-ipv6=true                        (avoid IPv6 timeouts → "no peers")
 """
 from __future__ import annotations
 
@@ -33,24 +35,54 @@ from app.config import (
     ARIA2_RPC_PORT,
     ARIA2_RPC_SECRET,
     TORRENT_DOWNLOAD_DIR,
+    TORRENT_LISTEN_PORT,
+    TORRENT_DISABLE_IPV6,
+    TORRENT_TRACKERS,
 )
 
 
 # Public BitTorrent trackers used as a fallback for magnet links that carry no
 # `tr=` parameters. Giving aria2 a bootstrap set of trackers dramatically
-# improves peer discovery and torrent-metadata resolution.
-BT_TRACKERS = [
+# improves peer discovery and torrent-metadata resolution. Override the whole
+# list with the TORRENT_TRACKERS env var (comma-separated announce URLs).
+_DEFAULT_BT_TRACKERS = [
     "udp://tracker.opentrackr.org:1337/announce",
+    "https://opentracker.i2p.rocks:443/announce",
     "udp://open.stealth.si:80/announce",
-    "udp://exodus.desync.com:6969/announce",
+    "https://tracker.gbitt.info/announce",
     "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
     "udp://tracker.moeking.me:6969/announce",
     "udp://explodie.org:6969/announce",
-    "udp://open.demonii.com:1337/announce",
-    "udp://tracker.internetwarriors.net:1337/announce",
     "udp://tracker.tiny-vps.com:6969/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://tracker.cyberia.is:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://public.tracker.volemon.me:6969/announce",
     "http://tracker.openbittorrent.com:80/announce",
-    "https://tracker.gbitt.info/announce",
+    "udp://tracker1.bt.moack.co.kr:80/announce",
+    "udp://tracker.birkenfeld.one:6969/announce",
+]
+
+
+def _resolve_bt_trackers() -> List[str]:
+    """Return the fallback tracker list (env override wins)."""
+    if TORRENT_TRACKERS:
+        return [t.strip() for t in TORRENT_TRACKERS.split(",") if t.strip()]
+    return list(_DEFAULT_BT_TRACKERS)
+
+
+BT_TRACKERS = _resolve_bt_trackers()
+
+# Well-known DHT bootstrap nodes. `--enable-dht=true` alone relies on aria2's
+# bundled (and often stale) bootstrap nodes, which makes DHT slow to come
+# online. Explicit entry points let the DHT routing table populate within
+# seconds, which is the main peer source for bare magnet links.
+DHT_ENTRY_POINTS = [
+    "router.bittorrent.com:6881",
+    "router.utorrent.com:6881",
+    "dht.transmissionbt.com:6881",
+    "dht.libtorrent.org:25401",
 ]
 
 
@@ -96,18 +128,22 @@ class Aria2Client:
             "--max-overall-download-limit=0",
             "--file-allocation=none",
             "--disk-cache=16M",
-            # Peer discovery: DHT + peer exchange + local peer discovery, plus
-            # a fallback list of public trackers (helps bare magnet links that
-            # carry no `tr=` params resolve metadata and find peers).
+            # Peer discovery: DHT + peer exchange + local peer discovery.
+            # A single FIXED port is used for both BitTorrent (TCP, incoming
+            # peer connections) and DHT (UDP). The classic 6881-6999 range is
+            # avoided because ISPs commonly throttle it and the random
+            # per-start port would make firewall rules impossible to maintain.
             "--enable-dht=true",
-            "--dht-listen-port=6881-6999",
-            "--listen-port=6881-6999",
+            f"--listen-port={TORRENT_LISTEN_PORT}",
+            f"--dht-listen-port={TORRENT_LISTEN_PORT}",
             "--enable-peer-exchange=true",
             "--bt-enable-lpd=true",
-            "--bt-tracker-connect-timeout=30",
-            "--bt-tracker-timeout=30",
-            "--bt-stop-timeout=0",          # never auto-abort a stalled torrent
-            "--summary-interval=0",         # no periodic console output
+            "--bt-save-metadata=true",   # cache magnet metadata → faster re-adds
+            "--bt-max-peers=0",          # 0 = unlimited peer connections
+            "--bt-tracker-connect-timeout=60",
+            "--bt-tracker-timeout=60",
+            "--bt-stop-timeout=0",       # never auto-abort a stalled torrent
+            "--summary-interval=0",      # no periodic console output
             "--auto-save-interval=0",
             "--console-log-level=warn",
             f"--dir={download_dir}",
@@ -115,8 +151,18 @@ class Aria2Client:
             "--auto-file-renaming=false",
             "--check-integrity=false",
         ]
-        for tracker in BT_TRACKERS:
-            cmd.append(f"--bt-tracker={tracker}")
+        # Disable IPv6 unless the host has working IPv6 (default true). On an
+        # IPv4-only VPS, aria2 burns time on AAAA lookups / IPv6 connection
+        # timeouts before falling back — which presents as "no peers" even when
+        # the swarm is full.
+        cmd.append(f"--disable-ipv6={'true' if TORRENT_DISABLE_IPV6 else 'false'}")
+        # Explicit DHT bootstrap nodes so the DHT table populates quickly.
+        for entry in DHT_ENTRY_POINTS:
+            cmd.append(f"--dht-entry-point={entry}")
+        # Fallback public trackers — a single comma-separated value registers
+        # every tracker on all aria2 builds (safe, unambiguous).
+        if BT_TRACKERS:
+            cmd.append("--bt-tracker=" + ",".join(BT_TRACKERS))
 
         if self.secret:
             cmd.append(f"--rpc-secret={self.secret}")
@@ -248,6 +294,10 @@ class Aria2Client:
         """Return list of files in the download."""
         return await self._rpc("aria2.getFiles", [gid])
 
+    async def get_peers(self, gid: str) -> List[Dict[str, Any]]:
+        """Return the list of peers connected to a download (diagnostics)."""
+        return await self._rpc("aria2.getPeers", [gid])
+
     async def cancel(self, gid: str) -> None:
         """Force-remove (cancel) a download."""
         try:
@@ -315,6 +365,7 @@ class Aria2Client:
         start_time = time.monotonic()
         last_activity = start_time
         last_completed = -1
+        last_peer_log = start_time
 
         while True:
             await asyncio.sleep(poll_interval)
@@ -350,6 +401,19 @@ class Aria2Client:
                     f"Torrent tersekat (tiada kemajuan selama {mins} minit). "
                     "Sila cuba torrent lain atau semak rangkaian."
                 )
+            elif now - last_activity > 30 and now - last_peer_log > 60:
+                # Diagnostics: while stalled, log how many peers aria2 has
+                # actually connected to, so "no peers" issues become visible
+                # in the bot logs instead of a silent 10-minute wait.
+                last_peer_log = now
+                try:
+                    peers = await self.get_peers(active_gid)
+                    print(
+                        f"[Torrent] WARNING: no progress for {int(now - last_activity)}s — "
+                        f"connected peers: {len(peers)}"
+                    )
+                except Exception:
+                    pass
 
             if on_progress and total > 0:
                 on_progress(completed, total, speed)
