@@ -1060,6 +1060,13 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
             print(f"[Torrent] Failed to clean temp dir {temp_dir}: {e}")
+        # Purge this user's aria2 downloads (cancelled / errored / finished) so
+        # a re-add of the same torrent never hits "already registered".
+        try:
+            aria2 = await get_aria2_client()
+            await aria2.cleanup_user(user_id)
+        except Exception as e:
+            print(f"[Torrent] aria2 cleanup failed for user {user_id}: {e}")
         active_user_processes.pop(user_id, None)
         reset_cancel(user_id)
         gc.collect()
@@ -1161,6 +1168,13 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
             print(f"[Torrent] Failed to clean temp dir {temp_dir}: {e}")
+        # Purge this user's aria2 downloads (cancelled / errored / finished) so
+        # a re-add of the same torrent never hits "already registered".
+        try:
+            aria2 = await get_aria2_client()
+            await aria2.cleanup_user(user_id)
+        except Exception as e:
+            print(f"[Torrent] aria2 cleanup failed for user {user_id}: {e}")
         active_user_processes.pop(user_id, None)
         reset_cancel(user_id)
         gc.collect()
@@ -1192,6 +1206,16 @@ async def _process_torrent(
     # 1. Start aria2c client
     aria2 = await get_aria2_client()
 
+    # Register the user's aria2 downloads so the handler's finally block can
+    # fully purge them even if a cancellation/error interrupts us before
+    # wait_for_download gets a chance to clean up.
+    aria2.register_download(user_id)
+    if link_type == "magnet":
+        # Register the infoHash from the magnet URI right away, so cleanup works
+        # even if we are cancelled before aria2 exposes the infoHash itself.
+        from app.torrent.client import extract_info_hash_from_magnet
+        aria2.register_download(user_id, info_hash=extract_info_hash_from_magnet(link_or_path))
+
     # 2. Submit download
     if link_type == "magnet":
         gid = await aria2.add_magnet(link_or_path, download_dir)
@@ -1201,6 +1225,7 @@ async def _process_torrent(
         gid = await aria2.add_torrent(link_or_path, download_dir)
     else:
         raise ValueError(f"Unknown link type: {link_type}")
+    aria2.register_download(user_id, gid=gid)
 
     print(f"[Torrent] Download started: gid={gid} type={link_type}")
 
@@ -1214,12 +1239,18 @@ async def _process_torrent(
     try:
         init_status = await aria2.get_status(gid)
         torrent_name = _get_torrent_name(init_status)
-        # For magnet links, if there's a followedBy, track that GID
+        # For magnet links, if there's a followedBy, track that GID (but keep
+        # the original GID so wait_for_download follows — and cleans up — the
+        # whole metadata → data chain).
         followed = init_status.get("followedBy")
         if followed:
-            gid = followed[0]
-            init_status = await aria2.get_status(gid)
-            torrent_name = _get_torrent_name(init_status) or torrent_name
+            data_gid = followed[0]
+            aria2.register_download(user_id, gid=data_gid)
+            data_status = await aria2.get_status(data_gid)
+            ih = data_status.get("infoHash") or (data_status.get("bittorrent") or {}).get("infoHash")
+            if ih:
+                aria2.register_download(user_id, info_hash=ih)
+            torrent_name = _get_torrent_name(data_status) or torrent_name
     except Exception:
         torrent_name = "Unknown"
 

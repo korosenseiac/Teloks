@@ -89,6 +89,34 @@ DHT_ENTRY_POINTS = [
 class Aria2Error(Exception):
     """Raised when aria2c RPC returns an error."""
 
+    def __init__(self, message: str, code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def extract_info_hash_from_magnet(uri: str) -> Optional[str]:
+    """Extract a 40-char lowercase hex infoHash from a magnet URI (btih).
+
+    Supports both 40-char hex and 32-char base32 ``xt=urn:btih:`` values.
+    Returns None if the URI does not carry an infoHash.
+    """
+    import base64
+    import re
+
+    m = re.search(r"urn:btih:([a-zA-Z0-9]+)", uri or "", re.IGNORECASE)
+    if not m:
+        return None
+    raw_hash = m.group(1)
+    if len(raw_hash) == 40:
+        return raw_hash.lower()
+    if len(raw_hash) == 32:
+        try:
+            return base64.b32decode(raw_hash.upper()).hex()
+        except Exception:
+            return None
+    return None
+
 
 class Aria2Client:
     """Async wrapper around the aria2c JSON-RPC interface."""
@@ -100,6 +128,9 @@ class Aria2Client:
         self._process: Optional[asyncio.subprocess.Process] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._req_id: int = 0
+        # Per-user registry of GIDs/infoHashes added for them, so a cancellation
+        # at ANY point in the handler can still fully clean aria2's memory.
+        self._user_downloads: Dict[int, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -189,6 +220,10 @@ class Aria2Client:
             try:
                 if await self.ping():
                     print(f"[Torrent] aria2c started (pid={self._process.pid}, port={self.port})")
+                    try:
+                        await self.purge_results()
+                    except Exception:
+                        pass
                     return
             except Exception:
                 pass
@@ -247,18 +282,69 @@ class Aria2Client:
             data = await resp.json()
 
         if "error" in data:
-            raise Aria2Error(data["error"].get("message", str(data["error"])))
+            err = data["error"]
+            if isinstance(err, dict):
+                msg = err.get("message", str(err))
+                code = err.get("code")
+            else:
+                msg = str(err)
+                code = None
+            raise Aria2Error(msg, code=code)
 
         return data.get("result", {})
 
     # ------------------------------------------------------------------
-    # Download methods
+    # Download methods with Error 12 ("already registered") auto-recovery
     # ------------------------------------------------------------------
+
+    def _is_already_registered_error(self, err: Exception) -> bool:
+        """Check if error is aria2 error 12 / already registered."""
+        if getattr(err, "code", None) == 12:
+            return True
+        msg = str(err).lower()
+        return "already registered" in msg or "error 12" in msg
+
+    async def _handle_already_registered(self, err: Exception, uri: Optional[str] = None) -> None:
+        """Clean up registered download by infoHash or purge all results."""
+        import re
+        info_hash = None
+        match = re.search(r"infohash\s+([0-9a-fA-F]{40})", str(err), re.IGNORECASE)
+        if match:
+            info_hash = match.group(1)
+        elif uri and "urn:btih:" in uri.lower():
+            info_hash = extract_info_hash_from_magnet(uri)
+
+        if info_hash:
+            await self.remove_by_info_hash(info_hash)
+        else:
+            await self.purge_results()
+
+    async def _add_uri_with_retry(self, uris: List[str], opts: Dict[str, Any]) -> str:
+        try:
+            return await self._rpc("aria2.addUri", [uris, opts])
+        except Aria2Error as e:
+            if self._is_already_registered_error(e):
+                print(f"[Torrent] Torrent already registered: {e}. Cleaning existing download and retrying...")
+                await self._handle_already_registered(e, uri=uris[0] if uris else None)
+                await asyncio.sleep(0.5)
+                return await self._rpc("aria2.addUri", [uris, opts])
+            raise
+
+    async def _add_torrent_with_retry(self, torrent_b64: str, opts: Dict[str, Any]) -> str:
+        try:
+            return await self._rpc("aria2.addTorrent", [torrent_b64, [], opts])
+        except Aria2Error as e:
+            if self._is_already_registered_error(e):
+                print(f"[Torrent] Torrent already registered: {e}. Cleaning existing download and retrying...")
+                await self._handle_already_registered(e)
+                await asyncio.sleep(0.5)
+                return await self._rpc("aria2.addTorrent", [torrent_b64, [], opts])
+            raise
 
     async def add_magnet(self, magnet_uri: str, download_dir: str) -> str:
         """Add a magnet URI. Returns the GID."""
         opts = {"dir": download_dir, "seed-time": "0"}
-        result = await self._rpc("aria2.addUri", [[magnet_uri], opts])
+        result = await self._add_uri_with_retry([magnet_uri], opts)
         return result  # GID string
 
     async def add_torrent(self, torrent_path: str, download_dir: str) -> str:
@@ -267,13 +353,13 @@ class Aria2Client:
         with open(torrent_path, "rb") as f:
             torrent_b64 = base64.b64encode(f.read()).decode("ascii")
         opts = {"dir": download_dir, "seed-time": "0"}
-        result = await self._rpc("aria2.addTorrent", [torrent_b64, [], opts])
+        result = await self._add_torrent_with_retry(torrent_b64, opts)
         return result
 
     async def add_torrent_url(self, url: str, download_dir: str) -> str:
         """Add an HTTP URL to a .torrent file. Returns the GID."""
         opts = {"dir": download_dir, "seed-time": "0"}
-        result = await self._rpc("aria2.addUri", [[url], opts])
+        result = await self._add_uri_with_retry([url], opts)
         return result
 
     async def get_status(self, gid: str) -> Dict[str, Any]:
@@ -286,7 +372,7 @@ class Aria2Client:
         keys = [
             "status", "totalLength", "completedLength", "downloadSpeed",
             "uploadSpeed", "files", "bittorrent", "errorCode", "errorMessage",
-            "followedBy", "dir", "gid",
+            "followedBy", "dir", "gid", "infoHash",
         ]
         return await self._rpc("aria2.tellStatus", [gid, keys])
 
@@ -299,18 +385,139 @@ class Aria2Client:
         return await self._rpc("aria2.getPeers", [gid])
 
     async def cancel(self, gid: str) -> None:
-        """Force-remove (cancel) a download."""
+        """Force-remove (cancel) an active or waiting download."""
         try:
             await self._rpc("aria2.forceRemove", [gid])
         except Aria2Error:
-            pass  # already removed
+            pass  # already removed or stopped
 
     async def remove_result(self, gid: str) -> None:
-        """Remove completed/error/removed download result."""
+        """Remove completed/error/removed download result from memory."""
         try:
             await self._rpc("aria2.removeDownloadResult", [gid])
         except Aria2Error:
             pass
+
+    async def purge_results(self) -> None:
+        """Purge all completed/error/removed download results from memory."""
+        try:
+            await self._rpc("aria2.purgeDownloadResult")
+        except Aria2Error:
+            pass
+
+    async def remove_download(self, gid: str) -> None:
+        """Force cancel an active/waiting download and remove its result from memory."""
+        await self.cancel(gid)
+        await self.remove_result(gid)
+
+    def register_download(
+        self,
+        user_id: int,
+        gid: Optional[str] = None,
+        info_hash: Optional[str] = None,
+    ) -> None:
+        """Record a GID / infoHash for a user so it can be cleaned up later.
+
+        The bot's handlers call this as they add downloads. ``cleanup_user``
+        (called from the handler ``finally`` blocks) then guarantees aria2 is
+        left clean no matter where a cancellation interrupted the flow.
+        """
+        entry = self._user_downloads.setdefault(user_id, {"gids": set(), "info_hash": None})
+        if gid:
+            entry["gids"].add(gid)
+        if info_hash:
+            entry["info_hash"] = info_hash.strip().lower()
+
+    async def cleanup_user(self, user_id: int) -> None:
+        """Force-remove every aria2 download registered for ``user_id``."""
+        entry = self._user_downloads.pop(user_id, None)
+        if not entry:
+            return
+        await self.cleanup_download(entry.get("gids") or set(), entry.get("info_hash"))
+
+    async def cleanup_download(self, gids, info_hash: Optional[str] = None) -> None:
+        """Fully cancel/purge a download from aria2's memory.
+
+        Force-removes every known GID (active/waiting), removes the stopped
+        results, then clears anything else sharing ``info_hash`` (e.g. the
+        metadata GID of a magnet, or a duplicate from an earlier session).
+        Safe to call multiple times and from any cancellation path — a
+        cancelled torrent can then be re-added without aria2 error 12
+        ("InfoHash ... is already registered").
+        """
+        if gids:
+            for gid in list(gids):
+                try:
+                    await self.remove_download(gid)
+                except Exception as e:
+                    print(f"[Torrent] cleanup_download: failed to remove GID={gid}: {e}")
+        if info_hash:
+            try:
+                await self.remove_by_info_hash(info_hash)
+            except Exception as e:
+                print(f"[Torrent] cleanup_download: remove_by_info_hash({info_hash}) failed: {e}")
+        try:
+            await self.purge_results()
+        except Exception as e:
+            print(f"[Torrent] cleanup_download: purge_results failed: {e}")
+
+    async def remove_by_info_hash(self, info_hash: str) -> None:
+        """Find and completely remove any download (active, waiting, stopped) matching info_hash.
+
+        Collects every matching GID from all three aria2 lists first, then
+        force-removes active/waiting downloads and purges stopped results.
+        This guarantees the infoHash is unregistered even when multiple
+        downloads share it (e.g. a magnet's metadata GID plus its followed-by
+        data GID).
+        """
+        info_hash_clean = (info_hash or "").strip().lower()
+        if not info_hash_clean:
+            await self.purge_results()
+            return
+        print(f"[Torrent] Cleaning up info_hash={info_hash_clean} from aria2...")
+
+        def _matches(item: Any) -> bool:
+            ih = (item.get("infoHash") or item.get("bittorrent", {}).get("infoHash") or "").lower()
+            return ih == info_hash_clean
+
+        active_gids: List[str] = []
+        waiting_gids: List[str] = []
+        stopped_gids: List[str] = []
+
+        # 1. Collect active downloads
+        try:
+            active = await self._rpc("aria2.tellActive", [["gid", "infoHash", "bittorrent"]])
+            if isinstance(active, list):
+                active_gids = [it.get("gid") for it in active if it.get("gid") and _matches(it)]
+        except Exception as e:
+            print(f"[Torrent] Error checking active downloads for info_hash {info_hash}: {e}")
+
+        # 2. Collect waiting downloads
+        try:
+            waiting = await self._rpc("aria2.tellWaiting", [0, 1000, ["gid", "infoHash", "bittorrent"]])
+            if isinstance(waiting, list):
+                waiting_gids = [it.get("gid") for it in waiting if it.get("gid") and _matches(it)]
+        except Exception as e:
+            print(f"[Torrent] Error checking waiting downloads for info_hash {info_hash}: {e}")
+
+        # 3. Collect stopped downloads
+        try:
+            stopped = await self._rpc("aria2.tellStopped", [0, 1000, ["gid", "infoHash", "bittorrent"]])
+            if isinstance(stopped, list):
+                stopped_gids = [it.get("gid") for it in stopped if it.get("gid") and _matches(it)]
+        except Exception as e:
+            print(f"[Torrent] Error checking stopped downloads for info_hash {info_hash}: {e}")
+
+        # 4. Remove everything collected
+        for gid in active_gids + waiting_gids:
+            print(f"[Torrent] Removing active/waiting GID={gid} for info_hash={info_hash_clean}")
+            await self.remove_download(gid)
+        for gid in stopped_gids:
+            print(f"[Torrent] Removing stopped result GID={gid} for info_hash={info_hash_clean}")
+            await self.remove_result(gid)
+
+        # 5. Purge any remaining stopped results
+        await self.purge_results()
 
     # ------------------------------------------------------------------
     # High-level: wait for download completion
@@ -332,6 +539,11 @@ class Aria2Client:
         download once the metadata (or the .torrent file) has been fetched.
         This method transparently follows that chain and reports the status of
         the GID that actually finished the download.
+
+        Every exit path (cancel, error, stall, timeout, task cancellation)
+        fully purges the involved GIDs — and, once the infoHash is known, any
+        other download in aria2 sharing it — so a cancelled torrent can be
+        re-added immediately without aria2 error 12 ("already registered").
 
         Parameters
         ----------
@@ -361,87 +573,126 @@ class Aria2Client:
         """
         active_gid = gid
         seen_gids: set = set()
+        all_gids: set = {gid}
+        known_info_hash: Optional[str] = None
 
         start_time = time.monotonic()
         last_activity = start_time
         last_completed = -1
         last_peer_log = start_time
 
-        while True:
-            await asyncio.sleep(poll_interval)
+        async def _cleanup() -> None:
+            """Force-remove every tracked GID and any download sharing the infoHash."""
+            try:
+                await self.cleanup_download(all_gids, known_info_hash)
+            except Exception as e:
+                print(f"[Torrent] wait_for_download cleanup error: {e}")
 
-            # Check cancellation
-            if cancel_check and cancel_check():
-                await self.cancel(active_gid)
-                raise Aria2Error("Download cancelled by user")
+        try:
+            while True:
+                await asyncio.sleep(poll_interval)
 
-            status = await self.get_status(active_gid)
-            state = status.get("status", "")
+                # Check cancellation
+                if cancel_check and cancel_check():
+                    await _cleanup()
+                    raise Aria2Error("Download cancelled by user")
 
-            total = int(status.get("totalLength", 0))
-            completed = int(status.get("completedLength", 0))
-            speed = int(status.get("downloadSpeed", 0))
+                status = await self.get_status(active_gid)
+                state = status.get("status", "")
 
-            now = time.monotonic()
+                # Remember the infoHash as soon as it is known so cleanup can
+                # also remove the metadata / followed-by GIDs that share it.
+                ih = status.get("infoHash") or (status.get("bittorrent") or {}).get("infoHash")
+                if ih:
+                    known_info_hash = ih
 
-            # Overall timeout
-            if total_timeout > 0 and now - start_time > total_timeout:
-                await self.cancel(active_gid)
-                mins = int((now - start_time) / 60)
-                raise Aria2Error(f"Torrent timed out after {mins} min.")
+                total = int(status.get("totalLength", 0))
+                completed = int(status.get("completedLength", 0))
+                speed = int(status.get("downloadSpeed", 0))
 
-            # Stall detection (no bytes downloaded and no speed for a while)
-            if speed > 0 or completed != last_completed:
-                last_activity = now
-                last_completed = completed
-            elif stall_timeout > 0 and now - last_activity > stall_timeout:
-                await self.cancel(active_gid)
-                mins = int(stall_timeout / 60)
-                raise Aria2Error(
-                    f"Torrent tersekat (tiada kemajuan selama {mins} minit). "
-                    "Sila cuba torrent lain atau semak rangkaian."
-                )
-            elif now - last_activity > 30 and now - last_peer_log > 60:
-                # Diagnostics: while stalled, log how many peers aria2 has
-                # actually connected to, so "no peers" issues become visible
-                # in the bot logs instead of a silent 10-minute wait.
-                last_peer_log = now
-                try:
-                    peers = await self.get_peers(active_gid)
-                    print(
-                        f"[Torrent] WARNING: no progress for {int(now - last_activity)}s — "
-                        f"connected peers: {len(peers)}"
-                    )
-                except Exception:
-                    pass
+                now = time.monotonic()
 
-            if on_progress and total > 0:
-                on_progress(completed, total, speed)
+                # Overall timeout
+                if total_timeout > 0 and now - start_time > total_timeout:
+                    await _cleanup()
+                    mins = int((now - start_time) / 60)
+                    raise Aria2Error(f"Torrent timed out after {mins} min.")
 
-            if state == "complete":
-                # Magnet links first resolve metadata, then spawn a
-                # "followed-by" GID for the actual data download. Keep
-                # following until we reach a GID that completed on its own.
-                followed = status.get("followedBy")
-                if followed:
-                    next_gid = followed[0]
-                    if next_gid == active_gid or next_gid in seen_gids:
-                        # Safety net: never loop forever on a follow cycle.
-                        return status, active_gid
-                    seen_gids.add(active_gid)
-                    active_gid = next_gid
-                    # Fresh activity clock for the new download
+                # Stall detection (no bytes downloaded and no speed for a while)
+                if speed > 0 or completed != last_completed:
                     last_activity = now
-                    last_completed = -1
-                    continue
-                return status, active_gid
+                    last_completed = completed
+                elif stall_timeout > 0 and now - last_activity > stall_timeout:
+                    await _cleanup()
+                    mins = int(stall_timeout / 60)
+                    raise Aria2Error(
+                        f"Torrent tersekat (tiada kemajuan selama {mins} minit). "
+                        "Sila cuba torrent lain atau semak rangkaian."
+                    )
+                elif now - last_activity > 30 and now - last_peer_log > 60:
+                    # Diagnostics: while stalled, log how many peers aria2 has
+                    # actually connected to, so "no peers" issues become visible
+                    # in the bot logs instead of a silent 10-minute wait.
+                    last_peer_log = now
+                    try:
+                        peers = await self.get_peers(active_gid)
+                        print(
+                            f"[Torrent] WARNING: no progress for {int(now - last_activity)}s — "
+                            f"connected peers: {len(peers)}"
+                        )
+                    except Exception:
+                        pass
 
-            if state == "error":
-                code = status.get("errorCode", "?")
-                msg = status.get("errorMessage", "Unknown error")
-                raise Aria2Error(f"aria2 error {code}: {msg}")
+                if on_progress and total > 0:
+                    on_progress(completed, total, speed)
 
-            if state == "removed":
-                raise Aria2Error("Download was removed/cancelled")
+                if state == "complete":
+                    # Magnet links first resolve metadata, then spawn a
+                    # "followed-by" GID for the actual data download. Keep
+                    # following until we reach a GID that completed on its own.
+                    followed = status.get("followedBy")
+                    if followed:
+                        next_gid = followed[0]
+                        if next_gid == active_gid or next_gid in seen_gids:
+                            # Safety net: never loop forever on a follow cycle.
+                            for g in seen_gids:
+                                await self.remove_result(g)
+                            return status, active_gid
+                        seen_gids.add(active_gid)
+                        all_gids.add(next_gid)
+                        active_gid = next_gid
+                        # Fresh activity clock for the new download
+                        last_activity = now
+                        last_completed = -1
+                        continue
+                    # Clean up intermediate metadata GIDs
+                    for g in seen_gids:
+                        await self.remove_result(g)
+                    return status, active_gid
 
-            # state in ("active", "waiting", "paused") — keep polling
+                if state == "error":
+                    await _cleanup()
+                    code = status.get("errorCode", "?")
+                    msg = status.get("errorMessage", "Unknown error")
+                    if str(code) == "12":
+                        # Duplicate infoHash — a previous copy of this torrent was
+                        # still registered in aria2. It has just been purged, so
+                        # re-sending the torrent will now succeed.
+                        raise Aria2Error(
+                            f"aria2 error 12: InfoHash {known_info_hash or '?'} was already registered. "
+                            "Salinan lama telah dibersihkan, sila hantar semula torrent."
+                        )
+                    raise Aria2Error(f"aria2 error {code}: {msg}")
+
+                if state == "removed":
+                    await _cleanup()
+                    raise Aria2Error("Download was removed/cancelled")
+
+                # state in ("active", "waiting", "paused") — keep polling
+
+        except (asyncio.CancelledError, GeneratorExit):
+            try:
+                await self.cleanup_download(all_gids, known_info_hash)
+            except Exception:
+                pass
+            raise
