@@ -124,7 +124,10 @@ async def _generate_video_thumb(video_path: str, duration_sec: int = 0) -> Optio
     """Generate a thumbnail for a video file using ffmpeg.
     
     Seeks to 10% of video duration (or 1 second if duration unknown).
+    Tries 20%, 45%, and 70% of video duration (or 1 second fallback)
+    and returns the first non-blank frame.
     """
+    thumb_path = video_path + ".thumb.jpg"
     try:
         thumb_path = video_path + ".thumb.jpg"
         # If duration is known, seek to 10% of the video
@@ -142,6 +145,16 @@ async def _generate_video_thumb(video_path: str, duration_sec: int = 0) -> Optio
             stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
+        if duration_sec > 0:
+            seen = set()
+            seek_positions = []
+            for pct in (0.20, 0.45, 0.70):
+                sec = max(1, int(duration_sec * pct))
+                if sec not in seen:
+                    seen.add(sec)
+                    seek_positions.append(sec)
+        else:
+            seek_positions = [1]
 
         if proc.returncode == 0 and os.path.exists(thumb_path):
             with open(thumb_path, "rb") as f:
@@ -151,8 +164,41 @@ async def _generate_video_thumb(video_path: str, duration_sec: int = 0) -> Optio
                 return data
         if os.path.exists(thumb_path):
             os.remove(thumb_path)
+        for seek_time in seek_positions:
+            try:
+                if os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y",
+                    "-ss", str(seek_time),
+                    "-i", video_path,
+                    "-frames:v", "1",
+                    "-q:v", "2",
+                    "-vf", "scale='min(320,iw)':-2",
+                    thumb_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+
+                if proc.returncode == 0 and os.path.exists(thumb_path):
+                    with open(thumb_path, "rb") as f:
+                        data = f.read()
+                    os.remove(thumb_path)
+                    if len(data) > 500:
+                        return data
+                    print(f"[DirectLink] Thumbnail at {seek_time}s too small ({len(data)} bytes), trying next position")
+            except Exception as e:
+                print(f"[DirectLink] Thumbnail generation error at {seek_time}s: {e}")
     except Exception as e:
         print(f"[DirectLink] Error generating thumbnail: {e}")
+    finally:
+        if os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except Exception:
+                pass
     return None
 
 
@@ -1119,6 +1165,7 @@ async def _handle_archive(
                 if mf["kind"] == "video":
                     thumb_raw = await _generate_video_thumb(mf["path"])
                     video_meta = await _get_video_metadata(mf["path"])
+                    thumb_raw = await _generate_video_thumb(mf["path"], video_meta.get("duration", 0))
 
                 tracker = ProgressTracker(
                     status_msg=status_msg,
@@ -1483,6 +1530,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
 
                 else:
                     # Generate thumbnail at 10% of duration
+                    # Generate thumbnail (20% -> 45% -> 70% of duration)
                     duration = video_meta.get("duration", 0)
                     if not thumb_raw:
                         thumb_raw = await _generate_video_thumb(temp_video_path, duration)

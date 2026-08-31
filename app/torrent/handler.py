@@ -134,6 +134,13 @@ def _extract_msg_id(updates) -> Optional[int]:
 
 async def _generate_video_thumb(video_path: str) -> Optional[bytes]:
     """Use ffmpeg to extract a JPEG thumbnail at ~1 second."""
+async def _generate_video_thumb(video_path: str, duration_sec: int = 0) -> Optional[bytes]:
+    """Use ffmpeg to extract a JPEG thumbnail.
+    
+    Tries 20%, 45%, and 70% of video duration (or 1 second fallback)
+    and returns the first non-blank frame.
+    """
+    thumb_path = video_path + ".thumb.jpg"
     try:
         thumb_path = video_path + ".thumb.jpg"
         proc = await asyncio.create_subprocess_exec(
@@ -156,8 +163,52 @@ async def _generate_video_thumb(video_path: str) -> Optional[bytes]:
                 return data
         if os.path.exists(thumb_path):
             os.remove(thumb_path)
+        if duration_sec > 0:
+            seen = set()
+            seek_positions = []
+            for pct in (0.20, 0.45, 0.70):
+                sec = max(1, int(duration_sec * pct))
+                if sec not in seen:
+                    seen.add(sec)
+                    seek_positions.append(sec)
+        else:
+            seek_positions = [1]
+
+        for seek_time in seek_positions:
+            try:
+                if os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y",
+                    "-ss", str(seek_time),
+                    "-i", video_path,
+                    "-frames:v", "1",
+                    "-q:v", "5",
+                    "-vf", "scale='min(320,iw)':-2",
+                    thumb_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+
+                if proc.returncode == 0 and os.path.exists(thumb_path):
+                    with open(thumb_path, "rb") as f:
+                        data = f.read()
+                    os.remove(thumb_path)
+                    if len(data) > 500:
+                        return data
+                    print(f"[Torrent] Thumbnail at {seek_time}s too small ({len(data)} bytes), trying next position")
+            except Exception as e:
+                print(f"[Torrent] Thumbnail generation error at {seek_time}s: {e}")
     except Exception as e:
         print(f"[Torrent] _generate_video_thumb error: {e}")
+    finally:
+        if os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except Exception:
+                pass
     return None
 
 
@@ -560,6 +611,7 @@ async def _split_and_upload_video(
     base_thumb = await _generate_video_thumb(video_path)
     video_meta = await _get_video_metadata(video_path)
     total_duration = video_meta.get("duration", 0)
+    base_thumb = await _generate_video_thumb(video_path, total_duration)
 
     target_part_size = int(size_limit * 0.95)
     num_parts = max(1, math.ceil(file_size / target_part_size))
@@ -601,6 +653,7 @@ async def _split_and_upload_video(
                 part_thumb = base_thumb
             else:
                 part_thumb = await _generate_video_thumb(part_path)
+                part_thumb = await _generate_video_thumb(part_path, int(dur_sec))
             part_meta = await _get_video_metadata(part_path)
 
             ok_up = await _upload_local_file(
@@ -1318,6 +1371,7 @@ async def _process_torrent(
         if finfo["kind"] == "video":
             thumb_raw = await _generate_video_thumb(file_path)
             video_meta = await _get_video_metadata(file_path)
+            thumb_raw = await _generate_video_thumb(file_path, video_meta.get("duration", 0))
 
         await _upload_local_file(
             bot, user_client, backup_peer, message,
