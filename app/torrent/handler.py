@@ -132,20 +132,23 @@ def _extract_msg_id(updates) -> Optional[int]:
 # Video thumbnail & metadata helpers (ffmpeg / ffprobe)
 # ---------------------------------------------------------------------------
 
-async def _generate_video_thumb(video_path: str) -> Optional[bytes]:
-    """Use ffmpeg to extract a JPEG thumbnail at ~1 second."""
 async def _generate_video_thumb(video_path: str, duration_sec: int = 0) -> Optional[bytes]:
     """Use ffmpeg to extract a JPEG thumbnail.
-    
-    Tries 20%, 45%, and 70% of video duration (or 1 second fallback)
-    and returns the first non-blank frame.
+
+    Seeks to a random position between 20% and 70% of video duration
+    (or 1 second if duration is unknown).
     """
     thumb_path = video_path + ".thumb.jpg"
     try:
-        thumb_path = video_path + ".thumb.jpg"
+        # If duration is known, seek to a random point between 20% and 70%
+        if duration_sec > 0:
+            seek_time = max(1, random.uniform(duration_sec * 0.20, duration_sec * 0.70))
+        else:
+            seek_time = 1
+
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
-            "-ss", "1",
+            "-ss", str(seek_time),
             "-i", video_path,
             "-frames:v", "1",
             "-q:v", "5",
@@ -155,52 +158,12 @@ async def _generate_video_thumb(video_path: str, duration_sec: int = 0) -> Optio
             stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
+
         if proc.returncode == 0 and os.path.exists(thumb_path):
             with open(thumb_path, "rb") as f:
                 data = f.read()
             os.remove(thumb_path)
-            if len(data) > 100:
-                return data
-        if os.path.exists(thumb_path):
-            os.remove(thumb_path)
-        if duration_sec > 0:
-            seen = set()
-            seek_positions = []
-            for pct in (0.20, 0.45, 0.70):
-                sec = max(1, int(duration_sec * pct))
-                if sec not in seen:
-                    seen.add(sec)
-                    seek_positions.append(sec)
-        else:
-            seek_positions = [1]
-
-        for seek_time in seek_positions:
-            try:
-                if os.path.exists(thumb_path):
-                    os.remove(thumb_path)
-
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-y",
-                    "-ss", str(seek_time),
-                    "-i", video_path,
-                    "-frames:v", "1",
-                    "-q:v", "5",
-                    "-vf", "scale='min(320,iw)':-2",
-                    thumb_path,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await proc.wait()
-
-                if proc.returncode == 0 and os.path.exists(thumb_path):
-                    with open(thumb_path, "rb") as f:
-                        data = f.read()
-                    os.remove(thumb_path)
-                    if len(data) > 500:
-                        return data
-                    print(f"[Torrent] Thumbnail at {seek_time}s too small ({len(data)} bytes), trying next position")
-            except Exception as e:
-                print(f"[Torrent] Thumbnail generation error at {seek_time}s: {e}")
+            return data
     except Exception as e:
         print(f"[Torrent] _generate_video_thumb error: {e}")
     finally:
@@ -608,7 +571,6 @@ async def _split_and_upload_video(
     user_id = message.from_user.id
 
     # Thumbnail + metadata for the source video (Part 1 reuses this thumbnail)
-    base_thumb = await _generate_video_thumb(video_path)
     video_meta = await _get_video_metadata(video_path)
     total_duration = video_meta.get("duration", 0)
     base_thumb = await _generate_video_thumb(video_path, total_duration)
@@ -652,7 +614,6 @@ async def _split_and_upload_video(
             if part_num == 1 and base_thumb:
                 part_thumb = base_thumb
             else:
-                part_thumb = await _generate_video_thumb(part_path)
                 part_thumb = await _generate_video_thumb(part_path, int(dur_sec))
             part_meta = await _get_video_metadata(part_path)
 
@@ -1400,7 +1361,6 @@ async def _process_torrent(
         thumb_raw = None
         video_meta = None
         if finfo["kind"] == "video":
-            thumb_raw = await _generate_video_thumb(file_path)
             video_meta = await _get_video_metadata(file_path)
             thumb_raw = await _generate_video_thumb(file_path, video_meta.get("duration", 0))
 
