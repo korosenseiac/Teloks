@@ -15,6 +15,7 @@ import tempfile
 from typing import Dict, List, Optional, Tuple
 
 from pyrogram import Client
+from pyrogram.enums import ParseMode
 from app.utils.message import safe_edit
 from pyrogram.types import (
     Message,
@@ -66,6 +67,12 @@ from app.mediafire.streamer import FileStreamer
 from app.mediafire.archive import (
     count_media_in_archive,
     iter_extract_media,
+)
+from app.utils.caption import (
+    generate_video_caption,
+    parse_caption,
+    get_caption_choice_keyboard,
+    set_caption_state,
 )
 
 # ---------------------------------------------------------------------------
@@ -417,6 +424,7 @@ async def _upload_file_to_backup(
     tracker: Optional[ProgressTracker] = None,
     thumb_raw: Optional[bytes] = None,
     video_meta: Optional[Dict[str, int]] = None,
+    caption: Optional[str] = None,
 ) -> Tuple[Optional[int], bool]:
     """Upload file to backup group (or bot chat if large) and return (message_id, is_sent_to_bot)."""
     try:
@@ -486,6 +494,12 @@ async def _upload_file_to_backup(
                 pending_bot_uploads[uid] = []
             pending_bot_uploads[uid].append((file_name, fut))
 
+        # Parse caption if provided
+        caption_text = ""
+        caption_entities = None
+        if caption:
+            caption_text, caption_entities = await parse_caption(upload_client, caption)
+
         # Send to target peer with FloodWait handling
         for attempt in range(1, 4):
             try:
@@ -502,10 +516,13 @@ async def _upload_file_to_backup(
                         peer=target_peer,
                         media=media,
                         message="",
+                        message=caption_text,
+                        entities=caption_entities,
                         random_id=random.randint(0, 2 ** 63 - 1),
                     )
                 )
                 break
+
             except FloodWait as fw:
                 wait = fw.value if hasattr(fw, "value") else getattr(fw, "x", 10)
                 print(f"[DirectLink] FloodWait {wait}s (attempt {attempt}/3)")
@@ -620,6 +637,8 @@ async def _send_album_to_user(
     user_id: int,
     items: List[Tuple[int, str, str, int]],
     delivered_mids: set,
+    enable_caption: bool = False,
+    exclude_words: Optional[str] = None,
 ) -> None:
     """
     Send *items* ``(backup_msg_id, kind, name, size)`` to the user as
@@ -632,11 +651,16 @@ async def _send_album_to_user(
     CHUNK = 8
 
     async def _send_single(mid: int) -> bool:
+    async def _send_single(mid: int, name: str = "", kind: str = "") -> bool:
+        cap = generate_video_caption(name, exclude_words) if (enable_caption and kind == "video") else None
         r = await _safe_send(
             lambda _mid=mid: bot.copy_message(
+            lambda _mid=mid, _cap=cap: bot.copy_message(
                 chat_id=user_id,
                 from_chat_id=BACKUP_GROUP_ID,
                 message_id=_mid,
+                caption=_cap,
+                parse_mode=ParseMode.HTML if _cap else None,
             )
         )
         if r:
@@ -654,22 +678,29 @@ async def _send_album_to_user(
         if backup_msgs is None:
             for mid, kind, name, size in chunk:
                 await _send_single(mid)
+                await _send_single(mid, name, kind)
                 await asyncio.sleep(0.5)
             continue
 
         if not isinstance(backup_msgs, list):
             backup_msgs = [backup_msgs]
 
+        msg_map = {m.id: m for m in backup_msgs if m and not getattr(m, "empty", False)}
         media_list = []
         valid_mids = []
         for msg in backup_msgs:
             if not msg or getattr(msg, "empty", False):
+        for mid, kind, name, size in chunk:
+            msg = msg_map.get(mid)
+            if not msg:
                 continue
             if msg.photo:
                 media_list.append(InputMediaPhoto(msg.photo.file_id))
                 valid_mids.append(msg.id)
             elif msg.video:
                 media_list.append(InputMediaVideo(msg.video.file_id))
+                cap = generate_video_caption(name, exclude_words) if enable_caption else None
+                media_list.append(InputMediaVideo(msg.video.file_id, caption=cap, parse_mode=ParseMode.HTML if cap else None))
                 valid_mids.append(msg.id)
             elif msg.document:
                 media_list.append(InputMediaDocument(msg.document.file_id))
@@ -678,11 +709,16 @@ async def _send_album_to_user(
         if not media_list:
             for mid, kind, name, size in chunk:
                 await _send_single(mid)
+                await _send_single(mid, name, kind)
                 await asyncio.sleep(0.5)
             continue
 
         if len(media_list) == 1:
             await _send_single(valid_mids[0])
+            single_item = next((item for item in chunk if item[0] == valid_mids[0]), None)
+            s_name = single_item[2] if single_item else ""
+            s_kind = single_item[1] if single_item else ""
+            await _send_single(valid_mids[0], s_name, s_kind)
         else:
             r = await _safe_send(
                 lambda _ml=media_list: bot.send_media_group(user_id, _ml)
@@ -700,6 +736,10 @@ async def _send_album_to_user(
                 for mid in valid_mids:
                     await _send_single(mid)
                     await asyncio.sleep(0.5)
+                for mid, kind, name, size in chunk:
+                    if mid in valid_mids:
+                        await _send_single(mid, name, kind)
+                        await asyncio.sleep(0.5)
 
         await asyncio.sleep(1.5)
 
@@ -709,6 +749,8 @@ async def _deliver_to_user_multi(
     user_id: int,
     uploaded: List[Tuple[int, str, str, int]],
     status_msg: Message,
+    enable_caption: bool = False,
+    exclude_words: Optional[str] = None,
 ) -> None:
     """
     Deliver all uploaded backup-group files to the user.
@@ -720,11 +762,28 @@ async def _deliver_to_user_multi(
     delivered_mids: set = set()
 
     async def _send_single(mid: int) -> bool:
+    photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
+    videos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
+    others = [(mid, k, n, s) for mid, k, n, s in uploaded
+              if k not in ("photo", "video")]
+
+    # Send: photos album first
+    await _send_album_to_user(bot, user_id, photos, delivered_mids, enable_caption=False)
+
+    # Send: videos album next
+    await _send_album_to_user(bot, user_id, videos, delivered_mids, enable_caption=enable_caption, exclude_words=exclude_words)
+
+    # Send: anything else individually
+    async def _send_single_item(mid: int, name: str = "", kind: str = "") -> bool:
+        cap = generate_video_caption(name, exclude_words) if (enable_caption and kind == "video") else None
         r = await _safe_send(
             lambda _mid=mid: bot.copy_message(
+            lambda _mid=mid, _cap=cap: bot.copy_message(
                 chat_id=user_id,
                 from_chat_id=BACKUP_GROUP_ID,
                 message_id=_mid,
+                caption=_cap,
+                parse_mode=ParseMode.HTML if _cap else None,
             )
         )
         if r:
@@ -746,11 +805,13 @@ async def _deliver_to_user_multi(
     # Send: anything else individually
     for mid, k, n, s in others:
         await _send_single(mid)
+        await _send_single_item(mid, n, k)
         await asyncio.sleep(0.5)
 
     # Safety net — resend anything not confirmed delivered
     all_mids = {mid for mid, k, n, s in uploaded}
     missing_mids = all_mids - delivered_mids
+    item_map = {item[0]: item for item in uploaded}
 
     if missing_mids:
         print(
@@ -760,6 +821,10 @@ async def _deliver_to_user_multi(
         await asyncio.sleep(2)
         for mid in missing_mids:
             await _send_single(mid)
+            item = item_map.get(mid)
+            name = item[2] if item else ""
+            kind = item[1] if item else ""
+            await _send_single_item(mid, name, kind)
             await asyncio.sleep(1)
 
     total_to_send = len(uploaded)
@@ -784,6 +849,7 @@ async def _send_to_user(
     user_id: int,
     msg_id: int,
     is_sent_to_bot: bool,
+    caption: Optional[str] = None,
 ) -> bool:
     """Deliver file to user and ensure it's in the backup group."""
     try:
@@ -800,6 +866,8 @@ async def _send_to_user(
                     chat_id=user_id,
                     from_chat_id=BACKUP_GROUP_ID,
                     message_id=msg_id,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML if caption else None,
                 ),
                 retries=3,
             )
@@ -807,6 +875,7 @@ async def _send_to_user(
     except Exception as e:
         print(f"[DirectLink] Failed to send to user: {e}")
         return False
+
 
 
 
@@ -900,6 +969,8 @@ async def _handle_archive(
     file_size: int,
     skip_non_videos: bool = False,
     is_premium: bool = False,
+    enable_caption: bool = False,
+    exclude_words: Optional[str] = None,
 ) -> None:
     """Download archive, extract media ONE AT A TIME, upload each, send albums to user."""
     import gc
@@ -1125,9 +1196,12 @@ async def _handle_archive(
 
                 thumb_raw = None
                 video_meta = None
+                vid_caption = None
                 if mf["kind"] == "video":
                     video_meta = await _get_video_metadata(mf["path"])
                     thumb_raw = await _generate_video_thumb(mf["path"], video_meta.get("duration", 0))
+                    if enable_caption:
+                        vid_caption = generate_video_caption(mf["name"], exclude_words)
 
                 tracker = ProgressTracker(
                     status_msg=status_msg,
@@ -1150,6 +1224,7 @@ async def _handle_archive(
                         tracker=tracker,
                         thumb_raw=thumb_raw,
                         video_meta=video_meta,
+                        caption=vid_caption,
                     )
                     if bmid:
                         break
@@ -1193,6 +1268,7 @@ async def _handle_archive(
             return
 
         await _deliver_to_user_multi(bot, user_id, uploaded, status_msg)
+        await _deliver_to_user_multi(bot, user_id, uploaded, status_msg, enable_caption=enable_caption, exclude_words=exclude_words)
 
     finally:
         try:
@@ -1213,9 +1289,11 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
     4. Stream download from URL
     5. Upload to backup group
     6. Copy/send to user
+    Validates guards, extracts URL, and prompts user whether to caption videos.
     """
     # Avoid circular import by importing here
     from app.bot.main import active_user_processes, reset_cancel, is_cancelled
+    from app.bot.main import active_user_processes
     
     user_id = message.from_user.id
     tracker: Optional[ProgressTracker] = None
@@ -1258,6 +1336,54 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         return
 
     url = match.group(0).strip()
+
+    # Prompt user for caption setting
+    status_msg = await message.reply_text(
+        "🎬 **Tetapan Caption Video**\n\n"
+        "Adakah anda mahu meletakkan nama fail sebagai caption pada video?\n\n"
+        "💡 *Jika Ya, nama fail akan dijadikan caption (format fail seperti .mkv/.mp4 akan dibuang secara automatik).* ",
+        reply_markup=get_caption_choice_keyboard(),
+    )
+
+    set_caption_state(
+        user_id=user_id,
+        flow_type="direct",
+        message=message,
+        status_msg=status_msg,
+        url=url,
+        skip_non_videos=skip_non_videos,
+    )
+
+
+async def process_direct_download(
+    bot: Client,
+    user_id: int,
+    message: Message,
+    status_msg: Message,
+    url: Optional[str] = None,
+    skip_non_videos: bool = False,
+    enable_caption: bool = False,
+    exclude_words: Optional[str] = None,
+    **kwargs: Any,
+) -> None:
+    """
+    Execute direct HTTP/HTTPS link download and upload to Telegram.
+    """
+    from app.bot.main import active_user_processes, reset_cancel, is_cancelled
+    
+    user_id = user_id or message.from_user.id
+    if not url:
+        url = kwargs.get("links") or kwargs.get("url")
+    if not url:
+        await safe_edit(status_msg, "❌ URL tidak sah.")
+        return
+
+    tracker: Optional[ProgressTracker] = None
+
+    user_client = await manager.get_client(user_id)
+    if not user_client:
+        await safe_edit(status_msg, "❌ Sesi tidak sah. Sila login semula.")
+        return
 
     # Mark user as active
     active_user_processes[user_id] = asyncio.current_task()
@@ -1333,6 +1459,9 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
                 user_id, final_url, file_name, file_size,
                 skip_non_videos=skip_non_videos,
                 is_premium=is_premium
+                is_premium=is_premium,
+                enable_caption=enable_caption,
+                exclude_words=exclude_words,
             )
             return
 
@@ -1448,11 +1577,15 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
 
                             part_streamer = FileStreamer(part_path, part_filename)
 
+                            part_caption = generate_video_caption(part_filename, exclude_words) if enable_caption else None
+
                             msg_id, is_sent_to_bot = await _upload_file_to_backup(
                                 bot, user_client, backup_peer, part_streamer, part_filename, part_size,
                                 tracker=part_tracker,
                                 thumb_raw=part_thumb,
                                 video_meta=part_meta
+                                video_meta=part_meta,
+                                caption=part_caption,
                             )
 
                             if hasattr(part_streamer, "close"):
@@ -1464,6 +1597,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
 
                             await part_tracker.stop(f"⬆️ Menghantar bahagian {part_num}/{num_parts}…")
                             delivered = await _send_to_user(bot, user_id, msg_id, is_sent_to_bot)
+                            delivered = await _send_to_user(bot, user_id, msg_id, is_sent_to_bot, caption=part_caption)
 
                             if delivered:
                                 delivered_count += 1
@@ -1528,12 +1662,17 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
                 on_download_chunk=tracker.add_downloaded,
             )
 
+        # Generate caption for single video if enabled
+        video_caption = generate_video_caption(file_name, exclude_words) if (enable_caption and is_video) else None
+
         # Upload to backup group with metadata and thumbnail
         msg_id, is_sent_to_bot = await _upload_file_to_backup(
             bot, user_client, backup_peer, streamer, file_name, file_size, 
             tracker=tracker,
             thumb_raw=thumb_raw,
             video_meta=video_meta
+            video_meta=video_meta,
+            caption=video_caption,
         )
 
         if hasattr(streamer, "close"):
@@ -1553,6 +1692,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         # Send to user
         await tracker.stop("⬆️ Menghantar ke anda…")
         delivered = await _send_to_user(bot, user_id, msg_id, is_sent_to_bot)
+        delivered = await _send_to_user(bot, user_id, msg_id, is_sent_to_bot, caption=video_caption)
 
         if delivered:
             # Log the upload

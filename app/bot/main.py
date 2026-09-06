@@ -25,14 +25,20 @@ from app.bot.session_manager import manager
 from app.utils.streamer import MediaStreamer, upload_stream
 from app.bot.auth import handle_login_command, handle_auth_message, handle_login_callback, cancel_login, handle_main_menu_callback, handle_profile_callback, handle_profile_age_message, start_profile_setup
 from app.bot.states import user_profile_states, ProfileStep
+from app.bot.states import user_profile_states, ProfileStep, CaptionStep
 from app.utils.message import safe_edit
 from app.terabox.handler import terabox_link_handler, handle_tb_folder_callback, TERABOX_LINK_PATTERN
 from app.mediafire.handler import mediafire_link_handler, MEDIAFIRE_LINK_PATTERN
 from app.torrent.handler import (
     torrent_link_handler, torrent_file_handler,
+    torrent_link_handler, torrent_file_handler, process_torrent_download,
     MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
 )
 from app.direct.handler import direct_link_handler, DIRECT_LINK_PATTERN
+from app.direct.handler import direct_link_handler, process_direct_download, DIRECT_LINK_PATTERN
+from app.utils.caption import (
+    user_caption_states, get_caption_state, clear_caption_state, get_exclude_keyboard,
+)
 from app.utils.media import is_torrent, is_archive, classify, mime, PHOTO_EXTS, VIDEO_EXTS, ext, SKIP_PATTERN, is_video
 from app.mediafire.archive import iter_extract_media, count_media_in_archive
 from app.mediafire.streamer import FileStreamer
@@ -414,6 +420,17 @@ async def login_handler(client: Client, message: Message):
 async def cancel_handler(client: Client, message: Message):
     user_id = message.from_user.id
 
+    # Check if user has an active caption state
+    if user_id in user_caption_states:
+        state = clear_caption_state(user_id)
+        if state and state.get("status_msg"):
+            try:
+                await state["status_msg"].edit("🚫 **Proses dibatalkan.**")
+            except Exception:
+                pass
+        await message.reply_text("🚫 **Penyediaan caption dibatalkan.**")
+        return
+
     # Check if user has an active process (terabox/mediafire/forwarding)
     if active_user_processes.get(user_id):
         request_cancel(user_id)
@@ -448,8 +465,186 @@ async def tb_folder_callback_handler(client: Client, callback_query):
     from app.terabox.handler import handle_tb_folder_callback
     await handle_tb_folder_callback(client, callback_query)
 
+@app.on_callback_query(filters.regex(r"^cap_"))
+async def caption_callback_handler(client: Client, callback_query):
+    """Handle caption choice and exclusion callbacks for Direct and Torrent."""
+    user_id = callback_query.from_user.id
+    data = callback_query.data
+
+    if data == "cap_choose_yes":
+        state = get_caption_state(user_id)
+        if not state:
+            await callback_query.answer("⚠️ Sesi tamat. Sila hantar link semula.", show_alert=True)
+            return
+        state["step"] = CaptionStep.ASK_EXCLUDE
+        prompt_text = (
+            "✂️ **Adakah anda ingin mengecualikan sebarang perkataan atau ayat daripada caption?**\n\n"
+            "Contoh: Jika fail bernama `Episode 1-jajan.mkv` dan anda ingin buang `-jajan`, "
+            "hantarkan `-jajan` sebagai mesej teks.\n\n"
+            "Caption pada Telegram akan menjadi: `Episode 1`\n\n"
+            "_(File extension seperti .mkv/.mp4 akan dibuang secara automatik)_"
+        )
+        try:
+            await callback_query.message.edit_text(
+                prompt_text,
+                reply_markup=get_exclude_keyboard()
+            )
+        except Exception:
+            pass
+        await callback_query.answer()
+
+    elif data == "cap_choose_no":
+        state = clear_caption_state(user_id)
+        if not state:
+            await callback_query.answer("⚠️ Sesi tamat. Sila hantar link semula.", show_alert=True)
+            return
+        await callback_query.answer()
+        try:
+            await callback_query.message.edit_text("🔄 **Sedang diproses...**")
+        except Exception:
+            pass
+
+        source_type = state.get("source_type")
+        orig_msg = state.get("message")
+        status_msg = state.get("status_msg") or callback_query.message
+
+        if source_type == "direct":
+            asyncio.create_task(
+                process_direct_download(
+                    client, user_id, orig_msg, status_msg,
+                    enable_caption=False,
+                    exclude_words=None,
+                    url=state.get("url"),
+                    skip_non_videos=state.get("skip_non_videos", False),
+                )
+            )
+        elif source_type in ("torrent", "torrent_file"):
+            asyncio.create_task(
+                process_torrent_download(
+                    client, user_id, orig_msg, status_msg,
+                    source_type=source_type,
+                    enable_caption=False,
+                    exclude_words=None,
+                    link=state.get("link"),
+                    link_type=state.get("link_type"),
+                    skip_non_videos=state.get("skip_non_videos", False),
+                )
+            )
+
+    elif data == "cap_exclude_skip":
+        state = clear_caption_state(user_id)
+        if not state:
+            await callback_query.answer("⚠️ Sesi tamat. Sila hantar link semula.", show_alert=True)
+            return
+        await callback_query.answer()
+        try:
+            await callback_query.message.edit_text("🔄 **Sedang diproses...**\n(Caption diaktifkan)")
+        except Exception:
+            pass
+
+        source_type = state.get("source_type")
+        orig_msg = state.get("message")
+        status_msg = state.get("status_msg") or callback_query.message
+
+        if source_type == "direct":
+            asyncio.create_task(
+                process_direct_download(
+                    client, user_id, orig_msg, status_msg,
+                    enable_caption=True,
+                    exclude_words=None,
+                    url=state.get("url"),
+                    skip_non_videos=state.get("skip_non_videos", False),
+                )
+            )
+        elif source_type in ("torrent", "torrent_file"):
+            asyncio.create_task(
+                process_torrent_download(
+                    client, user_id, orig_msg, status_msg,
+                    source_type=source_type,
+                    enable_caption=True,
+                    exclude_words=None,
+                    link=state.get("link"),
+                    link_type=state.get("link_type"),
+                    skip_non_videos=state.get("skip_non_videos", False),
+                )
+            )
+
+    elif data == "cap_cancel":
+        clear_caption_state(user_id)
+        try:
+            await callback_query.message.edit_text("🚫 **Proses dibatalkan.**")
+        except Exception:
+            pass
+        await callback_query.answer("Dibatalkan")
+
+
+async def handle_caption_exclusion_message(client: Client, message: Message) -> bool:
+    """Intercept text replies from users configuring caption exclusions."""
+    user_id = message.from_user.id if message.from_user else None
+    if not user_id:
+        return False
+    if message.text and message.text.startswith("/"):
+        return False
+    state = get_caption_state(user_id)
+    if not state or state.get("step") != CaptionStep.ASK_EXCLUDE:
+        return False
+
+    exclude_words = message.text.strip()
+    clear_caption_state(user_id)
+
+    status_msg = state.get("status_msg")
+    orig_msg = state.get("message")
+    source_type = state.get("source_type")
+
+    try:
+        await message.reply_text(
+            f"✅ **Pengecualian disimpan:** `{exclude_words}`\n\n"
+            f"🔄 Memulakan muat turun...",
+            quote=True
+        )
+    except Exception:
+        pass
+
+    if status_msg:
+        try:
+            await status_msg.edit(f"🔄 **Sedang diproses...**\n(Pengecualian: `{exclude_words}`)")
+        except Exception:
+            pass
+
+    target_status_msg = status_msg or message
+
+    if source_type == "direct":
+        asyncio.create_task(
+            process_direct_download(
+                client, user_id, orig_msg, target_status_msg,
+                enable_caption=True,
+                exclude_words=exclude_words,
+                url=state.get("url"),
+                skip_non_videos=state.get("skip_non_videos", False),
+            )
+        )
+    elif source_type in ("torrent", "torrent_file"):
+        asyncio.create_task(
+            process_torrent_download(
+                client, user_id, orig_msg, target_status_msg,
+                source_type=source_type,
+                enable_caption=True,
+                exclude_words=exclude_words,
+                link=state.get("link"),
+                link_type=state.get("link_type"),
+                skip_non_videos=state.get("skip_non_videos", False),
+            )
+        )
+    return True
+
+
 @app.on_message(filters.text & filters.private, group=1)
 async def auth_message_handler(client: Client, message: Message):
+    # Check if this message is part of the caption exclusion flow
+    if await handle_caption_exclusion_message(client, message):
+        message.stop_propagation()
+        return
+
     # Check if this message is part of the profile setup flow (age input)
     if await handle_profile_age_message(client, message):
         message.stop_propagation()
@@ -537,6 +732,7 @@ async def torrent_file_upload_handler(client: Client, message: Message):
 
 @app.on_message(filters.regex(DIRECT_LINK_PATTERN) & filters.private)
 async def direct_link_message_handler(client: Client, message: Message):
+    message.stop_propagation()
     await direct_link_handler(client, message)
 
 

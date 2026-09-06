@@ -29,6 +29,7 @@ import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from pyrogram import Client
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.functions.upload import SaveFilePart
@@ -68,6 +69,12 @@ from app.torrent.client import Aria2Error
 from app.torrent.streamer import TorrentFileStreamer
 from app.terabox.progress import ProgressTracker
 from app.bot.session_manager import manager
+from app.utils.caption import (
+    generate_video_caption,
+    parse_caption,
+    get_caption_choice_keyboard,
+    set_caption_state,
+)
 
 # ---------------------------------------------------------------------------
 # Link patterns
@@ -311,6 +318,7 @@ async def _upload_file_to_backup(
     tracker=None,
     thumb_raw: Optional[bytes] = None,
     video_meta: Optional[Dict[str, int]] = None,
+    caption: Optional[str] = None,
 ) -> Tuple[Optional[int], bool]:
     """Upload *streamer* to backup group. Returns (message_id, is_sent_to_bot)."""
     try:
@@ -369,6 +377,12 @@ async def _upload_file_to_backup(
                 pending_bot_uploads[uid] = []
             pending_bot_uploads[uid].append((file_name, fut))
 
+        # Parse caption if provided
+        caption_text = ""
+        caption_entities = None
+        if caption:
+            caption_text, caption_entities = await parse_caption(upload_client, caption)
+
         # SendMedia with FloodWait handling
         for _attempt in range(1, 4):
             try:
@@ -377,6 +391,8 @@ async def _upload_file_to_backup(
                         peer=await upload_client.resolve_peer(upload_peer),
                         media=media,
                         message="",
+                        message=caption_text,
+                        entities=caption_entities,
                         random_id=random.randint(0, 2 ** 63 - 1),
                     )
                 )
@@ -474,6 +490,7 @@ async def _upload_local_file(
     file_total: int = 1,
     thumb_raw: Optional[bytes] = None,
     video_meta: Optional[Dict[str, int]] = None,
+    caption: Optional[str] = None,
 ) -> bool:
     """Upload one local file to the backup group with retries, log it, delete it.
 
@@ -504,7 +521,9 @@ async def _upload_local_file(
             tracker=tracker,
             thumb_raw=thumb_raw,
             video_meta=video_meta,
+            caption=caption,
         )
+
         if bmid:
             break
         print(f"[Torrent] Upload failed for {file_name} (attempt {attempt}/{MAX_RETRIES})")
@@ -559,6 +578,8 @@ async def _split_and_upload_video(
     uploaded: List[Tuple[int, str, str, int, bool]],
     status_msg: Message,
     size_limit: int,
+    enable_caption: bool = False,
+    exclude_words: Optional[str] = None,
 ) -> None:
     """Split a video larger than *size_limit* and upload every part.
 
@@ -618,12 +639,15 @@ async def _split_and_upload_video(
                 part_thumb = await _generate_video_thumb(part_path, int(dur_sec))
             part_meta = await _get_video_metadata(part_path)
 
+            part_caption = generate_video_caption(part_filename, exclude_words) if enable_caption else None
+
             ok_up = await _upload_local_file(
                 bot, user_client, backup_peer, message,
                 part_path, part_filename, part_size,
                 torrent_name, uploaded, status_msg,
                 file_index=part_num, file_total=num_parts,
                 thumb_raw=part_thumb, video_meta=part_meta,
+                caption=part_caption,
             )
             if ok_up:
                 uploaded_count += 1
@@ -687,6 +711,8 @@ async def _send_album_to_user(
     user_id: int,
     items: List[Tuple[int, str, str, int, bool]],
     delivered_mids: set,
+    enable_caption: bool = False,
+    exclude_words: Optional[str] = None,
 ) -> None:
     if not items:
         return
@@ -694,16 +720,21 @@ async def _send_album_to_user(
     CHUNK = 8
 
     async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
+    async def _send_single(mid: int, is_sent_to_bot: bool, name: str = "", kind: str = "") -> bool:
         if is_sent_to_bot:
             delivered_mids.add(mid)
             return True
         else:
             actual_from_id = backup_group_actual_id
+            cap = generate_video_caption(name, exclude_words) if (enable_caption and kind == "video") else None
             r = await _safe_send(
                 lambda _mid=mid: bot.copy_message(
+                lambda _mid=mid, _cap=cap: bot.copy_message(
                     chat_id=user_id,
                     from_chat_id=actual_from_id,
                     message_id=_mid,
+                    caption=_cap,
+                    parse_mode=ParseMode.HTML if _cap else None,
                 )
             )
             if r:
@@ -720,6 +751,7 @@ async def _send_album_to_user(
         if any(is_bot for _, _, _, _, is_bot in chunk):
             for mid, kind, name, size, is_sent_to_bot in chunk:
                 await _send_single(mid, is_sent_to_bot)
+                await _send_single(mid, is_sent_to_bot, name, kind)
                 await asyncio.sleep(0.5)
             continue
 
@@ -729,22 +761,29 @@ async def _send_album_to_user(
         if backup_msgs is None:
             for mid, kind, name, size, is_sent_to_bot in chunk:
                 await _send_single(mid, is_sent_to_bot)
+                await _send_single(mid, is_sent_to_bot, name, kind)
                 await asyncio.sleep(0.5)
             continue
 
         if not isinstance(backup_msgs, list):
             backup_msgs = [backup_msgs]
 
+        msg_map = {m.id: m for m in backup_msgs if m and not getattr(m, "empty", False)}
         media_list = []
         valid_mids = []
         for msg in backup_msgs:
             if not msg or getattr(msg, "empty", False):
+        for mid, kind, name, size, is_sent_to_bot in chunk:
+            msg = msg_map.get(mid)
+            if not msg:
                 continue
             if msg.photo:
                 media_list.append(InputMediaPhoto(msg.photo.file_id))
                 valid_mids.append(msg.id)
             elif msg.video:
                 media_list.append(InputMediaVideo(msg.video.file_id))
+                cap = generate_video_caption(name, exclude_words) if enable_caption else None
+                media_list.append(InputMediaVideo(msg.video.file_id, caption=cap, parse_mode=ParseMode.HTML if cap else None))
                 valid_mids.append(msg.id)
             elif msg.document:
                 media_list.append(InputMediaDocument(msg.document.file_id))
@@ -753,11 +792,17 @@ async def _send_album_to_user(
         if not media_list:
             for mid, kind, name, size, is_sent_to_bot in chunk:
                 await _send_single(mid, is_sent_to_bot)
+                await _send_single(mid, is_sent_to_bot, name, kind)
                 await asyncio.sleep(0.5)
             continue
 
         if len(media_list) == 1:
             await _send_single(valid_mids[0], False)
+            single_item = next((item for item in chunk if item[0] == valid_mids[0]), None)
+            s_name = single_item[2] if single_item else ""
+            s_kind = single_item[1] if single_item else ""
+            s_is_bot = single_item[4] if single_item else False
+            await _send_single(valid_mids[0], s_is_bot, s_name, s_kind)
         else:
             r = await _safe_send(
                 lambda _ml=media_list: bot.send_media_group(user_id, _ml)
@@ -773,6 +818,10 @@ async def _send_album_to_user(
                 for mid in valid_mids:
                     await _send_single(mid)
                     await asyncio.sleep(0.5)
+                for mid, kind, name, size, is_sent_to_bot in chunk:
+                    if mid in valid_mids:
+                        await _send_single(mid, is_sent_to_bot, name, kind)
+                        await asyncio.sleep(0.5)
 
         await asyncio.sleep(1.5)
 
@@ -786,21 +835,35 @@ async def _deliver_to_user(
     user_id: int,
     uploaded: List[Tuple[int, str, str, int, bool]],
     status_msg: Message,
+    enable_caption: bool = False,
+    exclude_words: Optional[str] = None,
 ) -> None:
     await status_msg.edit("⬆️ Menghantar ke anda…")
 
     delivered_mids: set = set()
 
     async def _send_single(mid: int, is_sent_to_bot: bool) -> bool:
+    photos = [(mid, k, n, s, is_bot) for mid, k, n, s, is_bot in uploaded if k == "photo"]
+    videos = [(mid, k, n, s, is_bot) for mid, k, n, s, is_bot in uploaded if k == "video"]
+    others = [(mid, k, n, s, is_bot) for mid, k, n, s, is_bot in uploaded if k not in ("photo", "video")]
+
+    await _send_album_to_user(bot, user_id, photos, delivered_mids, enable_caption=False)
+    await _send_album_to_user(bot, user_id, videos, delivered_mids, enable_caption=enable_caption, exclude_words=exclude_words)
+
+    async def _send_single_item(mid: int, is_sent_to_bot: bool, name: str = "", kind: str = "") -> bool:
         if is_sent_to_bot:
             delivered_mids.add(mid)
             return True
         else:
+            cap = generate_video_caption(name, exclude_words) if (enable_caption and kind == "video") else None
             r = await _safe_send(
                 lambda _mid=mid: bot.copy_message(
+                lambda _mid=mid, _cap=cap: bot.copy_message(
                     chat_id=user_id,
                     from_chat_id=BACKUP_GROUP_ID,
                     message_id=_mid,
+                    caption=_cap,
+                    parse_mode=ParseMode.HTML if _cap else None,
                 )
             )
             if r:
@@ -817,9 +880,11 @@ async def _deliver_to_user(
 
     for mid, k, n, s, is_bot in others:
         await _send_single(mid, is_bot)
+        await _send_single_item(mid, is_bot, n, k)
         await asyncio.sleep(0.5)
 
     # Safety net
+    item_map = {item[0]: item for item in uploaded}
     all_mids_map = {mid: is_bot for mid, k, n, s, is_bot in uploaded}
     missing = set(all_mids_map.keys()) - delivered_mids
     if missing:
@@ -827,7 +892,12 @@ async def _deliver_to_user(
         await asyncio.sleep(2)
         for mid in missing:
             await _send_single(mid, all_mids_map[mid])
+            item = item_map.get(mid)
+            name = item[2] if item else ""
+            kind = item[1] if item else ""
+            await _send_single_item(mid, all_mids_map[mid], name, kind)
             await asyncio.sleep(1)
+
 
     sent_count = len(delivered_mids)
     total_to_send = len(uploaded)
@@ -991,6 +1061,21 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
     reset_cancel(user_id)
     status_msg = await message.reply_text("🧲 Memulakan muat turun torrent…")
     temp_dir = tempfile.mkdtemp(prefix="torrent_")
+    # Prompt user for caption choice (Step 1)
+    status_msg = await message.reply_text(
+        "📝 **Adakah anda ingin meletakkan caption pada fail video?**\n\n"
+        "Nama fail video akan dijadikan caption.",
+        reply_markup=get_caption_choice_keyboard(),
+    )
+    set_caption_state(
+        user_id,
+        "torrent",
+        message,
+        status_msg,
+        link=link,
+        link_type=link_type,
+        skip_non_videos=skip_non_videos,
+    )
 
     try:
         await _process_torrent(
@@ -1048,6 +1133,7 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
     from app.bot.main import (
         active_user_processes, get_backup_group_peer,
         is_cancelled, reset_cancel,
+        active_user_processes,
     )
     from app.torrent import get_aria2_client
 
@@ -1091,6 +1177,43 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
     # ---------------------------------------------------------------- Download .torrent file
     caption = message.caption or message.text or ""
     skip_non_videos = bool(SKIP_PATTERN.search(caption))
+
+    # Prompt user for caption choice (Step 1)
+    status_msg = await message.reply_text(
+        "📝 **Adakah anda ingin meletakkan caption pada fail video?**\n\n"
+        "Nama fail video akan dijadikan caption.",
+        reply_markup=get_caption_choice_keyboard(),
+    )
+    set_caption_state(
+        user_id,
+        "torrent_file",
+        message,
+        status_msg,
+        skip_non_videos=skip_non_videos,
+    )
+
+
+# ===========================================================================
+# Execution pipeline (triggered after caption flow completes)
+# ===========================================================================
+
+async def process_torrent_download(
+    bot: Client,
+    user_id: int,
+    message: Message,
+    status_msg: Message,
+    source_type: str,
+    enable_caption: bool = False,
+    exclude_words: Optional[str] = None,
+    link: Optional[str] = None,
+    link_type: Optional[str] = None,
+    skip_non_videos: bool = False,
+) -> None:
+    from app.bot.main import (
+        active_user_processes, is_cancelled, reset_cancel,
+    )
+    from app.torrent import get_aria2_client
+
     active_user_processes[user_id] = asyncio.current_task()
     reset_cancel(user_id)
     status_msg = await message.reply_text("🧲 Memuat turun fail .torrent…")
@@ -1103,6 +1226,9 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
 
         if not os.path.exists(torrent_file_path):
             await status_msg.edit("❌ Gagal memuat turun fail .torrent.")
+        user_client = await manager.get_client(user_id)
+        if not user_client:
+            await status_msg.edit("❌ Sesi tidak sah. Sila login semula.")
             return
 
         await _process_torrent(
@@ -1110,6 +1236,33 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
             torrent_file_path, "torrent_file", temp_dir,
             skip_non_videos=skip_non_videos,
         )
+        if source_type == "torrent":
+            if not link or not link_type:
+                await status_msg.edit("❌ Link torrent tidak sah.")
+                return
+            await _process_torrent(
+                bot, user_client, message, status_msg, user_id,
+                link, link_type, temp_dir,
+                skip_non_videos=skip_non_videos,
+                enable_caption=enable_caption,
+                exclude_words=exclude_words,
+            )
+        elif source_type == "torrent_file":
+            await status_msg.edit("🧲 Memuat turun fail .torrent…")
+            torrent_file_path = os.path.join(temp_dir, "input.torrent")
+            await bot.download_media(message, file_name=torrent_file_path)
+
+            if not os.path.exists(torrent_file_path):
+                await status_msg.edit("❌ Gagal memuat turun fail .torrent.")
+                return
+
+            await _process_torrent(
+                bot, user_client, message, status_msg, user_id,
+                torrent_file_path, "torrent_file", temp_dir,
+                skip_non_videos=skip_non_videos,
+                enable_caption=enable_caption,
+                exclude_words=exclude_words,
+            )
     except Aria2Error as e:
         print(f"[Torrent] Aria2 error: {e}")
         try:
@@ -1164,6 +1317,8 @@ async def _process_torrent(
     link_type: str,   # "magnet", "torrent_url", "torrent_file"
     temp_dir: str,
     skip_non_videos: bool = False,
+    enable_caption: bool = False,
+    exclude_words: Optional[str] = None,
 ) -> None:
     """Download torrent via aria2c, then upload all media files to Telegram."""
     from app.bot.main import (
@@ -1374,9 +1529,12 @@ async def _process_torrent(
         # Generate video metadata if applicable
         thumb_raw = None
         video_meta = None
+        caption = None
         if finfo["kind"] == "video":
             video_meta = await _get_video_metadata(file_path)
             thumb_raw = await _generate_video_thumb(file_path, video_meta.get("duration", 0))
+            if enable_caption:
+                caption = generate_video_caption(file_name, exclude_words)
 
         await _upload_local_file(
             bot, user_client, backup_peer, message,
@@ -1384,6 +1542,7 @@ async def _process_torrent(
             torrent_name, uploaded, status_msg,
             file_index=idx, file_total=total_files,
             thumb_raw=thumb_raw, video_meta=video_meta,
+            caption=caption,
         )
 
         thumb_raw = None
@@ -1413,6 +1572,8 @@ async def _process_torrent(
             bot, user_client, backup_peer, message,
             finfo["path"], finfo["name"], finfo["size"],
             torrent_name, uploaded, status_msg, size_limit,
+            enable_caption=enable_caption,
+            exclude_words=exclude_words,
         )
         gc.collect()
 
@@ -1427,6 +1588,11 @@ async def _process_torrent(
         skip_msg = ""
 
     await _deliver_to_user(bot, user_id, uploaded, status_msg)
+    await _deliver_to_user(
+        bot, user_id, uploaded, status_msg,
+        enable_caption=enable_caption,
+        exclude_words=exclude_words,
+    )
 
     # If there were skipped files, notify user
     if skipped:

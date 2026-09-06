@@ -16,3 +16,7 @@ class LoginStep:
 class ProfileStep:
     ASK_GENDER = "ASK_GENDER"
     ASK_AGE = "ASK_AGE"
+
+class CaptionStep:
+    ASK_CAPTION = "ASK_CAPTION"
+    ASK_EXCLUDE = "ASK_EXCLUDE"
