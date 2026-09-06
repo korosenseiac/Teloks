@@ -30,11 +30,9 @@ from app.utils.message import safe_edit
 from app.terabox.handler import terabox_link_handler, handle_tb_folder_callback, TERABOX_LINK_PATTERN
 from app.mediafire.handler import mediafire_link_handler, MEDIAFIRE_LINK_PATTERN
 from app.torrent.handler import (
-    torrent_link_handler, torrent_file_handler,
     torrent_link_handler, torrent_file_handler, process_torrent_download,
     MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
 )
-from app.direct.handler import direct_link_handler, DIRECT_LINK_PATTERN
 from app.direct.handler import direct_link_handler, process_direct_download, DIRECT_LINK_PATTERN
 from app.utils.caption import (
     user_caption_states, get_caption_state, clear_caption_state, get_exclude_keyboard,

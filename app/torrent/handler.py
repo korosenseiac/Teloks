@@ -619,12 +619,10 @@ async def _split_and_upload_video(
             if dur_sec <= 0:
                 dur_sec = part_duration
 
-            try:
-                await status_msg.edit(
-                    f"✂️ Memotong Bahagian {part_num}/{num_parts}: `{part_filename}`…"
-                )
-            except Exception:
-                pass
+            await safe_edit(
+                status_msg,
+                f"✂️ Memotong Bahagian {part_num}/{num_parts}: `{part_filename}`…"
+            )
 
             ok = await _split_video_part(video_path, start_sec, dur_sec, part_path)
             if not ok:
@@ -655,22 +653,17 @@ async def _split_and_upload_video(
             await asyncio.sleep(1)
 
         if uploaded_count < num_parts:
-            try:
-                await status_msg.edit(
-                    f"⚠️ Video `{file_name}`: {uploaded_count}/{num_parts} bahagian berjaya dimuat naik."
-                )
-            except Exception:
-                pass
+            await safe_edit(
+                status_msg,
+                f"⚠️ Video `{file_name}`: {uploaded_count}/{num_parts} bahagian berjaya dimuat naik."
+            )
     except asyncio.CancelledError:
         raise
     except Exception as e:
         print(f"[Torrent] Video split error for {file_name}: {e}")
         import traceback
         traceback.print_exc()
-        try:
-            await status_msg.edit(f"❌ Ralat memotong video `{file_name}`: {e}")
-        except Exception:
-            pass
+        await safe_edit(status_msg, f"❌ Ralat memotong video `{file_name}`: {e}")
     finally:
         try:
             shutil.rmtree(split_dir, ignore_errors=True)
@@ -826,7 +819,6 @@ async def _deliver_to_user(
     enable_caption: bool = False,
     exclude_words: Optional[str] = None,
 ) -> None:
-    await status_msg.edit("⬆️ Menghantar ke anda…")
     await safe_edit(status_msg, "⬆️ Menghantar ke anda…")
 
     delivered_mids: set = set()
@@ -879,10 +871,7 @@ async def _deliver_to_user(
     sent_count = len(delivered_mids)
     total_to_send = len(uploaded)
     if sent_count < total_to_send:
-        try:
-            await status_msg.edit(f"⚠️ Selesai! {sent_count}/{total_to_send} fail berjaya dihantar.")
-        except Exception:
-            pass
+        await safe_edit(status_msg, f"⚠️ Selesai! {sent_count}/{total_to_send} fail berjaya dihantar.")
     else:
         try:
             await status_msg.delete()
@@ -955,10 +944,8 @@ def _get_torrent_name(status: Dict[str, Any]) -> str:
 async def torrent_link_handler(bot: Client, message: Message) -> None:
     """Handler for magnet: URIs and HTTP .torrent URLs sent as text."""
     from app.bot.main import (
-        active_user_processes, get_backup_group_peer,
-        handled_torrent_messages, is_cancelled, reset_cancel,
+        active_user_processes, handled_torrent_messages,
     )
-    from app.torrent import get_aria2_client
 
     user_id = message.from_user.id
 
@@ -1034,11 +1021,8 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
     print(f"[Torrent] user={user_id} type={link_type} link={link[:80]}… skip={skip_non_videos}")
 
     # ---------------------------------------------------------------- Start
-    active_user_processes[user_id] = asyncio.current_task()
-    reset_cancel(user_id)
-    status_msg = await message.reply_text("🧲 Memulakan muat turun torrent…")
-    temp_dir = tempfile.mkdtemp(prefix="torrent_")
-    # Prompt user for caption choice (Step 1)
+    # Prompt the user for the caption choice first. Downloading only begins
+    # after the caption flow completes (see process_torrent_download below).
     status_msg = await message.reply_text(
         "📝 **Adakah anda ingin meletakkan caption pada fail video?**\n\n"
         "Nama fail video akan dijadikan caption.",
@@ -1054,52 +1038,6 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
         skip_non_videos=skip_non_videos,
     )
 
-    try:
-        await _process_torrent(
-            bot, user_client, message, status_msg, user_id,
-            link, link_type, temp_dir,
-            skip_non_videos=skip_non_videos,
-        )
-    except Aria2Error as e:
-        print(f"[Torrent] Aria2 error: {e}")
-        try:
-            await status_msg.edit(f"❌ Ralat torrent: {e}")
-        except Exception:
-            pass
-    except asyncio.CancelledError:
-        print(f"[Torrent] Handler cancelled for user {user_id}")
-    except SessionInvalidError as e:
-        # Session already invalidated inside _upload_file_to_backup.
-        print(f"[Torrent] Session invalid for user {user_id}: {e}")
-        try:
-            await status_msg.edit("❌ Sesi anda telah tamat. Sila /start dan login semula.")
-        except Exception:
-            pass
-    except Exception as e:
-        print(f"[Torrent] Handler error: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            await status_msg.edit(f"❌ Ralat tidak dijangka: {e}")
-        except Exception:
-            pass
-    finally:
-        # Cleanup temp directory
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception as e:
-            print(f"[Torrent] Failed to clean temp dir {temp_dir}: {e}")
-        # Purge this user's aria2 downloads (cancelled / errored / finished) so
-        # a re-add of the same torrent never hits "already registered".
-        try:
-            aria2 = await get_aria2_client()
-            await aria2.cleanup_user(user_id)
-        except Exception as e:
-            print(f"[Torrent] aria2 cleanup failed for user {user_id}: {e}")
-        active_user_processes.pop(user_id, None)
-        reset_cancel(user_id)
-        gc.collect()
-
 
 # ===========================================================================
 # HANDLER — .torrent file uploads
@@ -1107,12 +1045,7 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
 
 async def torrent_file_handler(bot: Client, message: Message) -> None:
     """Handler for .torrent files uploaded to the bot."""
-    from app.bot.main import (
-        active_user_processes, get_backup_group_peer,
-        is_cancelled, reset_cancel,
-        active_user_processes,
-    )
-    from app.torrent import get_aria2_client
+    from app.bot.main import active_user_processes
 
     user_id = message.from_user.id
     print(f"[Torrent] File handler invoked: user={user_id} "
@@ -1187,36 +1120,23 @@ async def process_torrent_download(
     skip_non_videos: bool = False,
 ) -> None:
     from app.bot.main import (
-        active_user_processes, is_cancelled, reset_cancel,
+        active_user_processes, reset_cancel,
     )
     from app.torrent import get_aria2_client
 
     active_user_processes[user_id] = asyncio.current_task()
     reset_cancel(user_id)
-    status_msg = await message.reply_text("🧲 Memuat turun fail .torrent…")
     temp_dir = tempfile.mkdtemp(prefix="torrent_")
 
     try:
-        # Download the .torrent file from Telegram
-        torrent_file_path = os.path.join(temp_dir, "input.torrent")
-        await bot.download_media(message, file_name=torrent_file_path)
-
-        if not os.path.exists(torrent_file_path):
-            await status_msg.edit("❌ Gagal memuat turun fail .torrent.")
         user_client = await manager.get_client(user_id)
         if not user_client:
-            await status_msg.edit("❌ Sesi tidak sah. Sila login semula.")
             await safe_edit(status_msg, "❌ Sesi tidak sah. Sila login semula.")
             return
 
-        await _process_torrent(
-            bot, user_client, message, status_msg, user_id,
-            torrent_file_path, "torrent_file", temp_dir,
-            skip_non_videos=skip_non_videos,
-        )
         if source_type == "torrent":
+            # Magnet link / HTTP .torrent URL — hand straight to aria2.
             if not link or not link_type:
-                await status_msg.edit("❌ Link torrent tidak sah.")
                 await safe_edit(status_msg, "❌ Link torrent tidak sah.")
                 return
             await _process_torrent(
@@ -1227,13 +1147,12 @@ async def process_torrent_download(
                 exclude_words=exclude_words,
             )
         elif source_type == "torrent_file":
-            await status_msg.edit("🧲 Memuat turun fail .torrent…")
+            # User uploaded a .torrent document — fetch it from Telegram first.
             await safe_edit(status_msg, "🧲 Memuat turun fail .torrent…")
             torrent_file_path = os.path.join(temp_dir, "input.torrent")
             await bot.download_media(message, file_name=torrent_file_path)
 
             if not os.path.exists(torrent_file_path):
-                await status_msg.edit("❌ Gagal memuat turun fail .torrent.")
                 await safe_edit(status_msg, "❌ Gagal memuat turun fail .torrent.")
                 return
 
@@ -1247,7 +1166,6 @@ async def process_torrent_download(
     except Aria2Error as e:
         print(f"[Torrent] Aria2 error: {e}")
         try:
-            await status_msg.edit(f"❌ Ralat torrent: {e}")
             await safe_edit(status_msg, f"❌ Ralat torrent: {e}")
         except Exception:
             pass
@@ -1257,7 +1175,6 @@ async def process_torrent_download(
         # Session already invalidated inside _upload_file_to_backup.
         print(f"[Torrent] Session invalid for user {user_id}: {e}")
         try:
-            await status_msg.edit("❌ Sesi anda telah tamat. Sila /start dan login semula.")
             await safe_edit(status_msg, "❌ Sesi anda telah tamat. Sila /start dan login semula.")
         except Exception:
             pass
@@ -1266,7 +1183,6 @@ async def process_torrent_download(
         import traceback
         traceback.print_exc()
         try:
-            await status_msg.edit(f"❌ Ralat tidak dijangka: {e}")
             await safe_edit(status_msg, f"❌ Ralat tidak dijangka: {e}")
         except Exception:
             pass
@@ -1340,7 +1256,6 @@ async def _process_torrent(
     print(f"[Torrent] Download started: gid={gid} type={link_type}")
 
     # 3. Wait for metadata (for magnet links, aria2 first fetches metadata)
-    await status_msg.edit("🔍 Mendapatkan maklumat torrent…")
     await safe_edit(status_msg, "🔍 Mendapatkan maklumat torrent…")
 
     # Give aria2 a moment to resolve metadata
@@ -1409,7 +1324,6 @@ async def _process_torrent(
     except Aria2Error as e:
         await download_tracker.stop()
         if "cancelled" in str(e).lower():
-            await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
             await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
         else:
             raise
@@ -1420,7 +1334,6 @@ async def _process_torrent(
     # Check total size against limit
     total_size = int(final_status.get("totalLength", 0))
     if TORRENT_MAX_SIZE > 0 and total_size > TORRENT_MAX_SIZE:
-        await status_msg.edit(
         await safe_edit(
             status_msg,
             f"❌ Torrent terlalu besar! ({_format_size(total_size)})\n"
@@ -1436,7 +1349,6 @@ async def _process_torrent(
 
     # 6. Collect uploadable files
     if is_cancelled(user_id):
-        await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
         await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
         return
 
@@ -1449,7 +1361,6 @@ async def _process_torrent(
             else "❌ **Tiada fail yang boleh dimuat naik dijumpai dalam torrent ini.**\n\n"
                  "Bot menyokong: foto, video, audio, dan dokumen biasa."
         )
-        await status_msg.edit(msg)
         await safe_edit(status_msg, msg)
         return
 
@@ -1484,7 +1395,6 @@ async def _process_torrent(
         print(f"[Torrent] Splitting {len(split_videos)} oversized videos: {split_names}")
 
     if not valid_files and not split_videos:
-        await status_msg.edit(
         await safe_edit(
             status_msg,
             f"❌ Semua {len(files)} fail melebihi had saiz Telegram ({_format_size(size_limit)}).\n\n"
@@ -1495,7 +1405,6 @@ async def _process_torrent(
     # 7. Get backup peer
     backup_peer = await get_backup_group_peer(bot)
     if not backup_peer:
-        await status_msg.edit("❌ Backup group tidak dijumpai.")
         await safe_edit(status_msg, "❌ Backup group tidak dijumpai.")
         return
 
@@ -1505,7 +1414,6 @@ async def _process_torrent(
     total_files = len(valid_files)
     media_label = "video" if skip_non_videos else "fail"
     if total_files:
-        await status_msg.edit(
         await safe_edit(
             status_msg,
             f"📤 Memuat naik {total_files} {media_label} ke Telegram…\n"
@@ -1514,7 +1422,6 @@ async def _process_torrent(
 
     for idx, finfo in enumerate(valid_files, 1):
         if is_cancelled(user_id):
-            await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
             await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
             return
 
@@ -1551,13 +1458,6 @@ async def _process_torrent(
 
     # Split & upload videos that exceed the Telegram limit (2 GB / 4 GB Premium)
     if split_videos:
-        try:
-            await status_msg.edit(
-                f"✂️ Memotong {len(split_videos)} video besar kepada bahagian…\n"
-                f"🧲 {torrent_name}"
-            )
-        except Exception:
-            pass
         await safe_edit(
             status_msg,
             f"✂️ Memotong {len(split_videos)} video besar kepada bahagian…\n"
@@ -1566,7 +1466,6 @@ async def _process_torrent(
 
     for finfo in split_videos:
         if is_cancelled(user_id):
-            await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
             await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
             return
 
@@ -1580,7 +1479,6 @@ async def _process_torrent(
         gc.collect()
 
     if not uploaded:
-        await status_msg.edit("❌ Semua fail gagal dimuat naik.")
         await safe_edit(status_msg, "❌ Semua fail gagal dimuat naik.")
         return
 
@@ -1590,7 +1488,6 @@ async def _process_torrent(
     else:
         skip_msg = ""
 
-    await _deliver_to_user(bot, user_id, uploaded, status_msg)
     await _deliver_to_user(
         bot, user_id, uploaded, status_msg,
         enable_caption=enable_caption,
