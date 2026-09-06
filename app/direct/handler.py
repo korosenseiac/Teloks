@@ -515,7 +515,6 @@ async def _upload_file_to_backup(
                     SendMedia(
                         peer=target_peer,
                         media=media,
-                        message="",
                         message=caption_text,
                         entities=caption_entities,
                         random_id=random.randint(0, 2 ** 63 - 1),
@@ -650,11 +649,9 @@ async def _send_album_to_user(
 
     CHUNK = 8
 
-    async def _send_single(mid: int) -> bool:
     async def _send_single(mid: int, name: str = "", kind: str = "") -> bool:
         cap = generate_video_caption(name, exclude_words) if (enable_caption and kind == "video") else None
         r = await _safe_send(
-            lambda _mid=mid: bot.copy_message(
             lambda _mid=mid, _cap=cap: bot.copy_message(
                 chat_id=user_id,
                 from_chat_id=BACKUP_GROUP_ID,
@@ -677,7 +674,6 @@ async def _send_album_to_user(
         )
         if backup_msgs is None:
             for mid, kind, name, size in chunk:
-                await _send_single(mid)
                 await _send_single(mid, name, kind)
                 await asyncio.sleep(0.5)
             continue
@@ -688,8 +684,6 @@ async def _send_album_to_user(
         msg_map = {m.id: m for m in backup_msgs if m and not getattr(m, "empty", False)}
         media_list = []
         valid_mids = []
-        for msg in backup_msgs:
-            if not msg or getattr(msg, "empty", False):
         for mid, kind, name, size in chunk:
             msg = msg_map.get(mid)
             if not msg:
@@ -698,7 +692,6 @@ async def _send_album_to_user(
                 media_list.append(InputMediaPhoto(msg.photo.file_id))
                 valid_mids.append(msg.id)
             elif msg.video:
-                media_list.append(InputMediaVideo(msg.video.file_id))
                 cap = generate_video_caption(name, exclude_words) if enable_caption else None
                 media_list.append(InputMediaVideo(msg.video.file_id, caption=cap, parse_mode=ParseMode.HTML if cap else None))
                 valid_mids.append(msg.id)
@@ -708,13 +701,11 @@ async def _send_album_to_user(
 
         if not media_list:
             for mid, kind, name, size in chunk:
-                await _send_single(mid)
                 await _send_single(mid, name, kind)
                 await asyncio.sleep(0.5)
             continue
 
         if len(media_list) == 1:
-            await _send_single(valid_mids[0])
             single_item = next((item for item in chunk if item[0] == valid_mids[0]), None)
             s_name = single_item[2] if single_item else ""
             s_kind = single_item[1] if single_item else ""
@@ -733,9 +724,6 @@ async def _send_album_to_user(
                         delivered_mids.add(vm)
             else:
                 print("[DirectLink] Album send failed, falling back to individual sends")
-                for mid in valid_mids:
-                    await _send_single(mid)
-                    await asyncio.sleep(0.5)
                 for mid, kind, name, size in chunk:
                     if mid in valid_mids:
                         await _send_single(mid, name, kind)
@@ -761,7 +749,6 @@ async def _deliver_to_user_multi(
 
     delivered_mids: set = set()
 
-    async def _send_single(mid: int) -> bool:
     photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
     videos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
     others = [(mid, k, n, s) for mid, k, n, s in uploaded
@@ -777,7 +764,6 @@ async def _deliver_to_user_multi(
     async def _send_single_item(mid: int, name: str = "", kind: str = "") -> bool:
         cap = generate_video_caption(name, exclude_words) if (enable_caption and kind == "video") else None
         r = await _safe_send(
-            lambda _mid=mid: bot.copy_message(
             lambda _mid=mid, _cap=cap: bot.copy_message(
                 chat_id=user_id,
                 from_chat_id=BACKUP_GROUP_ID,
@@ -791,20 +777,7 @@ async def _deliver_to_user_multi(
             return True
         return False
 
-    photos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "photo"]
-    videos = [(mid, k, n, s) for mid, k, n, s in uploaded if k == "video"]
-    others = [(mid, k, n, s) for mid, k, n, s in uploaded
-              if k not in ("photo", "video")]
-
-    # Send: photos album first
-    await _send_album_to_user(bot, user_id, photos, delivered_mids)
-
-    # Send: videos album next
-    await _send_album_to_user(bot, user_id, videos, delivered_mids)
-
-    # Send: anything else individually
     for mid, k, n, s in others:
-        await _send_single(mid)
         await _send_single_item(mid, n, k)
         await asyncio.sleep(0.5)
 
@@ -820,7 +793,6 @@ async def _deliver_to_user_multi(
         )
         await asyncio.sleep(2)
         for mid in missing_mids:
-            await _send_single(mid)
             item = item_map.get(mid)
             name = item[2] if item else ""
             kind = item[1] if item else ""
@@ -1458,7 +1430,6 @@ async def process_direct_download(
                 bot, _direct_client, backup_peer, message, status_msg,
                 user_id, final_url, file_name, file_size,
                 skip_non_videos=skip_non_videos,
-                is_premium=is_premium
                 is_premium=is_premium,
                 enable_caption=enable_caption,
                 exclude_words=exclude_words,
@@ -1583,7 +1554,6 @@ async def process_direct_download(
                                 bot, user_client, backup_peer, part_streamer, part_filename, part_size,
                                 tracker=part_tracker,
                                 thumb_raw=part_thumb,
-                                video_meta=part_meta
                                 video_meta=part_meta,
                                 caption=part_caption,
                             )
@@ -1596,7 +1566,6 @@ async def process_direct_download(
                                 return
 
                             await part_tracker.stop(f"⬆️ Menghantar bahagian {part_num}/{num_parts}…")
-                            delivered = await _send_to_user(bot, user_id, msg_id, is_sent_to_bot)
                             delivered = await _send_to_user(bot, user_id, msg_id, is_sent_to_bot, caption=part_caption)
 
                             if delivered:
@@ -1633,7 +1602,6 @@ async def process_direct_download(
                             shutil.rmtree(split_dir, ignore_errors=True)
 
                 else:
-                    # Generate thumbnail at 10% of duration
                     # Generate thumbnail (20% -> 45% -> 70% of duration)
                     duration = video_meta.get("duration", 0)
                     if not thumb_raw:
@@ -1670,7 +1638,6 @@ async def process_direct_download(
             bot, user_client, backup_peer, streamer, file_name, file_size, 
             tracker=tracker,
             thumb_raw=thumb_raw,
-            video_meta=video_meta
             video_meta=video_meta,
             caption=video_caption,
         )
@@ -1691,7 +1658,6 @@ async def process_direct_download(
 
         # Send to user
         await tracker.stop("⬆️ Menghantar ke anda…")
-        delivered = await _send_to_user(bot, user_id, msg_id, is_sent_to_bot)
         delivered = await _send_to_user(bot, user_id, msg_id, is_sent_to_bot, caption=video_caption)
 
         if delivered:
