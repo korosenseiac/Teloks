@@ -120,6 +120,7 @@ def _extract_terabox_info(text: str) -> Optional[Tuple[str, str]]:
 from app.utils.media import (
     PHOTO_EXTS, VIDEO_EXTS, AUDIO_EXTS, MAX_FILE_SIZE,
     ext as _ext, classify as _classify, mime as _mime,
+    SKIP_PATTERN,
 )
 
 
@@ -601,7 +602,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         return
 
     # ---------------------------------------------------------------- Parse link
-    skip_non_videos = "/skip" in message.text.lower()
+    skip_non_videos = bool(SKIP_PATTERN.search(message.text or ""))
     parsed = _extract_terabox_info(message.text)
     if not parsed:
         return
@@ -785,6 +786,13 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             return
 
         total = len(all_files)
+
+        if skip_non_videos:
+            all_files = [f for f in all_files if _classify(f.get("server_filename", "file")) == "video"]
+            print(f"[TB:handler] /skip filtered {total} -> {len(all_files)} video(s)")
+            if not all_files:
+                await safe_edit(status_msg, "❌ Tiada video dijumpai untuk dimuat naik.")
+                return
 
         # 5. Validate sizes
         oversized = [f for f in all_files if int(f.get("size", 0)) > MAX_FILE_SIZE]

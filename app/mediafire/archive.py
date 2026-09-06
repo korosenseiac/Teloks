@@ -43,10 +43,12 @@ def _natural_sort_key(s: str) -> list:
 async def extract_media_from_archive(
     archive_path: str,
     dest_dir: str,
+    skip_non_video: bool = False,
 ) -> List[Dict[str, object]]:
     """
     Extract only media files (photos + videos) from *archive_path* into
-    *dest_dir*.  Returns a list of dicts::
+    *dest_dir*. If *skip_non_video* is True, only video files are extracted.
+    Returns a list of dicts::
 
         [{"name": "photo.jpg", "size": 123456, "path": "/tmp/.../photo.jpg",
           "kind": "photo"}, ...]
@@ -61,14 +63,14 @@ async def extract_media_from_archive(
     lower = archive_path.lower()
 
     if lower.endswith(".zip"):
-        return await _extract_zip(archive_path, dest_dir)
+        return await _extract_zip(archive_path, dest_dir, skip_non_video)
     elif lower.endswith(".rar"):
         if not _HAS_RAR:
             raise ValueError(
                 "Sokongan RAR tidak tersedia — sila pasang `rarfile` dan "
                 "binary `unrar` pada pelayan."
             )
-        return await _extract_rar(archive_path, dest_dir)
+        return await _extract_rar(archive_path, dest_dir, skip_non_video)
     else:
         raise ValueError(f"Format arkib tidak disokong: {os.path.basename(archive_path)}")
 
@@ -264,14 +266,19 @@ def _extract_single_rar_entry(
 # ---------------------------------------------------------------------------
 
 
-async def _extract_zip(archive_path: str, dest_dir: str) -> List[Dict[str, object]]:
+async def _extract_zip(
+    archive_path: str, dest_dir: str, skip_non_video: bool = False
+) -> List[Dict[str, object]]:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _sync_extract_zip, archive_path, dest_dir)
+    return await loop.run_in_executor(None, _sync_extract_zip, archive_path, dest_dir, skip_non_video)
 
 
-def _sync_extract_zip(archive_path: str, dest_dir: str) -> List[Dict[str, object]]:
+def _sync_extract_zip(
+    archive_path: str, dest_dir: str, skip_non_video: bool = False
+) -> List[Dict[str, object]]:
     results: List[Dict[str, object]] = []
     seen_names: Dict[str, int] = {}
+    filter_exts = VIDEO_EXTS if skip_non_video else MEDIA_EXTS
 
     with zipfile.ZipFile(archive_path, "r") as zf:
         # Sort in-memory list naturally by basename
@@ -283,7 +290,7 @@ def _sync_extract_zip(archive_path: str, dest_dir: str) -> List[Dict[str, object
 
             # Only extract media files
             basename = os.path.basename(info.filename)
-            if not basename or ext(basename) not in MEDIA_EXTS:
+            if not basename or ext(basename) not in filter_exts:
                 continue
 
             # Handle duplicate names
@@ -314,14 +321,19 @@ def _sync_extract_zip(archive_path: str, dest_dir: str) -> List[Dict[str, object
 # ---------------------------------------------------------------------------
 
 
-async def _extract_rar(archive_path: str, dest_dir: str) -> List[Dict[str, object]]:
+async def _extract_rar(
+    archive_path: str, dest_dir: str, skip_non_video: bool = False
+) -> List[Dict[str, object]]:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _sync_extract_rar, archive_path, dest_dir)
+    return await loop.run_in_executor(None, _sync_extract_rar, archive_path, dest_dir, skip_non_video)
 
 
-def _sync_extract_rar(archive_path: str, dest_dir: str) -> List[Dict[str, object]]:
+def _sync_extract_rar(
+    archive_path: str, dest_dir: str, skip_non_video: bool = False
+) -> List[Dict[str, object]]:
     results: List[Dict[str, object]] = []
     seen_names: Dict[str, int] = {}
+    filter_exts = VIDEO_EXTS if skip_non_video else MEDIA_EXTS
 
     with rarfile.RarFile(archive_path, "r") as rf:
         # Sort in-memory list naturally by basename
@@ -331,7 +343,7 @@ def _sync_extract_rar(archive_path: str, dest_dir: str) -> List[Dict[str, object
                 continue
 
             basename = os.path.basename(info.filename)
-            if not basename or ext(basename) not in MEDIA_EXTS:
+            if not basename or ext(basename) not in filter_exts:
                 continue
 
             safe_name = _unique_name(basename, seen_names)

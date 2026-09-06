@@ -55,7 +55,7 @@ from app.utils.streamer import upload_stream
 from app.utils.media import (
     PHOTO_EXTS, VIDEO_EXTS, MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM,
     ext as _ext, classify as _classify, mime as _mime,
-    is_media, is_archive,
+    is_media, is_archive, SKIP_PATTERN,
 )
 from app.mediafire.client import MediaFireClient
 from app.mediafire.streamer import MediaFireStreamer, FileStreamer
@@ -617,7 +617,7 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
         return
 
     # ---------------------------------------------------------------- Parse link
-    skip_non_videos = "/skip" in message.text.lower()
+    skip_non_videos = bool(SKIP_PATTERN.search(message.text or ""))
     match = MEDIAFIRE_LINK_PATTERN.search(message.text)
     if not match:
         return
@@ -885,8 +885,9 @@ async def _handle_archive(
         extract_dir = os.path.join(temp_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
 
+        media_label = "video" if skip_non_videos else "media"
         await safe_edit(status_msg, 
-            f"📤 Memuat naik {total_files} fail media ke Telegram…"
+            f"📤 Memuat naik {total_files} fail {media_label} ke Telegram…"
         )
 
         # ----- Phase 3: Extract & upload (photos parallel, videos sequential) -----

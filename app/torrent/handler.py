@@ -62,6 +62,7 @@ from app.utils.media import (
     PHOTO_EXTS, VIDEO_EXTS, AUDIO_EXTS,
     MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM,
     ext as _ext, classify as _classify, mime as _mime,
+    SKIP_PATTERN,
 )
 from app.torrent.client import Aria2Error
 from app.torrent.streamer import TorrentFileStreamer
@@ -846,7 +847,7 @@ async def _deliver_to_user(
 # Collect files from completed torrent download
 # ---------------------------------------------------------------------------
 
-def _collect_torrent_files(download_dir: str) -> List[Dict[str, Any]]:
+def _collect_torrent_files(download_dir: str, skip_non_videos: bool = False) -> List[Dict[str, Any]]:
     """Walk the download directory and return uploadable files.
 
     Returns list of dicts: {"path": str, "name": str, "size": int, "kind": str}
@@ -863,11 +864,14 @@ def _collect_torrent_files(download_dir: str) -> List[Dict[str, Any]]:
                 continue
             if not _is_uploadable(fname):
                 continue
+            kind = _classify(fname)
+            if skip_non_videos and kind != "video":
+                continue
             files.append({
                 "path": fpath,
                 "name": fname,
                 "size": fsize,
-                "kind": _classify(fname),
+                "kind": kind,
             })
 
     # Sort: photos → videos → audio → documents
@@ -963,6 +967,7 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
 
     # ---------------------------------------------------------------- Detect link type
     text = message.text or ""
+    skip_non_videos = bool(SKIP_PATTERN.search(text))
     magnet_match = MAGNET_LINK_PATTERN.search(text)
     torrent_url_match = TORRENT_URL_PATTERN.search(text)
 
@@ -979,7 +984,7 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
     else:
         return
 
-    print(f"[Torrent] user={user_id} type={link_type} link={link[:80]}…")
+    print(f"[Torrent] user={user_id} type={link_type} link={link[:80]}… skip={skip_non_videos}")
 
     # ---------------------------------------------------------------- Start
     active_user_processes[user_id] = asyncio.current_task()
@@ -991,6 +996,7 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
         await _process_torrent(
             bot, user_client, message, status_msg, user_id,
             link, link_type, temp_dir,
+            skip_non_videos=skip_non_videos,
         )
     except Aria2Error as e:
         print(f"[Torrent] Aria2 error: {e}")
@@ -1083,6 +1089,8 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
         return
 
     # ---------------------------------------------------------------- Download .torrent file
+    caption = message.caption or message.text or ""
+    skip_non_videos = bool(SKIP_PATTERN.search(caption))
     active_user_processes[user_id] = asyncio.current_task()
     reset_cancel(user_id)
     status_msg = await message.reply_text("🧲 Memuat turun fail .torrent…")
@@ -1100,6 +1108,7 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
         await _process_torrent(
             bot, user_client, message, status_msg, user_id,
             torrent_file_path, "torrent_file", temp_dir,
+            skip_non_videos=skip_non_videos,
         )
     except Aria2Error as e:
         print(f"[Torrent] Aria2 error: {e}")
@@ -1154,6 +1163,7 @@ async def _process_torrent(
     link_or_path: str,
     link_type: str,   # "magnet", "torrent_url", "torrent_file"
     temp_dir: str,
+    skip_non_videos: bool = False,
 ) -> None:
     """Download torrent via aria2c, then upload all media files to Telegram."""
     from app.bot.main import (
@@ -1286,13 +1296,16 @@ async def _process_torrent(
         await status_msg.edit("🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
         return
 
-    files = _collect_torrent_files(download_dir)
+    files = _collect_torrent_files(download_dir, skip_non_videos=skip_non_videos)
 
     if not files:
-        await status_msg.edit(
-            "❌ **Tiada fail yang boleh dimuat naik dijumpai dalam torrent ini.**\n\n"
-            "Bot menyokong: foto, video, audio, dan dokumen biasa."
+        msg = (
+            "❌ **Tiada fail video dijumpai dalam torrent ini.**"
+            if skip_non_videos
+            else "❌ **Tiada fail yang boleh dimuat naik dijumpai dalam torrent ini.**\n\n"
+                 "Bot menyokong: foto, video, audio, dan dokumen biasa."
         )
+        await status_msg.edit(msg)
         return
 
     # Filter out files exceeding Telegram's limit
@@ -1342,9 +1355,10 @@ async def _process_torrent(
     uploaded: List[Tuple[int, str, str, int, bool]] = []
 
     total_files = len(valid_files)
+    media_label = "video" if skip_non_videos else "fail"
     if total_files:
         await status_msg.edit(
-            f"📤 Memuat naik {total_files} fail ke Telegram…\n"
+            f"📤 Memuat naik {total_files} {media_label} ke Telegram…\n"
             f"🧲 {torrent_name}"
         )
 

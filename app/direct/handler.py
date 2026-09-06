@@ -57,6 +57,7 @@ from app.utils.media import (
     is_archive,
     is_media,
     MEDIA_EXTS,
+    SKIP_PATTERN,
 )
 from app.direct.client import DirectLinkClient
 from app.direct.streamer import DirectLinkStreamer
@@ -951,8 +952,9 @@ async def _handle_archive(
         extract_dir = os.path.join(temp_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
 
+        media_label = "video" if skip_non_videos else "media"
         await safe_edit(status_msg, 
-            f"📤 Memuat naik {total_files} fail media ke Telegram…"
+            f"📤 Memuat naik {total_files} fail {media_label} ke Telegram…"
         )
 
         # ----- Phase 3: Extract & upload (photos parallel, videos sequential) -----
@@ -1249,6 +1251,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
 
     # Extract URL from message
     message_text = message.text or message.caption or ""
+    skip_non_videos = bool(SKIP_PATTERN.search(message_text))
     match = DIRECT_LINK_PATTERN.search(message_text)
     if not match:
         await message.reply_text("❌ Tidak dapat mengesan URL yang sah.")
@@ -1281,6 +1284,12 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         
         is_arch = is_archive(file_name)
         is_video = _ext(file_name) in VIDEO_EXTS
+
+        # If /skip is used, skip all files except videos and archives containing videos
+        if skip_non_videos and not is_arch and not is_video:
+            await safe_edit(status_msg, "❌ Fail ini bukannya video. Melangkau (skip).")
+            return
+
         hard_limit = 10 * 1024 * 1024 * 1024  # 10 GB limit for archives
 
         # Allow videos and archives to exceed standard limit during initial download
@@ -1322,6 +1331,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
             await _handle_archive(
                 bot, _direct_client, backup_peer, message, status_msg,
                 user_id, final_url, file_name, file_size,
+                skip_non_videos=skip_non_videos,
                 is_premium=is_premium
             )
             return

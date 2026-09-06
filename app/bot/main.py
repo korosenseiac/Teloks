@@ -33,7 +33,7 @@ from app.torrent.handler import (
     MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
 )
 from app.direct.handler import direct_link_handler, DIRECT_LINK_PATTERN
-from app.utils.media import is_torrent, is_archive, classify, mime, PHOTO_EXTS, VIDEO_EXTS
+from app.utils.media import is_torrent, is_archive, classify, mime, PHOTO_EXTS, VIDEO_EXTS, ext, SKIP_PATTERN, is_video
 from app.mediafire.archive import iter_extract_media, count_media_in_archive
 from app.mediafire.streamer import FileStreamer
 import asyncio
@@ -664,7 +664,7 @@ async def _process_archive_from_message(
     Handle archive files (.zip/.rar) from forwarded messages.
     Downloads the archive, extracts media files, uploads them, and sends to user.
 
-    If skip_non_videos is True, only videos will be extracted (photos skipped).
+    If skip_non_videos is True, only videos will be extracted (all non-video files skipped).
     """
     from pyrogram.types import InputMediaPhoto, InputMediaVideo
 
@@ -1053,6 +1053,30 @@ def _media_type_of(target_msg):
     return None
 
 
+def _is_video_message(target_msg: Message) -> bool:
+    """Check if a Telegram message contains a video.
+
+    Returns True for:
+    - target_msg.video
+    - target_msg.video_note
+    - target_msg.document with a video extension or video MIME type (excluding archives)
+    Returns False for photos, audios, voice notes, stickers, animations, non-video documents, and archives.
+    """
+    if not target_msg or not target_msg.media:
+        return False
+    if target_msg.video or target_msg.video_note:
+        return True
+    if target_msg.document:
+        fname = getattr(target_msg.document, "file_name", "") or ""
+        mime_type = getattr(target_msg.document, "mime_type", "") or ""
+        if is_archive(fname):
+            return False
+        if ext(fname) in VIDEO_EXTS or mime_type.lower().startswith("video/"):
+            return True
+    return False
+
+
+
 async def send_album_to_user(client, user_id, items, source_name, username, status_msg):
     """Send a list of uploaded media items to the user as chunked albums.
 
@@ -1284,6 +1308,7 @@ async def link_handler(client: Client, message: Message):
         skipped_archives = []      # list of file names skipped because they are archives
         fetch_errors = []          # list of human-readable error strings
         seen_msg_ids = set()       # dedup by (chat_id, msg_id) to avoid double-counting album media
+        skip_non_videos = bool(SKIP_PATTERN.search(message.text or ""))
 
         total_links = len(unique_links)
         for link_idx, match in enumerate(unique_links, 1):
@@ -1318,7 +1343,6 @@ async def link_handler(client: Client, message: Message):
                 if is_archive(doc_name):
                     if total_links == 1:
                         # Single link with archive: process it directly
-                        skip_non_videos = "/skip" in message.text.lower()
                         source_name = (target_msg.chat.title if target_msg.chat and target_msg.chat.title
                                        else "Unknown")
                         backup_peer = await get_backup_group_peer(client)
@@ -1351,11 +1375,15 @@ async def link_handler(client: Client, message: Message):
                     fetch_errors.append(f"Link {link_idx}: gagal dapat media group ({e})")
                     continue
                 for mg_msg in media_group_msgs:
+                    if skip_non_videos and not _is_video_message(mg_msg):
+                        continue
                     key = (resolved_chat_id, mg_msg.id)
                     if key not in seen_msg_ids:
                         seen_msg_ids.add(key)
                         collected_messages.append(mg_msg)
             else:
+                if skip_non_videos and not _is_video_message(target_msg):
+                    continue
                 key = (resolved_chat_id, target_msg.id)
                 if key not in seen_msg_ids:
                     seen_msg_ids.add(key)
@@ -1363,7 +1391,10 @@ async def link_handler(client: Client, message: Message):
 
         # If nothing collectable, summarize and stop
         if not collected_messages:
-            summary = "❌ **Tiada media berjaya dikumpul.**\n"
+            if skip_non_videos:
+                summary = "❌ **Tiada fail video dijumpai untuk diproses.**\n"
+            else:
+                summary = "❌ **Tiada media berjaya dikumpul.**\n"
             if skipped_archives:
                 summary += "\n📂 **Arkib dilangkau (hantar secara berasingan):**\n"
                 summary += "\n".join(f"  • {s}" for s in skipped_archives)
@@ -1412,8 +1443,9 @@ async def link_handler(client: Client, message: Message):
                 return
 
             # Throttle status edits to avoid FloodWait on large batches
+            media_label = "video" if skip_non_videos else "media"
             if idx == 1 or idx == total_files or idx % 5 == 0:
-                await safe_edit(status_msg, f"⬇️ Memuat naik {idx}/{total_files}...")
+                await safe_edit(status_msg, f"⬇️ Memuat naik {idx}/{total_files} fail {media_label}...")
 
             media_type = _media_type_of(msg_to_process)
 
@@ -1476,7 +1508,8 @@ async def link_handler(client: Client, message: Message):
         # --- Phase 6: Finalize ---
         total_media = len(uploaded_media) + len(others_backup_ids)
         total_size = sum(m[2] for m in uploaded_media)
-        summary = f"✅ **Selesai!**\n\n📁 Media: {total_media}\n📦 Jumlah: {format_file_size(total_size)}"
+        media_label = "Video" if skip_non_videos else "Media"
+        summary = f"✅ **Selesai!**\n\n📁 {media_label}: {total_media}\n📦 Jumlah: {format_file_size(total_size)}"
         if skipped_archives:
             summary += f"\n\n📂 Arkib dilangkau: {len(skipped_archives)}"
         if fetch_errors:

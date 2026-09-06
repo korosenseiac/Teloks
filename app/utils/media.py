@@ -7,17 +7,24 @@ classification used by both the TeraBox and MediaFire pipelines.
 from __future__ import annotations
 
 import os
+import re
 
 # ---------------------------------------------------------------------------
 # Extension sets
 # ---------------------------------------------------------------------------
 
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".ts"}
+VIDEO_EXTS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v", ".ts",
+    ".wmv", ".asf", ".3gp", ".m2ts", ".vob", ".ogv", ".rmvb", ".rm", ".divx", ".f4v",
+}
 AUDIO_EXTS = {".mp3", ".flac", ".aac", ".ogg", ".m4a", ".wav", ".opus"}
 ARCHIVE_EXTS = {".zip", ".rar"}
 TORRENT_EXTS = {".torrent"}
 MEDIA_EXTS = PHOTO_EXTS | VIDEO_EXTS
+
+# Regex pattern to match /skip as an isolated token / command
+SKIP_PATTERN = re.compile(r"(?<!\S)/skip(?!\S)", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Max file size (Telegram upload limit via raw API)
@@ -72,6 +79,16 @@ def mime(name: str) -> str:
 def is_media(name: str) -> bool:
     """Return True if the filename has a photo or video extension."""
     return ext(name) in MEDIA_EXTS
+
+
+def is_video(name: str) -> bool:
+    """Return True if the filename has a video extension."""
+    return ext(name) in VIDEO_EXTS
+
+
+def is_photo(name: str) -> bool:
+    """Return True if the filename has a photo extension."""
+    return ext(name) in PHOTO_EXTS
 
 
 def is_archive(name: str) -> bool:
