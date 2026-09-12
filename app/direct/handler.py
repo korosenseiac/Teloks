@@ -74,6 +74,7 @@ from app.utils.caption import (
     get_caption_choice_keyboard,
     set_caption_state,
 )
+from app.utils.video_compressor import convert_mkv_to_mp4, is_convertible
 
 # ---------------------------------------------------------------------------
 # Pattern matching for direct links
@@ -1170,6 +1171,29 @@ async def _handle_archive(
                 video_meta = None
                 vid_caption = None
                 if mf["kind"] == "video":
+                    # Remux MKV → MP4 first (stream copy, no quality loss) so the
+                    # metadata, thumbnail, progress tracker and upload below all
+                    # operate on the converted file and its real byte count.
+                    if is_convertible(mf["name"]):
+                        _conv = await convert_mkv_to_mp4(mf["path"], mf["name"])
+                        if _conv.converted:
+                            mf["path"], mf["name"], mf["size"] = (
+                                _conv.path, _conv.name, _conv.size,
+                            )
+                            # Remuxing can change the byte count slightly, so the
+                            # Telegram size limit must be re-checked with the new
+                            # size and the converted file cleaned up if oversized.
+                            if mf["size"] > size_limit:
+                                print(
+                                    f"[DirectArchive] Skipping oversized converted "
+                                    f"file: {mf['name']} ({mf['size']} bytes)"
+                                )
+                                try:
+                                    os.remove(mf["path"])
+                                except OSError:
+                                    pass
+                                continue
+
                     video_meta = await _get_video_metadata(mf["path"])
                     thumb_raw = await _generate_video_thumb(mf["path"], video_meta.get("duration", 0))
                     if enable_caption:
@@ -1351,6 +1375,9 @@ async def process_direct_download(
         return
 
     tracker: Optional[ProgressTracker] = None
+    # Initialised here so the handler-level ``finally`` can always clean up the
+    # downloaded — and possibly converted — temp video, whatever path we exit on.
+    temp_video_path: Optional[str] = None
 
     user_client = await manager.get_client(user_id)
     if not user_client:
@@ -1482,6 +1509,22 @@ async def process_direct_download(
                     _direct_client, final_url, file_name, file_size,
                     on_download_chunk=tracker.add_downloaded,
                 )
+
+                # Remux MKV → MP4 (stream copy, no quality loss) BEFORE probing,
+                # thumbnailing or splitting, so every downstream step — and the
+                # delivered Telegram video (mp4 = inline playable) — uses the MP4.
+                if is_convertible(file_name):
+                    _conv = await convert_mkv_to_mp4(
+                        temp_video_path, file_name,
+                        status_cb=lambda t: safe_edit(status_msg, t),
+                    )
+                    if _conv.converted:
+                        temp_video_path = _conv.path
+                        file_name = _conv.name
+                        # _upload_file_to_backup() must get the REAL byte count:
+                        # upload_stream() aborts when the size it was given does
+                        # not match the data it reads from disk.
+                        file_size = _conv.size
 
                 # Extract metadata with ffprobe
                 video_meta = await _get_video_metadata(temp_video_path)
@@ -1711,5 +1754,14 @@ async def process_direct_download(
         if tracker:
             await tracker.stop()
         active_user_processes.pop(user_id, None)
+        # 🧹 Always remove the downloaded (and possibly MKV→MP4 converted) temp
+        # video. This runs on EVERY exit path — success, multi-part split return,
+        # cancellation, invalid session and unexpected errors — which is what
+        # stops converted MP4s from piling up in the temp directory.
+        if temp_video_path and os.path.exists(temp_video_path):
+            try:
+                os.remove(temp_video_path)
+            except OSError as e:
+                print(f"[DirectLink] Temp video cleanup error: {e}")
         await _direct_client.close()
 

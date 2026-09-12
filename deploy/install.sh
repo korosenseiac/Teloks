@@ -148,6 +148,21 @@ OWNER_ID=your_telegram_id_here
 # firewall/security group so the bot can receive peers and DHT responses.
 # Default 51413; keep it in sync with deploy firewall rules.
 TORRENT_LISTEN_PORT=51413
+
+# MKV → MP4 remux (stream copy: no re-encode, no quality loss) before delivery.
+# Requires ffmpeg (installed by this script). Any failure falls back to
+# uploading the original MKV, so it is safe to leave enabled.
+MKV_TO_MP4=true
+
+# Timeout (seconds) for one remux before ffmpeg is killed. Default 1800.
+CONVERT_TIMEOUT=1800
+
+# Concurrent conversions. 1 is recommended on a 2 vCPU / small-RAM VPS.
+CONVERT_CONCURRENCY=1
+
+# Leave empty to write converted MP4s next to their source file inside the
+# pipeline's own temp dir (recommended — cleanup is automatic).
+CONVERT_TEMP_DIR=
 EOF
     chown $BOT_USER:$BOT_USER $BOT_DIR/.env
     chmod 600 $BOT_DIR/.env

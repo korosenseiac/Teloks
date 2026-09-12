@@ -76,6 +76,7 @@ from app.utils.caption import (
     set_caption_state,
 )
 from app.utils.message import safe_edit
+from app.utils.video_compressor import convert_mkv_to_mp4, is_convertible
 
 # ---------------------------------------------------------------------------
 # Link patterns
@@ -1353,6 +1354,35 @@ async def _process_torrent(
         return
 
     files = _collect_torrent_files(download_dir, skip_non_videos=skip_non_videos)
+
+    # 6b. Remux MKV → MP4 (stream copy, no quality loss) BEFORE size filtering,
+    # metadata, thumbnails and part-splitting, so everything downstream — and
+    # the delivered Telegram video — uses the converted MP4. The files live in
+    # this run's temp dir, so the handler's rmtree() and the startup
+    # cleanup_orphaned_torrent_dirs() sweep take care of anything left over.
+    _mkv_files = [f for f in files if is_convertible(f["name"])]
+    if _mkv_files:
+        await safe_edit(
+            status_msg,
+            f"🔄 Menukar {len(_mkv_files)} fail MKV → MP4 (tanpa kurang kualiti)…",
+        )
+        for _i, _f in enumerate(_mkv_files, 1):
+            if is_cancelled(user_id):
+                await safe_edit(
+                    status_msg,
+                    "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...",
+                )
+                return
+            _conv = await convert_mkv_to_mp4(_f["path"], _f["name"])
+            if _conv.converted:
+                _f["path"], _f["name"], _f["size"] = (
+                    _conv.path, _conv.name, _conv.size,
+                )
+                _f["kind"] = _classify(_conv.name)
+            print(
+                f"[Torrent] MKV->MP4 {_i}/{len(_mkv_files)}: {_f['name']} "
+                f"(converted={_conv.converted} reason={_conv.reason!r})"
+            )
 
     if not files:
         msg = (

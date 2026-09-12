@@ -42,3 +42,28 @@ TORRENT_LISTEN_PORT = int(os.getenv("TORRENT_LISTEN_PORT", "51413"))
 TORRENT_DISABLE_IPV6 = os.getenv("TORRENT_DISABLE_IPV6", "true").lower() in ("1", "true", "yes", "on")
 # Optional comma-separated override for the public fallback tracker list.
 TORRENT_TRACKERS = os.getenv("TORRENT_TRACKERS", "")
+
+# ---------------------------------------------------------------------------
+# MKV → MP4 remux (stream copy — no re-encode, no quality loss)
+# ---------------------------------------------------------------------------
+# Enabled by default. Conversion is strictly best-effort: any failure (no
+# ffmpeg, unsupported codec, low disk, timeout, cancellation) falls back to
+# uploading the original MKV, so this can never break an existing flow.
+MKV_TO_MP4 = os.getenv("MKV_TO_MP4", "true").lower() in ("1", "true", "yes", "on")
+
+# Extensions that get remuxed. MP4 (H.264 + AAC) is what Telegram streams.
+CONVERT_EXTENSIONS = {".mkv"}
+
+# Hard timeout (seconds) for a single ffmpeg remux before it is killed.
+CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT", "1800"))
+
+# How many conversions may run at once. 1 keeps the bot comfortably inside the
+# service's MemoryMax cgroup limit and avoids disk I/O thrash on a small VPS.
+CONVERT_CONCURRENCY = int(os.getenv("CONVERT_CONCURRENCY", "1"))
+
+# Where converted MP4s are written. Empty = next to the source file (default),
+# which keeps every converted file inside the pipeline's own temp directory so
+# the existing cleanup sweeps remove it automatically. Only point this at a
+# central directory if you rely on cleanup_orphaned_convert_dirs() too.
+CONVERT_TEMP_DIR = os.getenv("CONVERT_TEMP_DIR", "")
+
