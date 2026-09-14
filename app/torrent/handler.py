@@ -282,6 +282,77 @@ async def _split_video_part(
         return False
 
 
+def _resize_thumb_high_quality(raw: bytes, max_side: int = 320) -> bytes:
+    """Resize thumbnail to max_side px on longest side, using high JPEG quality."""
+    from io import BytesIO
+    try:
+        from PIL import Image
+        img = Image.open(BytesIO(raw))
+        # Convert RGBA/palette to RGB for JPEG
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        # Resize preserving aspect ratio
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+    except ImportError:
+        print("[Torrent] Pillow not installed, returning raw thumbnail")
+        return raw
+    except Exception as e:
+        print(f"[Torrent] Thumbnail resize error: {e}")
+        return raw
+
+
+async def extract_user_thumbnail(bot: Client, message: Message) -> Optional[bytes]:
+    """Download a user-supplied image and return a Telegram-ready thumbnail.
+
+    A document image is preferred (full quality, Telegram does not compress it),
+    otherwise the largest available photo size is used — same behaviour as the
+    Direct Link feature. The raw bytes are resized to ≤320 px JPEG because
+    Telegram only accepts small JPEG thumbnails.
+
+    Returns None when the message carries no usable image.
+    """
+    thumb_source = None
+    doc = message.document
+    if doc and (doc.mime_type or "").lower().startswith("image/"):
+        thumb_source = "document"
+    elif message.photo:
+        thumb_source = "photo"
+
+    if not thumb_source:
+        return None
+
+    thumb_path = None
+    try:
+        if thumb_source == "document":
+            thumb_path = await message.download()
+        else:
+            thumb_path = await bot.download_media(message.photo.file_id)
+
+        if not thumb_path or not os.path.exists(thumb_path):
+            return None
+
+        with open(thumb_path, "rb") as f:
+            raw = f.read()
+        if not raw:
+            return None
+
+        thumb_raw = _resize_thumb_high_quality(raw)
+        print(f"[Torrent] User thumbnail loaded ({thumb_source}): {len(thumb_raw)} bytes")
+        return thumb_raw
+    except Exception as e:
+        print(f"[Torrent] Failed to load user thumbnail: {e}")
+        return None
+    finally:
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except Exception:
+                pass
+
+
 async def _upload_thumb_to_telegram(
     bot: Client, thumb_raw: bytes
 ) -> Optional[InputFile]:
@@ -581,6 +652,7 @@ async def _split_and_upload_video(
     size_limit: int,
     enable_caption: bool = False,
     exclude_words: Optional[str] = None,
+    custom_thumb_raw: Optional[bytes] = None,
 ) -> None:
     """Split a video larger than *size_limit* and upload every part.
 
@@ -593,10 +665,11 @@ async def _split_and_upload_video(
 
     user_id = message.from_user.id
 
-    # Thumbnail + metadata for the source video (Part 1 reuses this thumbnail)
+    # Thumbnail + metadata for the source video (Part 1 reuses this thumbnail).
+    # A user-supplied image (single-video torrents only) replaces the snapshot.
     video_meta = await _get_video_metadata(video_path)
     total_duration = video_meta.get("duration", 0)
-    base_thumb = await _generate_video_thumb(video_path, total_duration)
+    base_thumb = custom_thumb_raw or await _generate_video_thumb(video_path, total_duration)
 
     target_part_size = int(size_limit * 0.95)
     num_parts = max(1, math.ceil(file_size / target_part_size))
@@ -1026,7 +1099,9 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
     # after the caption flow completes (see process_torrent_download below).
     status_msg = await message.reply_text(
         "📝 **Adakah anda ingin meletakkan caption pada fail video?**\n\n"
-        "Nama fail video akan dijadikan caption.",
+        "Nama fail video akan dijadikan caption.\n\n"
+        "🖼 Hantar gambar sekarang jika mahu ia dijadikan thumbnail "
+        "(hanya untuk torrent dengan 1 video).",
         reply_markup=get_caption_choice_keyboard(),
     )
     set_caption_state(
@@ -1092,7 +1167,9 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
     # Prompt user for caption choice (Step 1)
     status_msg = await message.reply_text(
         "📝 **Adakah anda ingin meletakkan caption pada fail video?**\n\n"
-        "Nama fail video akan dijadikan caption.",
+        "Nama fail video akan dijadikan caption.\n\n"
+        "🖼 Hantar gambar sekarang jika mahu ia dijadikan thumbnail "
+        "(hanya untuk torrent dengan 1 video).",
         reply_markup=get_caption_choice_keyboard(),
     )
     set_caption_state(
@@ -1119,6 +1196,7 @@ async def process_torrent_download(
     link: Optional[str] = None,
     link_type: Optional[str] = None,
     skip_non_videos: bool = False,
+    custom_thumb_raw: Optional[bytes] = None,
 ) -> None:
     from app.bot.main import (
         active_user_processes, reset_cancel,
@@ -1146,6 +1224,7 @@ async def process_torrent_download(
                 skip_non_videos=skip_non_videos,
                 enable_caption=enable_caption,
                 exclude_words=exclude_words,
+                custom_thumb_raw=custom_thumb_raw,
             )
         elif source_type == "torrent_file":
             # User uploaded a .torrent document — fetch it from Telegram first.
@@ -1163,6 +1242,7 @@ async def process_torrent_download(
                 skip_non_videos=skip_non_videos,
                 enable_caption=enable_caption,
                 exclude_words=exclude_words,
+                custom_thumb_raw=custom_thumb_raw,
             )
     except Aria2Error as e:
         print(f"[Torrent] Aria2 error: {e}")
@@ -1220,6 +1300,7 @@ async def _process_torrent(
     skip_non_videos: bool = False,
     enable_caption: bool = False,
     exclude_words: Optional[str] = None,
+    custom_thumb_raw: Optional[bytes] = None,
 ) -> None:
     """Download torrent via aria2c, then upload all media files to Telegram."""
     from app.bot.main import (
@@ -1424,6 +1505,26 @@ async def _process_torrent(
             split_names += f" +{len(split_videos) - 3} lagi"
         print(f"[Torrent] Splitting {len(split_videos)} oversized videos: {split_names}")
 
+    # ---------------------------------------------------------------- User thumbnail
+    # The user may have sent an image while the caption prompt was on screen
+    # (captured by the interceptor in app/bot/main.py). It is only applied when
+    # the torrent contains exactly ONE video — with zero or multiple videos the
+    # previous behaviour is kept unchanged.
+    video_files = [f for f in files if f["kind"] == "video"]
+    custom_thumb = custom_thumb_raw if (custom_thumb_raw and len(video_files) == 1) else None
+    if custom_thumb:
+        print(f"[Torrent] Using user thumbnail for the single video ({len(custom_thumb)} bytes)")
+    elif custom_thumb_raw:
+        print(f"[Torrent] User thumbnail ignored: {len(video_files)} video(s) in torrent")
+        try:
+            await bot.send_message(
+                user_id,
+                f"ℹ️ Gambar thumbnail diabaikan — torrent ini mempunyai "
+                f"{len(video_files)} video (thumbnail sendiri hanya untuk torrent 1 video).",
+            )
+        except Exception as e:
+            print(f"[Torrent] Failed to notify ignored thumbnail: {e}")
+
     if not valid_files and not split_videos:
         await safe_edit(
             status_msg,
@@ -1465,7 +1566,9 @@ async def _process_torrent(
         caption = None
         if finfo["kind"] == "video":
             video_meta = await _get_video_metadata(file_path)
-            thumb_raw = await _generate_video_thumb(file_path, video_meta.get("duration", 0))
+            # A user-supplied thumbnail (single-video torrents only) wins over
+            # the generated ffmpeg snapshot.
+            thumb_raw = custom_thumb or await _generate_video_thumb(file_path, video_meta.get("duration", 0))
             if enable_caption:
                 caption = generate_video_caption(file_name, exclude_words)
 
@@ -1505,6 +1608,7 @@ async def _process_torrent(
             torrent_name, uploaded, status_msg, size_limit,
             enable_caption=enable_caption,
             exclude_words=exclude_words,
+            custom_thumb_raw=custom_thumb,
         )
         gc.collect()
 

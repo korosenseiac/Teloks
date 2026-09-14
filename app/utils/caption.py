@@ -58,6 +58,24 @@ def set_caption_state(
     user_caption_states[user_id] = entry
 
 
+def set_caption_thumb(user_id: int, raw: Optional[bytes]) -> bool:
+    """Attach a user-provided thumbnail to the pending caption state.
+
+    The image is sent by the user as a separate message while the caption
+    prompt is on screen (see the torrent thumbnail interceptor in
+    ``app/bot/main.py``). It is stored on the live state entry so the
+    download callbacks can forward it to the upload pipeline.
+
+    Returns True when a pending state existed and the thumbnail was stored.
+    """
+    state = get_caption_state(user_id)
+    if not state:
+        return False
+    state["user_thumb_raw"] = raw
+    state.setdefault("data", {})["user_thumb_raw"] = raw
+    return True
+
+
 def get_caption_state(user_id: int) -> Optional[Dict[str, Any]]:
     """Get pending caption state for user if not expired."""
     state = user_caption_states.get(user_id)

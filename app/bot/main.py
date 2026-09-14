@@ -31,11 +31,13 @@ from app.terabox.handler import terabox_link_handler, handle_tb_folder_callback,
 from app.mediafire.handler import mediafire_link_handler, MEDIAFIRE_LINK_PATTERN
 from app.torrent.handler import (
     torrent_link_handler, torrent_file_handler, process_torrent_download,
+    extract_user_thumbnail,
     MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
 )
 from app.direct.handler import direct_link_handler, process_direct_download, DIRECT_LINK_PATTERN
 from app.utils.caption import (
     user_caption_states, get_caption_state, clear_caption_state, get_exclude_keyboard,
+    set_caption_thumb,
 )
 from app.utils.media import is_torrent, is_archive, classify, mime, PHOTO_EXTS, VIDEO_EXTS, ext, SKIP_PATTERN, is_video
 from app.mediafire.archive import iter_extract_media, count_media_in_archive
@@ -526,6 +528,7 @@ async def caption_callback_handler(client: Client, callback_query):
                     link=state.get("link"),
                     link_type=state.get("link_type"),
                     skip_non_videos=state.get("skip_non_videos", False),
+                    custom_thumb_raw=state.get("user_thumb_raw"),
                 )
             )
 
@@ -564,6 +567,7 @@ async def caption_callback_handler(client: Client, callback_query):
                     link=state.get("link"),
                     link_type=state.get("link_type"),
                     skip_non_videos=state.get("skip_non_videos", False),
+                    custom_thumb_raw=state.get("user_thumb_raw"),
                 )
             )
 
@@ -631,6 +635,7 @@ async def handle_caption_exclusion_message(client: Client, message: Message) -> 
                 link=state.get("link"),
                 link_type=state.get("link_type"),
                 skip_non_videos=state.get("skip_non_videos", False),
+                custom_thumb_raw=state.get("user_thumb_raw"),
             )
         )
     return True
@@ -714,6 +719,66 @@ async def bot_media_interceptor(client: Client, message: Message):
                 pending_bot_uploads[user_id].pop(i)
                 message.stop_propagation()
                 return
+
+
+def _is_pending_torrent_caption(_, __, message: Message) -> bool:
+    """True while the user has a pending torrent / .torrent caption prompt."""
+    user_id = message.from_user.id if message.from_user else None
+    if not user_id:
+        return False
+    state = get_caption_state(user_id)
+    return bool(state and state.get("source_type") in ("torrent", "torrent_file"))
+
+
+pending_torrent_caption_filter = filters.create(_is_pending_torrent_caption)
+
+
+@app.on_message(
+    (filters.photo | filters.document) & filters.private & pending_torrent_caption_filter,
+    group=0,
+)
+async def torrent_thumbnail_interceptor(client: Client, message: Message):
+    """Capture an image the user sends while the torrent caption prompt is on
+    screen and store it as the custom thumbnail for that torrent.
+
+    The thumbnail is applied only when the torrent turns out to contain exactly
+    one video (see app/torrent/handler.py::_process_torrent).
+    """
+    user_id = message.from_user.id
+
+    # Documents must be images: real .torrent uploads keep flowing to
+    # torrent_file_upload_handler below.
+    doc = message.document
+    if doc is not None and not (doc.mime_type or "").lower().startswith("image/"):
+        return
+
+    # Never hijack an image that carries a real job (link in its caption).
+    caption = message.caption or ""
+    if caption and any(
+        pattern.search(caption) for pattern in (
+            MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN, DIRECT_LINK_PATTERN,
+            TERABOX_LINK_PATTERN, MEDIAFIRE_LINK_PATTERN,
+        )
+    ):
+        return
+
+    raw = await extract_user_thumbnail(client, message)
+    if not raw:
+        await message.reply_text(
+            "❌ Gambar tidak dapat diproses.\n\n"
+            "Sila hantar sebagai gambar biasa (JPG/PNG)."
+        )
+        return
+
+    if not set_caption_thumb(user_id, raw):
+        # State expired / already consumed — nothing to attach the image to.
+        return
+
+    await message.reply_text(
+        "🖼 **Gambar disimpan sebagai thumbnail.**\n\n"
+        "Ia akan digunakan hanya jika torrent ini mengandungi 1 video sahaja."
+    )
+    message.stop_propagation()
 
 
 @app.on_message(filters.document & filters.private, group=2)
