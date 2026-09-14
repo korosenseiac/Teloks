@@ -163,6 +163,12 @@ CONVERT_CONCURRENCY=1
 # Leave empty to write converted MP4s next to their source file inside the
 # pipeline's own temp dir (recommended — cleanup is automatic).
 CONVERT_TEMP_DIR=
+
+# How many download/upload jobs ONE user may run at the same time. Each job has
+# its own "🚫 Batal" button, and a job that is still waiting at the caption
+# prompt already counts against this limit. 2 doubles per-user throughput;
+# lower it to 1 on a very small VPS (see the service MemoryMax/CPUQuota limits).
+MAX_CONCURRENT_PROCESSES=2
 EOF
     chown $BOT_USER:$BOT_USER $BOT_DIR/.env
     chmod 600 $BOT_DIR/.env

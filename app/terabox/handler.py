@@ -27,7 +27,7 @@ import aiohttp
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 
-from app.utils.message import safe_edit
+from app.utils.message import safe_edit, clear_reply_markup
 from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
@@ -568,17 +568,17 @@ async def handle_tb_folder_callback(bot: Client, callback_query: CallbackQuery) 
 async def terabox_link_handler(bot: Client, message: Message) -> None:
     """Handler called when a user sends a TeraBox share link."""
     # -- Import here to avoid circular import (app.bot.main imports this file)
-    from app.bot.main import active_user_processes, get_backup_group_peer, is_cancelled, reset_cancel
+    from app.bot.main import (
+        begin_process, get_backup_group_peer, has_free_slot, is_cancelled,
+        process_cancel_keyboard, process_limit_message, release_process,
+    )
     from app.terabox import get_terabox_client
 
     user_id = message.from_user.id
 
     # ---------------------------------------------------------------- Guards
-    if active_user_processes.get(user_id):
-        await message.reply_text(
-            "⚠️ **Ada proses yang sedang berjalan!**\n\n"
-            "Sila tunggu proses sebelumnya selesai sebelum menghantar link baru."
-        )
+    if not has_free_slot(user_id):
+        await message.reply_text(process_limit_message())
         return
 
     user_session = await get_user_session(user_id)
@@ -610,9 +610,17 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
     print(f"[TB:handler] user={user_id} raw_link={message.text.strip()!r} share_host={share_host!r} surl={surl!r} skip={skip_non_videos}")
 
     # ---------------------------------------------------------------- Start
-    active_user_processes[user_id] = asyncio.current_task()
-    reset_cancel(user_id)
-    status_msg = await message.reply_text("🔍 Parsing share link…")
+    # This handler task *is* the job: reserve a slot and bind it to this task.
+    slot = begin_process(user_id, None, "terabox")
+    if slot is None:
+        await message.reply_text(process_limit_message())
+        return
+
+    status_msg = await message.reply_text(
+        "🔍 Parsing share link…",
+        reply_markup=process_cancel_keyboard(slot.sid),
+    )
+    slot.status_msg = status_msg
 
     temp_folder: Optional[str] = None
 
@@ -621,7 +629,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         try:
             tb = await get_terabox_client()
         except RuntimeError as e:
-            active_user_processes.pop(user_id, None)
+            release_process(slot)
             await safe_edit(status_msg, f"❌ TeraBox tidak dikonfigurasi: {e}")
             return
 
@@ -761,10 +769,14 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         target_dir, collect_mode = await navigate_temp_folder(bot, user_id, message, tb, temp_folder)
         
         if collect_mode == "cancel":
-            active_user_processes.pop(user_id, None)
+            release_process(slot)
             return
             
-        status_msg = await message.reply_text("📂 Menyusun senarai fail…")
+        status_msg = await message.reply_text(
+            "📂 Menyusun senarai fail…",
+            reply_markup=process_cancel_keyboard(slot.sid),
+        )
+        slot.status_msg = status_msg
 
         all_files: List[Dict[str, Any]] = []
         # If files_only, we don't recurse. If all, we do deeply.
@@ -1033,6 +1045,7 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
                 file_size=entry["size"],
                 file_index=len(_photo_entries) + _seq_idx,
                 file_total=total_up,
+                reply_markup=process_cancel_keyboard(slot.sid),
             )
             tracker.start()
 
@@ -1282,5 +1295,6 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
             except Exception as e:
                 print(f"[TeraBox] Failed to delete temp folder {temp_folder}: {e}")
 
-        active_user_processes.pop(user_id, None)
-        reset_cancel(user_id)
+        # Release only this job's slot, then drop its 🚫 Batal button.
+        release_process(slot)
+        await clear_reply_markup(slot.status_msg)

@@ -11,7 +11,7 @@ import asyncio
 import time
 from typing import Optional
 
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup
 from pyrogram import enums
 
 from app.utils.message import safe_edit
@@ -91,12 +91,17 @@ class ProgressTracker:
         file_size: int,
         file_index: int = 1,
         file_total: int = 1,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
     ) -> None:
         self.status_msg = status_msg
         self.file_name = file_name
         self.file_size = file_size
         self.file_index = file_index
         self.file_total = file_total
+        # Kept on every edit so the job's "🚫 Batal" button stays tappable while
+        # the progress message is being rewritten. None keeps whatever keyboard
+        # the message already has.
+        self.reply_markup = reply_markup
 
         # Counters (written by workers from any coroutine — single-threaded asyncio is safe)
         self.downloaded: int = 0
@@ -246,7 +251,7 @@ class ProgressTracker:
             if should_edit:
                 try:
                     text = self._render()
-                    await safe_edit(self.status_msg, text)
+                    await safe_edit(self.status_msg, text, reply_markup=self.reply_markup)
                 except Exception:
                     pass  # FloodWait safely skipped by safe_edit
                     
@@ -266,6 +271,6 @@ class ProgressTracker:
                 pass
         if final_text:
             try:
-                await safe_edit(self.status_msg, final_text)
+                await safe_edit(self.status_msg, final_text, reply_markup=self.reply_markup)
             except Exception:
                 pass

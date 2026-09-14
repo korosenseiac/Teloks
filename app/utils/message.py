@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup
 from pyrogram.errors import FloodWait, MessageNotModified
 
 logger = logging.getLogger(__name__)
@@ -25,3 +25,17 @@ async def safe_edit(message: Message, text: str, reply_markup=None, **kwargs):
         logger.warning(f"FloodWait of {e.value}s encountered. Skipping this status update to prevent rate limiting.")
     except Exception as e:
         logger.error(f"Failed to edit message: {e}")
+
+
+async def clear_reply_markup(message: Message) -> None:
+    """Drop the inline keyboard of a message (e.g. a finished job's 🚫 button).
+
+    Best-effort: a message that was deleted, edited into something else or is
+    flood-limited simply keeps whatever keyboard it has.
+    """
+    if not message:
+        return
+    try:
+        await message.edit_reply_markup(reply_markup=InlineKeyboardMarkup([]))
+    except Exception as e:
+        logger.debug(f"Could not clear reply markup: {e}")

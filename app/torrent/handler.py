@@ -75,7 +75,7 @@ from app.utils.caption import (
     get_caption_choice_keyboard,
     set_caption_state,
 )
-from app.utils.message import safe_edit
+from app.utils.message import safe_edit, clear_reply_markup
 from app.utils.video_compressor import convert_mkv_to_mp4, is_convertible
 
 # ---------------------------------------------------------------------------
@@ -441,14 +441,16 @@ async def _upload_file_to_backup(
         fut = None
         uid = None
         if is_sent_to_bot:
-            from app.bot.main import pending_bot_uploads
+            from app.bot.main import pending_bot_uploads, current_process_slot
             loop = asyncio.get_running_loop()
             fut = loop.create_future()
             me = await user_client.get_me()
             uid = me.id
+            # (file_name, future, job sid) — see the interceptor in app/bot/main.py
+            _slot = current_process_slot()
             if uid not in pending_bot_uploads:
                 pending_bot_uploads[uid] = []
-            pending_bot_uploads[uid].append((file_name, fut))
+            pending_bot_uploads[uid].append((file_name, fut, _slot.sid if _slot else None))
 
         # Parse caption if provided
         caption_text = ""
@@ -1018,7 +1020,8 @@ def _get_torrent_name(status: Dict[str, Any]) -> str:
 async def torrent_link_handler(bot: Client, message: Message) -> None:
     """Handler for magnet: URIs and HTTP .torrent URLs sent as text."""
     from app.bot.main import (
-        active_user_processes, handled_torrent_messages,
+        handled_torrent_messages, has_free_slot, process_limit_message,
+        reserve_process,
     )
 
     user_id = message.from_user.id
@@ -1032,11 +1035,8 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
 
     # ---------------------------------------------------------------- Guards
     try:
-        if active_user_processes.get(user_id):
-            await message.reply_text(
-                "⚠️ **Ada proses yang sedang berjalan!**\n\n"
-                "Sila tunggu proses sebelumnya selesai sebelum menghantar link baru."
-            )
+        if not has_free_slot(user_id):
+            await message.reply_text(process_limit_message())
             return
 
         user_session = await get_user_session(user_id)
@@ -1097,13 +1097,21 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
     # ---------------------------------------------------------------- Start
     # Prompt the user for the caption choice first. Downloading only begins
     # after the caption flow completes (see process_torrent_download below).
+    # The slot is reserved now so the prompt itself occupies a concurrency slot.
+    slot = reserve_process(user_id, "torrent", prompt_msg=message)
+    if slot is None:
+        await message.reply_text(process_limit_message())
+        return
+
     status_msg = await message.reply_text(
         "📝 **Adakah anda ingin meletakkan caption pada fail video?**\n\n"
         "Nama fail video akan dijadikan caption.\n\n"
         "🖼 Hantar gambar sekarang jika mahu ia dijadikan thumbnail "
         "(hanya untuk torrent dengan 1 video).",
-        reply_markup=get_caption_choice_keyboard(),
+        reply_markup=get_caption_choice_keyboard(slot.sid),
     )
+    slot.status_msg = status_msg
+
     set_caption_state(
         user_id,
         "torrent",
@@ -1112,6 +1120,7 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
         link=link,
         link_type=link_type,
         skip_non_videos=skip_non_videos,
+        sid=slot.sid,
     )
 
 
@@ -1121,18 +1130,17 @@ async def torrent_link_handler(bot: Client, message: Message) -> None:
 
 async def torrent_file_handler(bot: Client, message: Message) -> None:
     """Handler for .torrent files uploaded to the bot."""
-    from app.bot.main import active_user_processes
+    from app.bot.main import (
+        has_free_slot, process_limit_message, reserve_process,
+    )
 
     user_id = message.from_user.id
     print(f"[Torrent] File handler invoked: user={user_id} "
           f"file={getattr(message.document, 'file_name', '?')}")
 
     # ---------------------------------------------------------------- Guards
-    if active_user_processes.get(user_id):
-        await message.reply_text(
-            "⚠️ **Ada proses yang sedang berjalan!**\n\n"
-            "Sila tunggu proses sebelumnya selesai sebelum menghantar link baru."
-        )
+    if not has_free_slot(user_id):
+        await message.reply_text(process_limit_message())
         return
 
     user_session = await get_user_session(user_id)
@@ -1164,20 +1172,28 @@ async def torrent_file_handler(bot: Client, message: Message) -> None:
     caption = message.caption or message.text or ""
     skip_non_videos = bool(SKIP_PATTERN.search(caption))
 
+    # Reserve the job slot now — the caption prompt is already part of the job.
+    slot = reserve_process(user_id, "torrent_file", prompt_msg=message)
+    if slot is None:
+        await message.reply_text(process_limit_message())
+        return
+
     # Prompt user for caption choice (Step 1)
     status_msg = await message.reply_text(
         "📝 **Adakah anda ingin meletakkan caption pada fail video?**\n\n"
         "Nama fail video akan dijadikan caption.\n\n"
         "🖼 Hantar gambar sekarang jika mahu ia dijadikan thumbnail "
         "(hanya untuk torrent dengan 1 video).",
-        reply_markup=get_caption_choice_keyboard(),
+        reply_markup=get_caption_choice_keyboard(slot.sid),
     )
+    slot.status_msg = status_msg
     set_caption_state(
         user_id,
         "torrent_file",
         message,
         status_msg,
         skip_non_videos=skip_non_videos,
+        sid=slot.sid,
     )
 
 
@@ -1197,15 +1213,39 @@ async def process_torrent_download(
     link_type: Optional[str] = None,
     skip_non_videos: bool = False,
     custom_thumb_raw: Optional[bytes] = None,
+    slot_sid: Optional[str] = None,
 ) -> None:
     from app.bot.main import (
-        active_user_processes, reset_cancel,
+        begin_process, get_process_slot, has_free_slot, process_limit_message,
+        process_cancel_keyboard, release_process,
     )
     from app.torrent import get_aria2_client
 
-    active_user_processes[user_id] = asyncio.current_task()
-    reset_cancel(user_id)
+    # Adopt the slot reserved when the link was accepted (or reserve one now for
+    # legacy callers). Binding also makes this the "current" slot, so
+    # is_cancelled() only ever reports the state of this job.
+    slot = begin_process(user_id, slot_sid, "torrent", status_msg)
+    if slot is None:
+        if slot_sid and get_process_slot(slot_sid) is None:
+            # Cancelled (🚫 button, /cancel) while the caption prompt was open.
+            print(f"[Torrent] job {slot_sid} was cancelled before it started")
+            await safe_edit(status_msg, "🚫 **Proses dibatalkan.**")
+        elif not has_free_slot(user_id):
+            await safe_edit(status_msg, process_limit_message())
+        return
+
+    # aria2 registry for THIS job only. The old per-user cleanup wiped the
+    # sibling torrent of the same user whenever one of them finished.
+    job_download = {"gids": set(), "info_hash": None}
+
     temp_dir = tempfile.mkdtemp(prefix="torrent_")
+
+    if status_msg is not None:
+        slot.status_msg = status_msg
+        await safe_edit(
+            status_msg, "🧲 Memulakan muat turun torrent…",
+            reply_markup=process_cancel_keyboard(slot.sid),
+        )
 
     try:
         user_client = await manager.get_client(user_id)
@@ -1225,6 +1265,8 @@ async def process_torrent_download(
                 enable_caption=enable_caption,
                 exclude_words=exclude_words,
                 custom_thumb_raw=custom_thumb_raw,
+                job_download=job_download,
+                status_markup=process_cancel_keyboard(slot.sid),
             )
         elif source_type == "torrent_file":
             # User uploaded a .torrent document — fetch it from Telegram first.
@@ -1243,6 +1285,8 @@ async def process_torrent_download(
                 enable_caption=enable_caption,
                 exclude_words=exclude_words,
                 custom_thumb_raw=custom_thumb_raw,
+                job_download=job_download,
+                status_markup=process_cancel_keyboard(slot.sid),
             )
     except Aria2Error as e:
         print(f"[Torrent] Aria2 error: {e}")
@@ -1268,19 +1312,24 @@ async def process_torrent_download(
         except Exception:
             pass
     finally:
+        # Stop THIS job's aria2 downloads first (cancelled / errored / finished)
+        # so a re-add of the same torrent never hits "already registered" and
+        # nothing keeps writing, then reclaim the disk. A second torrent of the
+        # same user is untouched.
+        try:
+            aria2 = await get_aria2_client()
+            await aria2.cleanup_download(
+                job_download["gids"], job_download["info_hash"]
+            )
+        except Exception as e:
+            print(f"[Torrent] aria2 cleanup failed for user {user_id}: {e}")
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
             print(f"[Torrent] Failed to clean temp dir {temp_dir}: {e}")
-        # Purge this user's aria2 downloads (cancelled / errored / finished) so
-        # a re-add of the same torrent never hits "already registered".
-        try:
-            aria2 = await get_aria2_client()
-            await aria2.cleanup_user(user_id)
-        except Exception as e:
-            print(f"[Torrent] aria2 cleanup failed for user {user_id}: {e}")
-        active_user_processes.pop(user_id, None)
-        reset_cancel(user_id)
+        # Release only this job's slot, then drop its 🚫 Batal button.
+        release_process(slot)
+        await clear_reply_markup(slot.status_msg)
         gc.collect()
 
 
@@ -1301,12 +1350,25 @@ async def _process_torrent(
     enable_caption: bool = False,
     exclude_words: Optional[str] = None,
     custom_thumb_raw: Optional[bytes] = None,
+    job_download: Optional[Dict[str, Any]] = None,
+    status_markup=None,
 ) -> None:
-    """Download torrent via aria2c, then upload all media files to Telegram."""
+    """Download torrent via aria2c, then upload all media files to Telegram.
+
+    ``job_download`` is THIS job's aria2 registry (``{"gids": set(),
+    "info_hash": None}``). It is filled in as downloads are submitted so the
+    caller's ``finally`` can purge exactly this job's downloads and leave a
+    sibling torrent of the same user running.
+
+    ``status_markup`` is the job's keyboard (its 🚫 Batal button).
+    """
     from app.bot.main import (
         get_backup_group_peer, is_cancelled,
     )
     from app.torrent import get_aria2_client
+
+    if job_download is None:
+        job_download = {"gids": set(), "info_hash": None}
 
     download_dir = os.path.join(temp_dir, "files")
     os.makedirs(download_dir, exist_ok=True)
@@ -1314,15 +1376,21 @@ async def _process_torrent(
     # 1. Start aria2c client
     aria2 = await get_aria2_client()
 
-    # Register the user's aria2 downloads so the handler's finally block can
-    # fully purge them even if a cancellation/error interrupts us before
+    def _register_job(gid: Optional[str] = None, info_hash: Optional[str] = None) -> None:
+        """Track this job's GIDs/infoHash for its own cleanup."""
+        if gid:
+            job_download["gids"].add(gid)
+        if info_hash:
+            job_download["info_hash"] = info_hash.strip().lower()
+
+    # Register the job's aria2 downloads so the caller's finally block can fully
+    # purge them even if a cancellation/error interrupts us before
     # wait_for_download gets a chance to clean up.
-    aria2.register_download(user_id)
     if link_type == "magnet":
         # Register the infoHash from the magnet URI right away, so cleanup works
         # even if we are cancelled before aria2 exposes the infoHash itself.
         from app.torrent.client import extract_info_hash_from_magnet
-        aria2.register_download(user_id, info_hash=extract_info_hash_from_magnet(link_or_path))
+        _register_job(info_hash=extract_info_hash_from_magnet(link_or_path))
 
     # 2. Submit download
     if link_type == "magnet":
@@ -1333,7 +1401,7 @@ async def _process_torrent(
         gid = await aria2.add_torrent(link_or_path, download_dir)
     else:
         raise ValueError(f"Unknown link type: {link_type}")
-    aria2.register_download(user_id, gid=gid)
+    _register_job(gid=gid)
 
     print(f"[Torrent] Download started: gid={gid} type={link_type}")
 
@@ -1353,11 +1421,11 @@ async def _process_torrent(
         followed = init_status.get("followedBy")
         if followed:
             data_gid = followed[0]
-            aria2.register_download(user_id, gid=data_gid)
+            _register_job(gid=data_gid)
             data_status = await aria2.get_status(data_gid)
             ih = data_status.get("infoHash") or (data_status.get("bittorrent") or {}).get("infoHash")
             if ih:
-                aria2.register_download(user_id, info_hash=ih)
+                _register_job(info_hash=ih)
             torrent_name = _get_torrent_name(data_status) or torrent_name
     except Exception:
         torrent_name = "Unknown"
@@ -1370,6 +1438,7 @@ async def _process_torrent(
         file_size=1,  # Will be updated once we know total size
         file_index=1,
         file_total=1,
+        reply_markup=status_markup,
     )
 
     total_known = False

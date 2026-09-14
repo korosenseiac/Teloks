@@ -418,9 +418,11 @@ class Aria2Client:
     ) -> None:
         """Record a GID / infoHash for a user so it can be cleaned up later.
 
-        The bot's handlers call this as they add downloads. ``cleanup_user``
-        (called from the handler ``finally`` blocks) then guarantees aria2 is
-        left clean no matter where a cancellation interrupted the flow.
+        .. note::
+            Legacy per-user registry, kept for compatibility. The bot handlers no
+            longer use it: with two concurrent jobs per user they track their own
+            GIDs/infoHash and call :meth:`cleanup_download`, which never touches a
+            sibling job's download.
         """
         entry = self._user_downloads.setdefault(user_id, {"gids": set(), "info_hash": None})
         if gid:
@@ -429,7 +431,12 @@ class Aria2Client:
             entry["info_hash"] = info_hash.strip().lower()
 
     async def cleanup_user(self, user_id: int) -> None:
-        """Force-remove every aria2 download registered for ``user_id``."""
+        """Force-remove every aria2 download registered for ``user_id``.
+
+        .. note::
+            Legacy counterpart of :meth:`register_download`, kept for
+            compatibility; the handlers now clean up per job instead.
+        """
         entry = self._user_downloads.pop(user_id, None)
         if not entry:
             return

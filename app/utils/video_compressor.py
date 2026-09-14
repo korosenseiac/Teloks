@@ -503,13 +503,19 @@ async def convert_mkv_to_mp4(
 # ---------------------------------------------------------------------------
 
 def cleanup_orphaned_convert_dirs() -> None:
-    """Remove leftover conversion scratch files from a previous crash.
+    """Remove leftover scratch files/dirs from a previous crash.
 
     Called once at bot startup (synchronous, before the event loop is busy).
-    With the default config the MP4 is written next to its source, so the
-    pipeline's own temp directories own that cleanup; this sweep covers an
-    explicitly configured ``CONVERT_TEMP_DIR`` plus stale Direct-Link temp
-    downloads that a hard crash (SIGKILL) can leave behind.
+    A 🚫 cancel removes its own temp files (see the handler ``finally`` blocks),
+    but a hard kill (SIGKILL / OOM) cannot: this sweep reclaims those leftovers.
+
+    With the default config converted MP4s are written next to their source, so
+    the pipeline's own temp directory owns that cleanup; this sweep covers an
+    explicitly configured ``CONVERT_TEMP_DIR`` plus the per-job temp paths used
+    by the download pipelines.
+
+    A generous age gate keeps this safe even if a second bot process happens to
+    be running.
     """
     import time
 
@@ -527,16 +533,39 @@ def cleanup_orphaned_convert_dirs() -> None:
     # Nothing can be running at startup, so a generous age gate is enough to
     # stay safe while still reclaiming multi-GB leftovers from old crashes.
     cutoff = time.time() - 6 * 3600
-    for f in glob.glob(os.path.join(tempfile.gettempdir(), "direct_link_*")):
+    tmp = tempfile.gettempdir()
+
+    def _stale(path: str) -> bool:
         try:
-            if os.path.isfile(f) and os.path.getmtime(f) < cutoff:
+            return os.path.getmtime(path) < cutoff
+        except OSError:
+            return False
+
+    # Streaming downloads that were interrupted mid-write.
+    for f in glob.glob(os.path.join(tmp, "direct_link_*")):
+        if os.path.isfile(f) and _stale(f):
+            try:
                 os.remove(f)
                 removed += 1
-        except OSError:
-            pass
+            except OSError:
+                pass
+
+    # Per-job temp directories (torrent_* is handled by
+    # cleanup_orphaned_torrent_dirs() at startup).
+    for pattern in (
+        "tg_archive_*", "direct_archive_*", "mf_archive_*",
+        "direct_split_*", "torrent_split_*", "thumb_*",
+    ):
+        for d in glob.glob(os.path.join(tmp, pattern)):
+            if os.path.isdir(d) and _stale(d):
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                    removed += 1
+                except OSError:
+                    pass
 
     if removed:
-        _log(f"[Convert] Cleaned up {removed} orphaned temp file(s)")
+        _log(f"[Convert] Cleaned up {removed} orphaned temp item(s)")
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ import re
 import random
 import math
 from io import BytesIO
+from typing import Any, Dict, Optional
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
@@ -22,11 +23,12 @@ from pyrogram.raw.types import (
 from app.config import API_ID, API_HASH, BOT_TOKEN, BACKUP_GROUP_ID
 from app.database.db import add_user, save_user_session, log_forward, get_user_session, save_backup_group_cache, get_backup_group_cache, get_user_profile
 from app.bot.session_manager import manager
+from app.bot import process_registry
 from app.utils.streamer import MediaStreamer, upload_stream
 from app.bot.auth import handle_login_command, handle_auth_message, handle_login_callback, cancel_login, handle_main_menu_callback, handle_profile_callback, handle_profile_age_message, start_profile_setup
 from app.bot.states import user_profile_states, ProfileStep
 from app.bot.states import user_profile_states, ProfileStep, CaptionStep
-from app.utils.message import safe_edit
+from app.utils.message import safe_edit, clear_reply_markup
 from app.terabox.handler import terabox_link_handler, handle_tb_folder_callback, TERABOX_LINK_PATTERN
 from app.mediafire.handler import mediafire_link_handler, MEDIAFIRE_LINK_PATTERN
 from app.torrent.handler import (
@@ -36,8 +38,8 @@ from app.torrent.handler import (
 )
 from app.direct.handler import direct_link_handler, process_direct_download, DIRECT_LINK_PATTERN
 from app.utils.caption import (
-    user_caption_states, get_caption_state, clear_caption_state, get_exclude_keyboard,
-    set_caption_thumb,
+    get_caption_state, clear_caption_state, list_caption_states, has_caption_state,
+    get_exclude_keyboard, parse_caption_callback, set_caption_thumb,
 )
 from app.utils.media import is_torrent, is_archive, classify, mime, PHOTO_EXTS, VIDEO_EXTS, ext, SKIP_PATTERN, is_video
 from app.mediafire.archive import iter_extract_media, count_media_in_archive
@@ -48,38 +50,171 @@ import shutil
 import os
 import gc
 
-# Track active processes per user (user_id: True if processing)
-active_user_processes = {}
+# ---------------------------------------------------------------------------
+# Concurrency (app/bot/process_registry.py)
+# ---------------------------------------------------------------------------
+# A user may run up to MAX_CONCURRENT_PROCESSES download/upload jobs at the same
+# time. Every job owns a slot with its own "🚫 Batal" button, and a slot is
+# reserved as soon as a link is accepted (a job waiting at the caption prompt
+# already counts), so spamming links can never overshoot the limit.
+#
+# Re-exported here so the download handlers can keep importing from this module
+# (e.g. "from app.bot.main import is_cancelled"). active_user_processes is the
+# live user_id -> [ProcessSlot] gate, handy when debugging.
+active_user_processes = process_registry.active_user_processes
+has_free_slot = process_registry.has_free_slot
+active_process_count = process_registry.active_count
+reserve_process = process_registry.reserve_process
+adopt_process = process_registry.adopt_process
+release_process = process_registry.release_process
+cancel_process = process_registry.cancel_slot
+request_cancel = process_registry.request_cancel
+is_cancelled = process_registry.is_cancelled
+get_process_slot = process_registry.get_slot
+current_process_slot = process_registry.current_slot
+process_cancel_keyboard = process_registry.cancel_keyboard
+MAX_CONCURRENT_PROCESSES = process_registry.MAX_CONCURRENT_PROCESSES
 
-# Cancellation events per user (user_id: asyncio.Event)
-cancel_events = {}
-
-# Track pending bot uploads for Option 2 (user_id -> list of (file_name, asyncio.Future))
+# Track pending bot uploads for Option 2 (user_id -> list of (file_name, asyncio.Future, sid))
 pending_bot_uploads = {}
 
 # Track messages already routed to the torrent handler ((chat_id, msg_id)).
 # Used so the magnet fallback handler doesn't process the same message twice.
 handled_torrent_messages: set = set()
 
-def is_cancelled(user_id: int) -> bool:
-    """Check if the user's process has been cancelled."""
-    event = cancel_events.get(user_id)
-    return event.is_set() if event else False
+def process_limit_message() -> str:
+    """Message shown when a user already runs the maximum number of jobs."""
+    return (
+        f"⚠️ **Had proses dicapai! ({MAX_CONCURRENT_PROCESSES}/{MAX_CONCURRENT_PROCESSES} sedang berjalan)**\n\n"
+        "Sila tunggu salah satu proses selesai sebelum menghantar link baru.\n"
+        "Anda boleh batalkan sesuatu proses dengan butang 🚫 Batal pada mesej statusnya."
+    )
 
-def reset_cancel(user_id: int):
-    """Reset/clear the cancellation event for a user."""
-    if user_id in cancel_events:
-        cancel_events[user_id].clear()
 
-def request_cancel(user_id: int):
-    """Request cancellation for a user's running process."""
-    if user_id not in cancel_events:
-        cancel_events[user_id] = asyncio.Event()
-    cancel_events[user_id].set()
-    
-    task = active_user_processes.get(user_id)
-    if isinstance(task, asyncio.Task):
-        task.cancel()
+def begin_process(user_id: int, slot_sid: Optional[str], kind: str, status_msg=None):
+    """Take ownership of the job slot a pipeline is about to run in.
+
+    Direct and Torrent jobs reserve their slot when the link is accepted (while
+    the caption prompt is on screen), so this simply adopts the reservation.
+    Terabox/MediaFire and any legacy caller pass ``slot_sid=None`` and get a
+    fresh slot.
+
+    Returns the slot, or ``None`` when the user is already at the limit or the
+    job was cancelled before it could start — callers must then abort.
+    """
+    if slot_sid:
+        slot = get_process_slot(slot_sid)
+        if slot is None or slot.cancelled:
+            # Cancelled (or recycled) between the prompt and the start.
+            return None
+        adopt_process(slot.sid)
+        return slot
+
+    slot = reserve_process(user_id, kind, status_msg=status_msg)
+    if slot is None:
+        return None
+    adopt_process(slot.sid)
+    return slot
+
+
+def _release_reserved_slot(sid: Optional[str]) -> None:
+    """Free the slot of a job that will never start (caption prompt dropped)."""
+    slot = get_process_slot(sid)
+    if slot is not None and not slot.started:
+        release_process(slot)
+
+
+def _start_job_from_caption_state(
+    client: Client,
+    user_id: int,
+    state: Dict,
+    enable_caption: bool,
+    exclude_words: Optional[str] = None,
+) -> None:
+    """Launch the download task described by a finished caption prompt.
+
+    The caption state carries the job's slot id, which is handed to the pipeline
+    so it adopts the reserved slot instead of reserving a second one.
+    """
+    source_type = state.get("source_type")
+    orig_msg = state.get("message")
+    status_msg = state.get("status_msg") or orig_msg
+    slot_sid = state.get("sid")
+
+    if source_type == "direct":
+        asyncio.create_task(
+            process_direct_download(
+                client, user_id, orig_msg, status_msg,
+                enable_caption=enable_caption,
+                exclude_words=exclude_words,
+                url=state.get("url"),
+                skip_non_videos=state.get("skip_non_videos", False),
+                slot_sid=slot_sid,
+            )
+        )
+    elif source_type in ("torrent", "torrent_file"):
+        asyncio.create_task(
+            process_torrent_download(
+                client, user_id, orig_msg, status_msg,
+                source_type=source_type,
+                enable_caption=enable_caption,
+                exclude_words=exclude_words,
+                link=state.get("link"),
+                link_type=state.get("link_type"),
+                skip_non_videos=state.get("skip_non_videos", False),
+                custom_thumb_raw=state.get("user_thumb_raw"),
+                slot_sid=slot_sid,
+            )
+        )
+
+
+def _resolve_caption_state(user_id: int, message: Message):
+    """Find the caption state a user's text/image message belongs to.
+
+    Prefers the prompt the user actually replied to; falls back to the sole
+    pending prompt, and returns None when several are pending and the reply
+    target is unknown (never guess — that would start the wrong job).
+    """
+    states = list_caption_states(user_id)
+    if not states:
+        return None
+
+    reply = getattr(message, "reply_to_message", None)
+    if reply is not None:
+        reply_id = getattr(reply, "id", None)
+        for state in states:
+            for key in ("status_msg", "message"):
+                prompt = state.get(key)
+                if prompt is not None and getattr(prompt, "id", None) == reply_id:
+                    return state
+
+    if len(states) == 1:
+        return states[0]
+    return None
+
+
+def _resolve_torrent_caption_state(user_id: int, message: Message):
+    """The pending torrent caption a user image should become the thumbnail for.
+
+    With two torrent prompts open the image is attached to the newest one unless
+    the user replied to a specific prompt.
+    """
+    states = [
+        state for state in list_caption_states(user_id)
+        if state.get("source_type") in ("torrent", "torrent_file")
+    ]
+    if not states:
+        return None
+
+    reply = getattr(message, "reply_to_message", None)
+    reply_id = getattr(reply, "id", None) if reply is not None else None
+    if reply_id is not None:
+        for state in states:
+            prompt = state.get("status_msg") or state.get("message")
+            if getattr(prompt, "id", None) == reply_id:
+                return state
+
+    return states[-1]
 
 # File size limit (2GB in bytes)
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
@@ -420,29 +555,71 @@ async def login_handler(client: Client, message: Message):
 async def cancel_handler(client: Client, message: Message):
     user_id = message.from_user.id
 
-    # Check if user has an active caption state
-    if user_id in user_caption_states:
-        state = clear_caption_state(user_id)
-        if state and state.get("status_msg"):
+    # Cancel jobs that are still waiting at the caption prompt and hand their
+    # reserved slots back.
+    pending = list_caption_states(user_id)
+    for state in pending:
+        sid = state.get("sid")
+        clear_caption_state(user_id, sid)
+        slot = get_process_slot(sid)
+        if slot is not None and not slot.started:
+            release_process(slot)
+        if state.get("status_msg"):
             try:
                 await state["status_msg"].edit("🚫 **Proses dibatalkan.**")
             except Exception:
                 pass
-        await message.reply_text("🚫 **Penyediaan caption dibatalkan.**")
-        return
 
-    # Check if user has an active process (terabox/mediafire/forwarding)
-    if active_user_processes.get(user_id):
-        request_cancel(user_id)
+    # Cancel the jobs that are already running (all of them, as before).
+    running = 0
+    if active_process_count(user_id):
+        running = request_cancel(user_id)
+
+    if pending or running:
+        lines = []
+        if running:
+            lines.append(f"• {running} proses berjalan dibatalkan")
+        if pending:
+            lines.append(f"• {len(pending)} proses menunggu caption dibatalkan")
         await message.reply_text(
             "🚫 **Membatalkan proses...**\n\n"
-            "Proses telah dibatalkan dengan serta-merta.\n"
-            "💾 Folder sementara telah dibersihkan."
+            + "\n".join(lines)
+            + "\n\n💾 Folder sementara telah dibersihkan.\n"
+            "💡 Guna butang 🚫 Batal pada mesej status untuk batalkan satu proses sahaja."
         )
         return
 
     # Otherwise, try to cancel login flow
     await cancel_login(client, message)
+
+
+@app.on_callback_query(filters.regex(r"^job_cancel_"))
+async def job_cancel_callback_handler(client: Client, callback_query):
+    """Cancel a single job from the "🚫 Batal" button on its status message."""
+    sid = callback_query.data[len(process_registry.CANCEL_CALLBACK_PREFIX):]
+    slot = get_process_slot(sid)
+    if slot is None:
+        await callback_query.answer(
+            "⏹ Proses ini sudah tamat atau dibatalkan.", show_alert=True
+        )
+        return
+    if slot.user_id != callback_query.from_user.id:
+        await callback_query.answer("❌ Ini bukan proses anda.", show_alert=True)
+        return
+
+    if slot.started:
+        cancelled = cancel_process(slot)
+    else:
+        # Still waiting at the caption prompt: drop the prompt and the slot.
+        clear_caption_state(slot.user_id, slot.sid)
+        release_process(slot)
+        cancelled = True
+
+    try:
+        await callback_query.message.edit_text("🚫 **Proses dibatalkan.**")
+    except Exception:
+        pass
+    await callback_query.answer("Dibatalkan" if cancelled else "Sudah dibatalkan")
 
 @app.on_callback_query(filters.regex(r"^login_"))
 async def login_callback_handler(client: Client, callback_query):
@@ -467,12 +644,17 @@ async def tb_folder_callback_handler(client: Client, callback_query):
 
 @app.on_callback_query(filters.regex(r"^cap_"))
 async def caption_callback_handler(client: Client, callback_query):
-    """Handle caption choice and exclusion callbacks for Direct and Torrent."""
-    user_id = callback_query.from_user.id
-    data = callback_query.data
+    """Handle caption choice and exclusion callbacks for Direct and Torrent.
 
-    if data == "cap_choose_yes":
-        state = get_caption_state(user_id)
+    The callback data carries the job's slot id (``cap_choose_yes:<sid>``), so an
+    answer is always applied to the prompt it came from — even while another job
+    of the same user sits on its own prompt.
+    """
+    user_id = callback_query.from_user.id
+    action, sid = parse_caption_callback(callback_query.data)
+
+    if action == "cap_choose_yes":
+        state = get_caption_state(user_id, sid)
         if not state:
             await callback_query.answer("⚠️ Sesi tamat. Sila hantar link semula.", show_alert=True)
             return
@@ -487,92 +669,43 @@ async def caption_callback_handler(client: Client, callback_query):
         try:
             await callback_query.message.edit_text(
                 prompt_text,
-                reply_markup=get_exclude_keyboard()
+                reply_markup=get_exclude_keyboard(state["sid"])
             )
         except Exception:
             pass
         await callback_query.answer()
 
-    elif data == "cap_choose_no":
-        state = clear_caption_state(user_id)
+    elif action in ("cap_choose_no", "cap_exclude_skip"):
+        state = clear_caption_state(user_id, sid)
         if not state:
             await callback_query.answer("⚠️ Sesi tamat. Sila hantar link semula.", show_alert=True)
             return
         await callback_query.answer()
+
+        enable_caption = action == "cap_exclude_skip"
+        job_sid = state.get("sid")
         try:
-            await callback_query.message.edit_text("🔄 **Sedang diproses...**")
+            if enable_caption:
+                await callback_query.message.edit_text(
+                    "🔄 **Sedang diproses...**\n(Caption diaktifkan)",
+                    reply_markup=process_cancel_keyboard(job_sid),
+                )
+            else:
+                await callback_query.message.edit_text(
+                    "🔄 **Sedang diproses...**",
+                    reply_markup=process_cancel_keyboard(job_sid),
+                )
         except Exception:
             pass
 
-        source_type = state.get("source_type")
-        orig_msg = state.get("message")
-        status_msg = state.get("status_msg") or callback_query.message
+        _start_job_from_caption_state(
+            client, user_id, state, enable_caption=enable_caption
+        )
 
-        if source_type == "direct":
-            asyncio.create_task(
-                process_direct_download(
-                    client, user_id, orig_msg, status_msg,
-                    enable_caption=False,
-                    exclude_words=None,
-                    url=state.get("url"),
-                    skip_non_videos=state.get("skip_non_videos", False),
-                )
-            )
-        elif source_type in ("torrent", "torrent_file"):
-            asyncio.create_task(
-                process_torrent_download(
-                    client, user_id, orig_msg, status_msg,
-                    source_type=source_type,
-                    enable_caption=False,
-                    exclude_words=None,
-                    link=state.get("link"),
-                    link_type=state.get("link_type"),
-                    skip_non_videos=state.get("skip_non_videos", False),
-                    custom_thumb_raw=state.get("user_thumb_raw"),
-                )
-            )
-
-    elif data == "cap_exclude_skip":
-        state = clear_caption_state(user_id)
-        if not state:
-            await callback_query.answer("⚠️ Sesi tamat. Sila hantar link semula.", show_alert=True)
-            return
-        await callback_query.answer()
-        try:
-            await callback_query.message.edit_text("🔄 **Sedang diproses...**\n(Caption diaktifkan)")
-        except Exception:
-            pass
-
-        source_type = state.get("source_type")
-        orig_msg = state.get("message")
-        status_msg = state.get("status_msg") or callback_query.message
-
-        if source_type == "direct":
-            asyncio.create_task(
-                process_direct_download(
-                    client, user_id, orig_msg, status_msg,
-                    enable_caption=True,
-                    exclude_words=None,
-                    url=state.get("url"),
-                    skip_non_videos=state.get("skip_non_videos", False),
-                )
-            )
-        elif source_type in ("torrent", "torrent_file"):
-            asyncio.create_task(
-                process_torrent_download(
-                    client, user_id, orig_msg, status_msg,
-                    source_type=source_type,
-                    enable_caption=True,
-                    exclude_words=None,
-                    link=state.get("link"),
-                    link_type=state.get("link_type"),
-                    skip_non_videos=state.get("skip_non_videos", False),
-                    custom_thumb_raw=state.get("user_thumb_raw"),
-                )
-            )
-
-    elif data == "cap_cancel":
-        clear_caption_state(user_id)
+    elif action == "cap_cancel":
+        state = clear_caption_state(user_id, sid)
+        # The job never started: hand its reserved slot back.
+        _release_reserved_slot(state.get("sid") if state else sid)
         try:
             await callback_query.message.edit_text("🚫 **Proses dibatalkan.**")
         except Exception:
@@ -587,16 +720,29 @@ async def handle_caption_exclusion_message(client: Client, message: Message) -> 
         return False
     if message.text and message.text.startswith("/"):
         return False
-    state = get_caption_state(user_id)
+
+    waiting = [
+        state for state in list_caption_states(user_id)
+        if state.get("step") == CaptionStep.ASK_EXCLUDE
+    ]
+    state = _resolve_caption_state(user_id, message)
     if not state or state.get("step") != CaptionStep.ASK_EXCLUDE:
+        # Two prompts are waiting for exclude-words and the user did not reply to
+        # either: ask which one instead of feeding the text to another handler.
+        if len(waiting) > 1:
+            await message.reply_text(
+                "⚠️ **Anda ada dua proses menunggu caption.**\n\n"
+                "Sila *reply* pada mesej proses yang anda maksudkan, kemudian "
+                "hantar perkataan yang ingin dibuang."
+            )
+            return True
         return False
 
     exclude_words = message.text.strip()
-    clear_caption_state(user_id)
+    job_sid = state.get("sid")
+    clear_caption_state(user_id, job_sid)
 
     status_msg = state.get("status_msg")
-    orig_msg = state.get("message")
-    source_type = state.get("source_type")
 
     try:
         await message.reply_text(
@@ -609,35 +755,16 @@ async def handle_caption_exclusion_message(client: Client, message: Message) -> 
 
     if status_msg:
         try:
-            await status_msg.edit(f"🔄 **Sedang diproses...**\n(Pengecualian: `{exclude_words}`)")
+            await status_msg.edit(
+                f"🔄 **Sedang diproses...**\n(Pengecualian: `{exclude_words}`)",
+                reply_markup=process_cancel_keyboard(job_sid),
+            )
         except Exception:
             pass
 
-    target_status_msg = status_msg or message
-
-    if source_type == "direct":
-        asyncio.create_task(
-            process_direct_download(
-                client, user_id, orig_msg, target_status_msg,
-                enable_caption=True,
-                exclude_words=exclude_words,
-                url=state.get("url"),
-                skip_non_videos=state.get("skip_non_videos", False),
-            )
-        )
-    elif source_type in ("torrent", "torrent_file"):
-        asyncio.create_task(
-            process_torrent_download(
-                client, user_id, orig_msg, target_status_msg,
-                source_type=source_type,
-                enable_caption=True,
-                exclude_words=exclude_words,
-                link=state.get("link"),
-                link_type=state.get("link_type"),
-                skip_non_videos=state.get("skip_non_videos", False),
-                custom_thumb_raw=state.get("user_thumb_raw"),
-            )
-        )
+    _start_job_from_caption_state(
+        client, user_id, state, enable_caption=True, exclude_words=exclude_words
+    )
     return True
 
 
@@ -701,24 +828,49 @@ pending_upload_filter = filters.create(_is_pending_upload)
 
 @app.on_message(filters.media & filters.private & pending_upload_filter, group=0)
 async def bot_media_interceptor(client: Client, message: Message):
-    """Intercept media messages sent by the user to the bot during Option 2 uploads."""
+    """Intercept media messages sent by the user to the bot during Option 2 uploads.
+
+    A user can have two jobs waiting for a file at once, so an exact file-name
+    match always wins; the "single waiter" fallback is only used when every
+    waiter belongs to the same job.
+    """
     user_id = message.from_user.id
-    if user_id in pending_bot_uploads and pending_bot_uploads[user_id]:
-        media_obj = (message.document or message.video or message.audio or 
-                     message.photo or message.animation or message.voice)
-        if not media_obj:
+    waiters = pending_bot_uploads.get(user_id) or []
+    if not waiters:
+        return
+    media_obj = (message.document or message.video or message.audio or 
+                 message.photo or message.animation or message.voice)
+    if not media_obj:
+        return
+    file_name = getattr(media_obj, "file_name", None)
+
+    def _resolve(index: int) -> None:
+        fname, fut, _sid = waiters[index]
+        if not fut.done():
+            fut.set_result(message)
+        pending_bot_uploads[user_id].pop(index)
+        if not pending_bot_uploads.get(user_id):
+            pending_bot_uploads.pop(user_id, None)
+        message.stop_propagation()
+
+    # 1. Exact file-name match (works with any number of waiting jobs)
+    for i, (fname, _fut, _sid) in enumerate(waiters):
+        if fname is not None and fname == file_name:
+            _resolve(i)
             return
-        file_name = getattr(media_obj, "file_name", None)
-        
-        for i, (fname, fut) in enumerate(pending_bot_uploads[user_id]):
-            # if name matches, or if it's a photo without a name and we expect a photo
-            # fallback: if there is only 1 pending upload, just resolve it to avoid timeouts.
-            if fname == file_name or (file_name is None and message.photo) or len(pending_bot_uploads[user_id]) == 1:
-                if not fut.done():
-                    fut.set_result(message)
-                pending_bot_uploads[user_id].pop(i)
-                message.stop_propagation()
-                return
+
+    # 2. Unnamed media (a photo) or a single waiting job: safe to resolve.
+    if file_name is None and message.photo:
+        _resolve(0)
+        return
+    if len(waiters) == 1:
+        _resolve(0)
+        return
+
+    # Several jobs wait for differently-named files and this one does not match
+    # any of them: leave the futures to time out rather than mis-assign the file.
+    print(f"[Uploads] ambiguous media {file_name!r} for user {user_id} "
+          f"({len(waiters)} jobs waiting)")
 
 
 def _is_pending_torrent_caption(_, __, message: Message) -> bool:
@@ -726,8 +878,10 @@ def _is_pending_torrent_caption(_, __, message: Message) -> bool:
     user_id = message.from_user.id if message.from_user else None
     if not user_id:
         return False
-    state = get_caption_state(user_id)
-    return bool(state and state.get("source_type") in ("torrent", "torrent_file"))
+    return any(
+        state.get("source_type") in ("torrent", "torrent_file")
+        for state in list_caption_states(user_id)
+    )
 
 
 pending_torrent_caption_filter = filters.create(_is_pending_torrent_caption)
@@ -770,7 +924,8 @@ async def torrent_thumbnail_interceptor(client: Client, message: Message):
         )
         return
 
-    if not set_caption_thumb(user_id, raw):
+    state = _resolve_torrent_caption_state(user_id, message)
+    if state is None or not set_caption_thumb(user_id, raw, sid=state.get("sid")):
         # State expired / already consumed — nothing to attach the image to.
         return
 
@@ -1490,12 +1645,9 @@ async def send_album_to_user(client, user_id, items, source_name, username, stat
 async def link_handler(client: Client, message: Message):
     user_id = message.from_user.id
     
-    # Check if user already has an active process
-    if active_user_processes.get(user_id):
-        await message.reply_text(
-            "⚠️ **Ada proses yang sedang berjalan!**\n\n"
-            "Sila tunggu proses sebelumnya selesai sebelum menghantar link baru."
-        )
+    # Check if the user still has a free job slot
+    if not has_free_slot(user_id):
+        await message.reply_text(process_limit_message())
         return
     
     # Check if user is logged in
@@ -1548,16 +1700,21 @@ async def link_handler(client: Client, message: Message):
         )
         return
 
-    # Mark user as having an active process (one lock for the whole batch)
-    active_user_processes[user_id] = asyncio.current_task()
-    reset_cancel(user_id)
+    # Reserve a job slot for the whole batch (this handler task is the job)
+    slot = begin_process(user_id, None, "tg_batch")
+    if slot is None:
+        await message.reply_text(process_limit_message())
+        return
 
-    status_msg = await message.reply_text(f"🔄 Sedang Diproses..")
+    status_msg = await message.reply_text(
+        "🔄 Sedang Diproses..", reply_markup=process_cancel_keyboard(slot.sid)
+    )
+    slot.status_msg = status_msg
 
     # 1. Get User Client
     user_client = await manager.get_client(user_id)
     if not user_client:
-        active_user_processes.pop(user_id, None)
+        release_process(slot)
         await safe_edit(status_msg, "❌ Belum login.")
         return
 
@@ -1782,9 +1939,10 @@ async def link_handler(client: Client, message: Message):
         import traceback
         traceback.print_exc()
     finally:
-        # Always clear the active process flag when done
-        active_user_processes.pop(user_id, None)
-        reset_cancel(user_id)
+        # Free this batch's slot (never touches the user's other jobs) and drop
+        # its 🚫 Batal button.
+        release_process(slot)
+        await clear_reply_markup(status_msg)
 
 
 async def _generate_video_thumbnail(media_source):

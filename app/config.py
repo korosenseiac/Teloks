@@ -67,3 +67,14 @@ CONVERT_CONCURRENCY = int(os.getenv("CONVERT_CONCURRENCY", "1"))
 # central directory if you rely on cleanup_orphaned_convert_dirs() too.
 CONVERT_TEMP_DIR = os.getenv("CONVERT_TEMP_DIR", "")
 
+# ---------------------------------------------------------------------------
+# Concurrency
+# ---------------------------------------------------------------------------
+# How many download/upload jobs a SINGLE user may run at the same time.
+# Every job gets its own "🚫 Batal" button and a slot is reserved as soon as a
+# link is accepted (a job waiting at the caption prompt already counts), so a
+# user can never start more jobs than this even by spamming links.
+# 2 doubles per-user throughput. Keep it in mind together with the service
+# limits in deploy/install.sh (MemoryMax / CPUQuota) and CONVERT_CONCURRENCY.
+MAX_CONCURRENT_PROCESSES = int(os.getenv("MAX_CONCURRENT_PROCESSES", "2"))
+

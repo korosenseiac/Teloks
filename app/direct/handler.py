@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 from pyrogram import Client
 from pyrogram.enums import ParseMode
-from app.utils.message import safe_edit
+from app.utils.message import safe_edit, clear_reply_markup
 from pyrogram.types import (
     Message,
     InputMediaPhoto,
@@ -103,8 +103,9 @@ DIRECT_LINK_PATTERN = re.compile(
 # ---------------------------------------------------------------------------
 # Tracking
 # ---------------------------------------------------------------------------
-
-_direct_client = DirectLinkClient()
+# NOTE: DirectLinkClient is created per job inside process_direct_download().
+# A module-level singleton used to be closed by whichever job finished first,
+# which broke the HTTP session of a second concurrent job of the same user.
 
 
 # ---------------------------------------------------------------------------
@@ -358,55 +359,89 @@ async def _download_video_to_temp(
 
     retries = 3
     offset = 0
+    writer_task: Optional[asyncio.Task] = None
+    completed = False
 
-    while retries > 0:
-        # Start the disk writer task
-        writer_task = asyncio.create_task(_disk_writer())
+    try:
+        while retries > 0:
+            # Start the disk writer task
+            writer_task = asyncio.create_task(_disk_writer())
 
-        try:
-            async for chunk in client.download_stream(url, start_offset=offset):
-                # Check if writer encountered an error
+            try:
+                async for chunk in client.download_stream(url, start_offset=offset):
+                    # Check if writer encountered an error
+                    if write_error["error"]:
+                        raise write_error["error"]
+
+                    # Put chunk in queue (will block if queue is full, providing back-pressure)
+                    await write_queue.put((chunk, offset))
+                    offset += len(chunk)
+                    if on_download_chunk:
+                        on_download_chunk(len(chunk))
+
+                # Signal EOF to writer and wait for it to finish
+                await write_queue.put(None)
+                await writer_task
+
+                # Check for write errors
                 if write_error["error"]:
                     raise write_error["error"]
 
-                # Put chunk in queue (will block if queue is full, providing back-pressure)
-                await write_queue.put((chunk, offset))
-                offset += len(chunk)
-                if on_download_chunk:
-                    on_download_chunk(len(chunk))
+                # Successfully downloaded
+                completed = True
+                break
 
-            # Signal EOF to writer and wait for it to finish
-            await write_queue.put(None)
+            except Exception as e:
+                # Cancel writer task on error
+                if not writer_task.done():
+                    await write_queue.put(None)
+                    try:
+                        await asyncio.wait_for(writer_task, timeout=5)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        writer_task.cancel()
+
+                import aiohttp
+                if isinstance(e, (aiohttp.ClientError, ValueError)):
+                    print(f"[DirectLink] Temp video download dropped (offset {offset}): {e}. Retries left: {retries - 1}")
+                    retries -= 1
+                    write_error["error"] = None  # Reset error for retry
+                    if retries > 0:
+                        await asyncio.sleep(2)
+                        continue
+                print(f"[DirectLink] Unrecoverable temp video download error: {e}")
+                raise e
+
+        return temp_file
+    finally:
+        if not completed:
+            # Cancelled (🚫 Batal / /cancel), out of retries, or hard failure:
+            # stop the disk writer and delete the partial file, so a cancel never
+            # leaves a multi-GB scrap behind until the next restart.
+            await _discard_partial_download(temp_file, writer_task)
+
+
+async def _discard_partial_download(
+    temp_file: str, writer_task: Optional[asyncio.Task]
+) -> None:
+    """Stop the disk writer of a partial download, then delete the file.
+
+    Best effort: the writer is awaited so it cannot re-create the file after we
+    remove it. ``cleanup_orphaned_convert_dirs()`` sweeps anything a hard kill
+    (SIGKILL) leaves behind at the next startup.
+    """
+    if writer_task is not None and not writer_task.done():
+        writer_task.cancel()
+        try:
             await writer_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    try:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            print(f"[DirectLink] Removed partial download {os.path.basename(temp_file)}")
+    except OSError as e:
+        print(f"[DirectLink] Could not remove partial download {temp_file}: {e}")
 
-            # Check for write errors
-            if write_error["error"]:
-                raise write_error["error"]
-
-            # Successfully downloaded
-            break
-
-        except Exception as e:
-            # Cancel writer task on error
-            if not writer_task.done():
-                await write_queue.put(None)
-                try:
-                    await asyncio.wait_for(writer_task, timeout=5)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    writer_task.cancel()
-
-            import aiohttp
-            if isinstance(e, (aiohttp.ClientError, ValueError)):
-                print(f"[DirectLink] Temp video download dropped (offset {offset}): {e}. Retries left: {retries - 1}")
-                retries -= 1
-                write_error["error"] = None  # Reset error for retry
-                if retries > 0:
-                    await asyncio.sleep(2)
-                    continue
-            print(f"[DirectLink] Unrecoverable temp video download error: {e}")
-            raise e
-
-    return temp_file
 
 
 def _append_bytes(path: str, data: bytes) -> None:
@@ -486,14 +521,17 @@ async def _upload_file_to_backup(
         fut = None
         uid = None
         if is_sent_to_bot:
-            from app.bot.main import pending_bot_uploads
+            from app.bot.main import pending_bot_uploads, current_process_slot
             loop = asyncio.get_running_loop()
             fut = loop.create_future()
             me = await user_client.get_me()
             uid = me.id
+            # (file_name, future, job sid) — the sid lets the interceptor prefer
+            # the job that actually asked for this file when two are waiting.
+            _slot = current_process_slot()
             if uid not in pending_bot_uploads:
                 pending_bot_uploads[uid] = []
-            pending_bot_uploads[uid].append((file_name, fut))
+            pending_bot_uploads[uid].append((file_name, fut, _slot.sid if _slot else None))
 
         # Parse caption if provided
         caption_text = ""
@@ -944,8 +982,13 @@ async def _handle_archive(
     is_premium: bool = False,
     enable_caption: bool = False,
     exclude_words: Optional[str] = None,
+    status_markup=None,
 ) -> None:
-    """Download archive, extract media ONE AT A TIME, upload each, send albums to user."""
+    """Download archive, extract media ONE AT A TIME, upload each, send albums to user.
+
+    ``status_markup`` is the job's keyboard (its 🚫 Batal button); it is kept on
+    every progress edit so the running archive job stays cancellable.
+    """
     import gc
     import time as _time
     from app.terabox.progress import _human_bytes, _human_speed, _bar, _eta
@@ -965,6 +1008,7 @@ async def _handle_archive(
             status_msg=status_msg,
             file_name=filename,
             file_size=file_size,
+            reply_markup=status_markup,
         )
         dl_tracker.start()
 
@@ -1205,6 +1249,7 @@ async def _handle_archive(
                     file_size=mf["size"],
                     file_index=idx,
                     file_total=total_files,
+                    reply_markup=status_markup,
                 )
                 tracker.start()
 
@@ -1288,18 +1333,18 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
     Validates guards, extracts URL, and prompts user whether to caption videos.
     """
     # Avoid circular import by importing here
-    from app.bot.main import active_user_processes, reset_cancel, is_cancelled
-    from app.bot.main import active_user_processes
+    from app.bot.main import (
+        has_free_slot, is_cancelled, process_limit_message,
+        process_cancel_keyboard, reserve_process,
+    )
     
     user_id = message.from_user.id
     tracker: Optional[ProgressTracker] = None
 
-    # Guard: check if user already has active process
-    if active_user_processes.get(user_id):
-        await message.reply_text(
-            "⚠️ **Ada proses yang sedang berjalan!**\n\n"
-            "Sila tunggu proses sebelumnya selesai sebelum menghantar link baru."
-        )
+    # Guard: does the user still have a free job slot? (up to
+    # MAX_CONCURRENT_PROCESSES jobs may run at once)
+    if not has_free_slot(user_id):
+        await message.reply_text(process_limit_message())
         return
 
     # Check if user is logged in
@@ -1333,13 +1378,21 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
 
     url = match.group(0).strip()
 
+    # Reserve a job slot *before* asking about captions: the prompt itself is a
+    # pending job, so spamming links can never start more jobs than allowed.
+    slot = reserve_process(user_id, "direct", prompt_msg=message)
+    if slot is None:
+        await message.reply_text(process_limit_message())
+        return
+
     # Prompt user for caption setting
     status_msg = await message.reply_text(
         "🎬 **Tetapan Caption Video**\n\n"
         "Adakah anda mahu meletakkan nama fail sebagai caption pada video?\n\n"
         "💡 *Jika Ya, nama fail akan dijadikan caption (format fail seperti .mkv/.mp4 akan dibuang secara automatik).* ",
-        reply_markup=get_caption_choice_keyboard(),
+        reply_markup=get_caption_choice_keyboard(slot.sid),
     )
+    slot.status_msg = status_msg
 
     set_caption_state(
         user_id=user_id,
@@ -1348,6 +1401,7 @@ async def direct_link_handler(bot: Client, message: Message) -> None:
         status_msg=status_msg,
         url=url,
         skip_non_videos=skip_non_videos,
+        sid=slot.sid,
     )
 
 
@@ -1360,12 +1414,16 @@ async def process_direct_download(
     skip_non_videos: bool = False,
     enable_caption: bool = False,
     exclude_words: Optional[str] = None,
+    slot_sid: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """
     Execute direct HTTP/HTTPS link download and upload to Telegram.
     """
-    from app.bot.main import active_user_processes, reset_cancel, is_cancelled
+    from app.bot.main import (
+        begin_process, get_process_slot, has_free_slot, is_cancelled,
+        process_limit_message, process_cancel_keyboard, release_process,
+    )
     
     user_id = user_id or message.from_user.id
     if not url:
@@ -1384,17 +1442,38 @@ async def process_direct_download(
         await safe_edit(status_msg, "❌ Sesi tidak sah. Sila login semula.")
         return
 
-    # Mark user as active
-    active_user_processes[user_id] = asyncio.current_task()
-    reset_cancel(user_id)
+    # Adopt the slot reserved when the link was accepted (or reserve one now for
+    # legacy callers). This also makes the slot the "current" one, so
+    # is_cancelled() below reports the state of *this* job only.
+    slot = begin_process(user_id, slot_sid, "direct", status_msg)
+    if slot is None:
+        if slot_sid and get_process_slot(slot_sid) is None:
+            # Cancelled (🚫 button, /cancel) while the caption prompt was open.
+            print(f"[DirectLink] job {slot_sid} was cancelled before it started")
+            await safe_edit(status_msg, "🚫 **Proses dibatalkan.**")
+        elif not has_free_slot(user_id):
+            await safe_edit(status_msg, process_limit_message())
+        return
 
-    status_msg = await message.reply_text("🔄 Sedang Diproses..")
+    # One HTTP client per job: closing it when this job ends must never knock
+    # out the session of a second job running for the same user.
+    direct_client = DirectLinkClient()
+
+    # Reuse the caption-prompt message as the progress message (it already
+    # carries this job's 🚫 Batal button).
+    if status_msg is None:
+        status_msg = await message.reply_text("🔄 Sedang Diproses..")
+    await safe_edit(
+        status_msg, "🔄 Sedang Diproses..",
+        reply_markup=process_cancel_keyboard(slot.sid),
+    )
+    slot.status_msg = status_msg
 
     try:
         # Resolve URL metadata
         await safe_edit(status_msg, "🔍 Mengekstrak metadata URL...")
         try:
-            metadata = await _direct_client.resolve(url)
+            metadata = await direct_client.resolve(url)
         except Exception as e:
             await safe_edit(status_msg, f"❌ Tidak dapat mengakses URL: {e}")
             return
@@ -1454,17 +1533,21 @@ async def process_direct_download(
         # Check if file is an archive
         if is_archive(file_name):
             await _handle_archive(
-                bot, _direct_client, backup_peer, message, status_msg,
+                bot, direct_client, backup_peer, message, status_msg,
                 user_id, final_url, file_name, file_size,
                 skip_non_videos=skip_non_videos,
                 is_premium=is_premium,
                 enable_caption=enable_caption,
                 exclude_words=exclude_words,
+                status_markup=process_cancel_keyboard(slot.sid),
             )
             return
 
         # Create progress tracker
-        tracker = ProgressTracker(status_msg, file_name, file_size)
+        tracker = ProgressTracker(
+            status_msg, file_name, file_size,
+            reply_markup=process_cancel_keyboard(slot.sid),
+        )
         tracker.start()
 
         # Check if file is a video
@@ -1506,7 +1589,7 @@ async def process_direct_download(
             # download bar updates in real-time during the network fetch.
             try:
                 temp_video_path = await _download_video_to_temp(
-                    _direct_client, final_url, file_name, file_size,
+                    direct_client, final_url, file_name, file_size,
                     on_download_chunk=tracker.add_downloaded,
                 )
 
@@ -1586,7 +1669,10 @@ async def process_direct_download(
 
                             part_meta = await _get_video_metadata(part_path)
 
-                            part_tracker = ProgressTracker(status_msg, part_filename, part_size)
+                            part_tracker = ProgressTracker(
+                                status_msg, part_filename, part_size,
+                                reply_markup=process_cancel_keyboard(slot.sid),
+                            )
                             part_tracker.start()
 
                             part_streamer = FileStreamer(part_path, part_filename)
@@ -1666,7 +1752,7 @@ async def process_direct_download(
         else:
             # For non-videos: stream directly from URL (no temp file needed)
             streamer = DirectLinkStreamer(
-                _direct_client,
+                direct_client,
                 final_url,
                 file_size,
                 file_name,
@@ -1753,7 +1839,9 @@ async def process_direct_download(
     finally:
         if tracker:
             await tracker.stop()
-        active_user_processes.pop(user_id, None)
+        # Release this job's slot only — a second job of the same user keeps its
+        # own slot, cancellation state and HTTP session.
+        release_process(slot)
         # 🧹 Always remove the downloaded (and possibly MKV→MP4 converted) temp
         # video. This runs on EVERY exit path — success, multi-part split return,
         # cancellation, invalid session and unexpected errors — which is what
@@ -1763,5 +1851,6 @@ async def process_direct_download(
                 os.remove(temp_video_path)
             except OSError as e:
                 print(f"[DirectLink] Temp video cleanup error: {e}")
-        await _direct_client.close()
+        await direct_client.close()
+        await clear_reply_markup(status_msg)
 

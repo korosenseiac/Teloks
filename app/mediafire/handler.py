@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 
-from app.utils.message import safe_edit
+from app.utils.message import safe_edit, clear_reply_markup
 from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
@@ -574,16 +574,16 @@ def _append_bytes(path: str, data: bytes) -> None:
 
 async def mediafire_link_handler(bot: Client, message: Message) -> None:
     """Handler called when a user sends a MediaFire file link."""
-    from app.bot.main import active_user_processes, get_backup_group_peer, is_cancelled, reset_cancel
+    from app.bot.main import (
+        begin_process, get_backup_group_peer, has_free_slot, is_cancelled,
+        process_cancel_keyboard, process_limit_message, release_process,
+    )
 
     user_id = message.from_user.id
 
     # ---------------------------------------------------------------- Guards
-    if active_user_processes.get(user_id):
-        await message.reply_text(
-            "⚠️ **Ada proses yang sedang berjalan!**\n\n"
-            "Sila tunggu proses sebelumnya selesai sebelum menghantar link baru."
-        )
+    if not has_free_slot(user_id):
+        await message.reply_text(process_limit_message())
         return
 
     user_session = await get_user_session(user_id)
@@ -626,9 +626,17 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
     print(f"[MediaFire] user={user_id} url={url!r} skip={skip_non_videos}")
 
     # ---------------------------------------------------------------- Start
-    active_user_processes[user_id] = asyncio.current_task()
-    reset_cancel(user_id)
-    status_msg = await message.reply_text("🔍 Menyelesaikan link MediaFire…")
+    # This handler task *is* the job: reserve a slot and bind it to this task.
+    slot = begin_process(user_id, None, "mediafire")
+    if slot is None:
+        await message.reply_text(process_limit_message())
+        return
+
+    status_msg = await message.reply_text(
+        "🔍 Menyelesaikan link MediaFire…",
+        reply_markup=process_cancel_keyboard(slot.sid),
+    )
+    slot.status_msg = status_msg
 
     temp_dir: Optional[str] = None
     mf_client = MediaFireClient()
@@ -728,8 +736,9 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
 
     finally:
         await mf_client.close()
-        active_user_processes.pop(user_id, None)
-        reset_cancel(user_id)
+        # Release only this job's slot, then drop its 🚫 Batal button.
+        release_process(slot)
+        await clear_reply_markup(status_msg)
 
 
 # ---------------------------------------------------------------------------
