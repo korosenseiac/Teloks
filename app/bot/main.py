@@ -1,9 +1,10 @@
 import re
 import random
 import math
+import traceback
 from io import BytesIO
 from typing import Any, Dict, Optional
-from pyrogram import Client, filters
+from pyrogram import Client, StopPropagation, filters
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
 from pyrogram.raw.functions.messages import SendMedia
@@ -950,8 +951,22 @@ async def torrent_file_upload_handler(client: Client, message: Message):
 
 @app.on_message(filters.regex(DIRECT_LINK_PATTERN) & filters.private)
 async def direct_link_message_handler(client: Client, message: Message):
+    # CRITICAL: Message.stop_propagation() does not set a flag, it RAISES
+    # pyrogram.StopPropagation (see pyrogram/types/update.py). Calling it before
+    # the handler aborts this coroutine immediately, so direct_link_handler()
+    # never ran and every direct link was swallowed with no reply, no log and no
+    # traceback — pyrogram/dispatcher.py catches StopPropagation with a silent
+    # `pass`. It must therefore always run AFTER the handler.
+    try:
+        await direct_link_handler(client, message)
+    except StopPropagation:
+        raise  # never mask propagation control flow
+    except Exception as e:
+        # Print it ourselves: the claim below would stop Pyrogram from ever
+        # logging the original traceback.
+        print(f"[DirectLink] Handler failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
     message.stop_propagation()
-    await direct_link_handler(client, message)
 
 
 # ---------------------------------------------------------------------------
