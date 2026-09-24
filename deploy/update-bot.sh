@@ -20,19 +20,39 @@ SERVICE_NAME="telegram-forwarder"
 REPO_URL="https://github.com/korosenseiac/Teloks.git"
 BACKUP_DIR="/opt/telegram-forwarder-bot-backup-$(date +%Y%m%d_%H%M%S)"
 
-# Is Playwright's own Chromium really there? ($1 = bot user, default botuser)
+# Is Chromium usable as the bot user? ($1 = bot user, default botuser)
 #
-# Ask Playwright for the exact executable it launches and test that path. A stale
-# chromium-* directory left by an older Playwright - or by an install that ran
-# with the wrong HOME - passes a `ls chromium-*` glob while the bot still reports
-# "Chromium is not downloaded", so the ~170 MB download gets silently skipped on
-# every update. Playwright only launches the build matching its own version.
+# This is a real headless launch. Neither `ls chromium-*` nor Playwright's
+# executable_path is enough: the former passes on a stale build from an older
+# Playwright, the latter names full Chromium while headless runs use the separate
+# chromium_headless_shell build. Launching covers both, plus the system libraries
+# and the cache path itself.
 browser_ready() {
     sudo -H -u "${1:-botuser}" env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
-        "$BOT_DIR/venv/bin/python" -c 'import os, sys
-from playwright.sync_api import sync_playwright
+        "$BOT_DIR/venv/bin/python" -c 'from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
-    sys.exit(0 if os.path.exists(p.chromium.executable_path) else 1)' 2>/dev/null
+    p.chromium.launch(headless=True).close()' 2>/dev/null
+}
+
+# Make the SERVICE able to see that browser. The unit is hardened with
+# ProtectHome=true, which empties /home for the bot, while Playwright defaults to
+# $HOME/.cache/ms-playwright - so a browser in the bot user's home can never be
+# used and the bot reports "Chromium is not downloaded" forever. A drop-in is used
+# instead of editing the unit, so it survives future rewrites of the unit file.
+ensure_service_browser_path() {
+    [ -f "/etc/systemd/system/$SERVICE_NAME.service" ] || return 0
+    if systemctl show -p Environment "$SERVICE_NAME" 2>/dev/null \
+        | grep -qF "PLAYWRIGHT_BROWSERS_PATH=$BROWSER_CACHE" \
+      || grep -qF "PLAYWRIGHT_BROWSERS_PATH=$BROWSER_CACHE" \
+           "/etc/systemd/system/$SERVICE_NAME.service.d/browser-cache.conf" 2>/dev/null; then
+        return 0
+    fi
+    echo "Pointing the service at $BROWSER_CACHE (it cannot see /home)..."
+    mkdir -p "/etc/systemd/system/$SERVICE_NAME.service.d" || return 0
+    printf '[Service]\n# Written by the updater: ProtectHome=true hides /home from the service,\n# so the Chromium cache must live where the service can read it.\nEnvironment=PLAYWRIGHT_BROWSERS_PATH=%s\n' \
+        "$BROWSER_CACHE" > "/etc/systemd/system/$SERVICE_NAME.service.d/browser-cache.conf" || return 0
+    systemctl daemon-reload || true
+    echo "Service environment updated (the restart below applies it)."
 }
 
 echo -e "${BLUE}========================================${NC}"
@@ -92,7 +112,10 @@ echo -e "${GREEN}[✓]${NC} Dependencies updated"
 # (see app/hls/browser.py). Idempotent and never fatal: the HLS pipeline works
 # without it. Set SKIP_BROWSER=1 to skip the ~170 MB download.
 if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwright" 2>/dev/null; then
-    BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-/home/botuser/.cache/ms-playwright}"
+    BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-$BOT_DIR/ms-playwright}"
+    mkdir -p "$BROWSER_CACHE"
+    chown -R botuser:botuser "$BROWSER_CACHE"
+    ensure_service_browser_path
     if browser_ready botuser; then
         echo -e "${GREEN}[✓]${NC} Headless browser already installed"
     else
@@ -117,15 +140,33 @@ cat > /usr/local/bin/bot << 'EOF'
 SERVICE_NAME="telegram-forwarder"
 BOT_DIR="/opt/telegram-forwarder-bot"
 
-# Is Playwright's own Chromium really there? A stale chromium-* from an older
-# Playwright passes `ls chromium-*` but cannot be launched, which is how the
-# download below used to be skipped forever. Ask Playwright for its own path.
+# Is Chromium usable? A real headless launch, because neither `ls chromium-*` (a
+# stale build passes) nor executable_path (full Chromium, while headless uses
+# chromium_headless_shell) proves the bot can start anything.
 browser_ready() {
     sudo -H -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
-        "$BOT_DIR/venv/bin/python" -c 'import os, sys
-from playwright.sync_api import sync_playwright
+        "$BOT_DIR/venv/bin/python" -c 'from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
-    sys.exit(0 if os.path.exists(p.chromium.executable_path) else 1)' 2>/dev/null
+    p.chromium.launch(headless=True).close()' 2>/dev/null
+}
+
+# The unit is hardened with ProtectHome=true, which empties /home for the bot and
+# makes a browser under /home unusable (Playwright defaults to
+# $HOME/.cache/ms-playwright). A drop-in, so it survives unit rewrites.
+ensure_service_browser_path() {
+    [ -f "/etc/systemd/system/$SERVICE_NAME.service" ] || return 0
+    if systemctl show -p Environment "$SERVICE_NAME" 2>/dev/null \
+        | grep -qF "PLAYWRIGHT_BROWSERS_PATH=$BROWSER_CACHE" \
+      || grep -qF "PLAYWRIGHT_BROWSERS_PATH=$BROWSER_CACHE" \
+           "/etc/systemd/system/$SERVICE_NAME.service.d/browser-cache.conf" 2>/dev/null; then
+        return 0
+    fi
+    echo "Pointing the service at $BROWSER_CACHE (it cannot see /home)..."
+    sudo mkdir -p "/etc/systemd/system/$SERVICE_NAME.service.d" || return 0
+    printf '[Service]\n# Written by the updater: ProtectHome=true hides /home from the service,\n# so the Chromium cache must live where the service can read it.\nEnvironment=PLAYWRIGHT_BROWSERS_PATH=%s\n' \
+        "$BROWSER_CACHE" \
+        | sudo tee "/etc/systemd/system/$SERVICE_NAME.service.d/browser-cache.conf" >/dev/null || return 0
+    sudo systemctl daemon-reload || true
 }
 
 case "$1" in
@@ -195,7 +236,10 @@ case "$1" in
         # Optional headless browser for JS-only player pages (idempotent,
         # never fatal). Set SKIP_BROWSER=1 to skip the ~170 MB download.
         if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwright" 2>/dev/null; then
-            BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-/home/botuser/.cache/ms-playwright}"
+            BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-$BOT_DIR/ms-playwright}"
+            sudo mkdir -p "$BROWSER_CACHE"
+            sudo chown -R botuser:botuser "$BROWSER_CACHE"
+            ensure_service_browser_path
             if browser_ready; then
                 echo "Headless browser already installed."
             else

@@ -87,6 +87,65 @@ _BLOCKED_HOST_PARTS = (
     "facebook.net", "criteo", "taboola", "outbrain", "openfpcdn",
 )
 
+#: Bot root (two levels above ``<bot>/app/hls/browser.py``).
+_BOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+#: Chromium caches to fall back on when the default one is out of reach.
+#:
+#: The systemd unit hardens the service with ``ProtectHome=true`` (see
+#: deploy/install.sh), which makes ``/home`` *empty* for the bot process. A
+#: Chromium installed in ``/home/botuser/.cache/ms-playwright`` therefore works
+#: perfectly from a shell and is still invisible to the bot, which reports
+#: "Chromium is not downloaded" forever. Keeping the browser in the bot
+#: directory (``<bot>/ms-playwright``, writable via ``ReadWritePaths``) is what
+#: the installer does, and these are the places this module looks for it.
+_CACHE_CANDIDATES = (
+    os.path.join(_BOT_DIR, "ms-playwright"),
+    "/opt/telegram-forwarder-bot/ms-playwright",
+)
+
+
+def _has_browser(path: str) -> bool:
+    """True when ``path`` holds at least one Chromium build (cheap, no import)."""
+    try:
+        return any(
+            name.startswith(("chromium", "chrome")) for name in os.listdir(path)
+        )
+    except Exception:
+        return False
+
+
+def _home_masked() -> bool:
+    """True when this process cannot see its own home directory.
+
+    That is the signature of ``ProtectHome=true``: ``$HOME`` still points at
+    ``/home/<user>`` but the path is not there. Worth naming in the log, because
+    it looks identical to "the browser was never downloaded".
+    """
+    for home in (os.environ.get("HOME"), os.path.expanduser("~")):
+        if home and home.startswith(("/home/", "/root")) and not os.path.isdir(home):
+            return True
+    return False
+
+
+def _resolve_browser_cache() -> None:
+    """Point Playwright at a Chromium it can actually reach.
+
+    ``PLAYWRIGHT_BROWSERS_PATH`` wins when set (the systemd unit sets it), then
+    the legacy ``~/.cache/ms-playwright`` is kept if it is visible and populated,
+    then the candidates above. Must run **before** the driver starts: that
+    variable is read by the driver process, not by the Python API.
+    """
+    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        return
+    if _has_browser(os.path.expanduser("~/.cache/ms-playwright")):
+        return
+    for candidate in _CACHE_CANDIDATES:
+        if _has_browser(candidate):
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = candidate
+            print(f"[HLS] Browser: using the Chromium cache at {candidate}")
+            return
+
 
 def browser_available() -> bool:
     """True when the ``playwright`` package is importable.
@@ -279,6 +338,10 @@ async def _get_browser():
 
     from playwright.async_api import async_playwright
 
+    # Before the driver starts: it is the driver that resolves the browser path,
+    # so a cache outside the (sandboxed) home has to be advertised here.
+    _resolve_browser_cache()
+
     if _pw is None:
         _pw = await async_playwright().start()
 
@@ -358,14 +421,20 @@ async def _read_tap(page) -> str:
 def _install_hint() -> str:
     """The exact commands that install Chromium for the account running the bot.
 
-    ``sudo -u <user>`` on its own is NOT enough: sudo keeps the *invoking* user's
-    ``HOME`` unless ``-H`` is given, so the browser would be downloaded into the
-    wrong user's cache and the bot would keep reporting it as missing. Hence
-    ``-H`` plus an explicit ``PLAYWRIGHT_BROWSERS_PATH``. The system libraries
-    are a separate, root-only step (``--with-deps`` would call sudo from inside
-    this account, where there is no password to give).
+    The browser goes *outside* ``/home``: the systemd unit uses
+    ``ProtectHome=true``, which makes ``/home`` empty for the bot, so a Chromium
+    there is unreachable for the service. ``<bot>/ms-playwright`` is already
+    writable for the service (``ReadWritePaths``), and the unit advertises it via
+    ``PLAYWRIGHT_BROWSERS_PATH``.
+
+    ``sudo -u <user>`` on its own is NOT enough either: sudo keeps the *invoking*
+    user's ``HOME`` unless ``-H`` is given, so the browser would be downloaded
+    into the wrong user's cache. Hence ``-H`` plus an explicit
+    ``PLAYWRIGHT_BROWSERS_PATH``. The system libraries are a separate, root-only
+    step (``--with-deps`` would call sudo from inside this account, where there
+    is no password to give).
     """
-    cache = os.path.expanduser("~/.cache/ms-playwright")
+    cache = os.path.join(_BOT_DIR, "ms-playwright")
     try:
         import pwd
         me = pwd.getpwuid(os.getuid()).pw_name
@@ -406,6 +475,9 @@ def _describe_cache(wanted: str) -> str:
     build = os.path.basename(os.path.dirname(os.path.dirname(wanted)))
     cache = os.path.dirname(os.path.dirname(os.path.dirname(wanted)))
     if not os.path.isdir(cache):
+        if _home_masked():
+            return (f"      cache contains:   {cache} is not visible to this process\n"
+                    f"                        (the service sandbox hides /home)")
         return f"      cache contains:   {cache} does not exist (download never ran)"
     try:
         builds = sorted(
@@ -418,6 +490,21 @@ def _describe_cache(wanted: str) -> str:
         return f"      cache contains:   nothing in {cache} (download never completed)"
     stale = "" if build in builds else "  <- OLDER than this Playwright wants"
     return f"      cache contains:   {', '.join(builds)}{stale}"
+
+
+def _sandbox_hint(cache: str) -> str:
+    """The way out of the ``ProtectHome=true`` trap (see the unit in install.sh)."""
+    return (
+        f"      ProtectHome=true hides /home from the service, so a Chromium under\n"
+        f"      {cache} can never be used by the bot, however often it is reinstalled.\n"
+        f"      Easiest fix (installs outside /home, where the service can read it):\n"
+        f"        sudo bash deploy/install-browser.sh\n"
+        f"      Or keep the current cache and let the service see it:\n"
+        f"        sudo mkdir -p /etc/systemd/system/telegram-forwarder.service.d\n"
+        f"        printf '[Service]\\nEnvironment=PLAYWRIGHT_BROWSERS_PATH=%s\\n' {cache} \\\n"
+        f"          | sudo tee /etc/systemd/system/telegram-forwarder.service.d/browser-cache.conf\n"
+        f"        sudo systemctl daemon-reload && sudo systemctl restart telegram-forwarder\n"
+    )
 
 
 def _log_launch_failure(err: Exception) -> None:
@@ -439,7 +526,7 @@ def _log_launch_failure(err: Exception) -> None:
                   f"(cache: {cache}).\n"
                   f"      playwright wants: {wanted or '(not named in the error)'}\n"
                   f"{_describe_cache(wanted)}\n"
-                  f"{_install_hint()}")
+                  f"{_sandbox_hint(cache) if _home_masked() else _install_hint()}")
         return
     if "shared librar" in message.lower() or "libnss" in message.lower():
         print("[HLS] Browser engine: Chromium cannot start - missing system "

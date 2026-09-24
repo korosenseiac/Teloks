@@ -126,19 +126,24 @@ print_status "Virtual environment created and dependencies installed"
 # Optional: headless Chromium for player pages whose stream URL is only built in
 # JavaScript (app/hls/browser.py). Skip with SKIP_BROWSER=1; never fatal.
 #
-# The check asks Playwright for the exact executable it launches instead of
-# globbing chromium-* in the cache: a build left by an older Playwright (or by an
-# install that ran with the wrong HOME) satisfies a glob but cannot be launched,
-# so the download below would be skipped while the bot reports Chromium missing.
+# Chromium goes into $BOT_DIR, NOT into the bot user's home: the unit below sets
+# ProtectHome=true, which makes /home empty for the service, so a browser there is
+# invisible to the bot however often it is reinstalled. $BOT_DIR is covered by
+# ReadWritePaths and advertised through PLAYWRIGHT_BROWSERS_PATH.
 browser_ready() {
+    # A real headless launch as the bot user: that also covers the
+    # chromium_headless_shell build that headless runs use, the system libraries
+    # and the cache path itself. A glob - or even playwright's executable_path -
+    # can look fine while the bot still cannot launch anything.
     sudo -H -u "$BOT_USER" env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
-        "$BOT_DIR/venv/bin/python" -c 'import os, sys
-from playwright.sync_api import sync_playwright
+        "$BOT_DIR/venv/bin/python" -c 'from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
-    sys.exit(0 if os.path.exists(p.chromium.executable_path) else 1)' 2>/dev/null
+    p.chromium.launch(headless=True).close()' 2>/dev/null
 }
 if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwright" 2>/dev/null; then
-    BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-/home/$BOT_USER/.cache/ms-playwright}"
+    BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-$BOT_DIR/ms-playwright}"
+    mkdir -p "$BROWSER_CACHE"
+    chown -R "$BOT_USER:$BOT_USER" "$BROWSER_CACHE"
     if browser_ready; then
         print_status "Headless browser already installed"
     else
@@ -285,6 +290,11 @@ User=$BOT_USER
 Group=$BOT_USER
 WorkingDirectory=$BOT_DIR
 Environment=PATH=$BOT_DIR/venv/bin:/usr/local/bin:/usr/bin:/bin
+# Headless Chromium (app/hls/browser.py) lives here, NOT in the bot user's home:
+# ProtectHome=true below empties /home for the service, so a browser under /home
+# is invisible to the bot and looks exactly like "Chromium is not downloaded".
+# $BOT_DIR is covered by ReadWritePaths, so the service can read it.
+Environment=PLAYWRIGHT_BROWSERS_PATH=$BOT_DIR/ms-playwright
 ExecStart=$BOT_DIR/venv/bin/python main.py
 
 # Restart configuration - restart on any failure

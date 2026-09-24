@@ -123,6 +123,11 @@ User=$BOT_USER
 Group=$BOT_USER
 WorkingDirectory=$BOT_DIR
 Environment=PATH=$BOT_DIR/venv/bin:/usr/local/bin:/usr/bin:/bin
+# Headless Chromium (app/hls/browser.py) lives here, NOT in the bot user's home:
+# ProtectHome=true below empties /home for the service, so a browser under /home
+# is invisible to the bot and looks exactly like "Chromium is not downloaded".
+# $BOT_DIR is covered by ReadWritePaths, so the service can read it.
+Environment=PLAYWRIGHT_BROWSERS_PATH=$BOT_DIR/ms-playwright
 ExecStart=$BOT_DIR/venv/bin/python main.py
 Restart=always
 RestartSec=10

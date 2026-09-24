@@ -145,7 +145,9 @@ HLS_PAGE_HINT = os.getenv("HLS_PAGE_HINT", "true").lower() in ("1", "true", "yes
 # With Playwright + Chromium installed the page is opened once, the first m3u8
 # request is captured, and that URL (minted for OUR egress, which is what makes
 # signed CDNs work) is downloaded normally. Without the package this is skipped.
-#   install: pip install playwright && python -m playwright install chromium
+#   install: sudo bash deploy/install-browser.sh
+# Chromium goes into <bot dir>/ms-playwright, not into the bot user's home: the
+# systemd unit uses ProtectHome=true, which hides /home from the service.
 HLS_BROWSER_ENABLED = os.getenv("HLS_BROWSER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 # Seconds to wait for the page to request its manifest.
