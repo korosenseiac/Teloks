@@ -307,7 +307,7 @@ async def _idle_watchdog() -> None:
         if _active or _browser_last_used == 0.0:
             continue
         if time.time() - _browser_last_used >= HLS_BROWSER_IDLE:
-            print(f"[HLS] Browser idle {HLS_BROWSER_IDLE}s — closing Chromium")
+            print(f"[HLS] Browser idle {HLS_BROWSER_IDLE}s - closing Chromium")
             await close_browser()
             break
     _idle_task = None
@@ -355,6 +355,32 @@ async def _read_tap(page) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _install_hint() -> str:
+    """The exact commands that install Chromium for the account running the bot.
+
+    ``sudo -u <user>`` on its own is NOT enough: sudo keeps the *invoking* user's
+    ``HOME`` unless ``-H`` is given, so the browser would be downloaded into the
+    wrong user's cache and the bot would keep reporting it as missing. Hence
+    ``-H`` plus an explicit ``PLAYWRIGHT_BROWSERS_PATH``. The system libraries
+    are a separate, root-only step (``--with-deps`` would call sudo from inside
+    this account, where there is no password to give).
+    """
+    cache = os.path.expanduser("~/.cache/ms-playwright")
+    try:
+        import pwd
+        me = pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        me = os.environ.get("USER") or os.environ.get("LOGNAME") or "botuser"
+    return (
+        f"        sudo -H -u {me} env PLAYWRIGHT_BROWSERS_PATH={cache} \\\n"
+        f"          {sys.executable} -m playwright install chromium\n"
+        f"      Chromium also needs its system libraries, installed as root:\n"
+        f"        sudo {sys.executable} -m playwright install-deps chromium\n"
+        f"      Or run both steps at once, from an admin user:\n"
+        f"        sudo bash deploy/install-browser.sh"
+    )
+
+
 def _log_launch_failure(err: Exception) -> None:
     """One clear log line per failure mode, with the fix where we know it."""
     global _HINT_LOGGED
@@ -364,9 +390,13 @@ def _log_launch_failure(err: Exception) -> None:
             _HINT_LOGGED = True
             print(f"[HLS] Browser engine: Chromium is not downloaded for this user "
                   f"(cache: {os.path.expanduser('~/.cache/ms-playwright')}).\n"
-                  f"      Fix it as the account that runs the bot, then restart:\n"
-                  f"        sudo -u botuser {sys.executable} -m playwright install chromium\n"
-                  f"      (or simply run: sudo bash deploy/install-browser.sh)")
+                  f"{_install_hint()}")
+        return
+    if "shared librar" in message.lower() or "libnss" in message.lower():
+        print("[HLS] Browser engine: Chromium cannot start - missing system "
+              "libraries.\n"
+              f"      Install them as root, then restart the bot:\n"
+              f"        sudo {sys.executable} -m playwright install-deps chromium")
         return
     print(f"[HLS] Browser engine unavailable: {type(err).__name__}: {err}")
 

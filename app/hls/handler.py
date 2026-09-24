@@ -333,12 +333,13 @@ async def _browser_stage(
     if scan.url:
         force_direct = (not scan.used_proxy) and read_proxy_url() is not None
         if force_direct:
-            print("[HLS] Browser had to go direct while proxy.txt is configured — "
+            print("[HLS] Browser had to go direct while proxy.txt is configured - "
                   "this job will download directly too, so the minted URL matches "
                   "the address it was minted for")
         return scan.url, page_url, force_direct
+    detail = f" - {scan.detail}" if scan.detail else ""
     print(f"[HLS] Browser stage: no manifest in {page_url.split('?', 1)[0]} "
-          f"({scan.reason or 'unknown'})")
+          f"({scan.reason or 'unknown'}{detail})")
     return "", fallback_page, False
 
 
@@ -400,8 +401,9 @@ async def page_hls_handler(bot: Client, message: Message) -> bool:
     force_direct = False
 
     if not url:
+        detail = f" - {scan.detail}" if scan.detail else ""
         print(f"[HLS] Page scan: no manifest in {page_url.split('?', 1)[0]} "
-              f"({scan.reason}, {scan.candidates} candidate(s))")
+              f"({scan.reason}, {scan.candidates} candidate(s){detail})")
         # Last resort: JS-only players. Run the page in Chromium and take the
         # first m3u8 it requests — that URL is minted for OUR egress, which is
         # also what makes client-bound signed CDNs work.

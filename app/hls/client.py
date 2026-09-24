@@ -187,6 +187,31 @@ def _append_bytes(path: str, data: bytes) -> None:
         fh.write(data)
 
 
+def decode_text(body: bytes, encoding: Optional[str] = None) -> str:
+    """Decode a fetched body as text *without* ever raising on bad bytes.
+
+    Real sites lie about charsets. A body that advertises (or defaults to)
+    utf-8 but actually carries cp1252/latin-1 text — or that is not text at all
+    — used to blow up inside ``str.decode`` as ``UnicodeDecodeError``, which the
+    page scan then reported as "Candidate rejected": the log hid whether the
+    candidate was a playlist at all, and a genuine manifest sitting in a
+    mis-declared page would have been thrown away.
+
+    Tolerating the bad bytes costs nothing: an HLS playlist is pure ASCII, so a
+    real one still starts with ``#EXTM3U`` after this. Tries the declared
+    charset strictly, then utf-8, then cp1252 (which accepts almost every byte),
+    and finally replaces whatever is left.
+    """
+    for enc in (encoding, "utf-8", "cp1252"):
+        if not enc:
+            continue
+        try:
+            return body.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return body.decode("utf-8", "replace")
+
+
 # ---------------------------------------------------------------------------
 # HlsClient
 # ---------------------------------------------------------------------------
@@ -251,14 +276,20 @@ class HlsClient:
     # ------------------------------------------------------------ fetching
 
     async def fetch_text(self, url: str) -> str:
-        """Fetch a playlist document and return it as text."""
+        """Fetch a playlist document and return it as text.
+
+        Decoding is deliberately lenient (see :func:`decode_text`): a body whose
+        charset is mis-declared must not surface as an exception, because that
+        would hide the real reason a candidate was rejected — and would discard
+        a manifest that happens to live in such a body.
+        """
         session = await self._get_session()
         async with session.get(
             url, timeout=_TIMEOUT, allow_redirects=True, ssl=False,
         ) as resp:
             if resp.status >= 400:
                 raise ValueError(f"HTTP {resp.status} for {url}")
-            return await resp.text()
+            return decode_text(await resp.read(), resp.get_encoding())
 
     async def fetch_bytes(
         self, url: str, byte_range: Optional[tuple] = None
@@ -309,11 +340,10 @@ class HlsClient:
                 body.extend(chunk)
                 if len(body) >= max_bytes:
                     break
-            encoding = resp.get_encoding() or "utf-8"
-            try:
-                return bytes(body).decode(encoding, "ignore")
-            except LookupError:
-                return bytes(body).decode("utf-8", "ignore")
+            # Lenient decoding on purpose: plenty of player pages announce utf-8
+            # and then serve a stray cp1252 byte, which must not cost us the
+            # manifests the rest of the document contains.
+            return decode_text(bytes(body), resp.get_encoding())
 
     async def download_to(
         self,
@@ -399,6 +429,8 @@ class HlsClient:
 if __name__ == "__main__":
     import sys
 
+    from app.hls.playlist import is_hls_playlist
+
     failures: List[str] = []
 
     def _check(label: str, ok: bool, detail: str = "") -> None:
@@ -426,6 +458,26 @@ if __name__ == "__main__":
     _check("http -> ffmpeg args",
            ffmpeg_proxy_args("http://h:8080") == ["-http_proxy", "http://h:8080"])
     _check("no proxy -> no args", ffmpeg_proxy_args(None) == [])
+
+    print("--- lenient decoding (production: 'Candidate rejected' on a good page) ---")
+    # A body that announces utf-8 but is really cp1252 used to raise
+    # UnicodeDecodeError out of resp.text(), which the page scan reported as
+    # "Candidate rejected" — losing the manifest that was inside it.
+    playlist_bytes = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n# caf\xe9\nv.m3u8\n"
+    _check("no declared charset + cp1252 byte -> decoded",
+           is_hls_playlist(decode_text(playlist_bytes)), repr(decode_text(playlist_bytes)))
+    _check("mis-declared utf-8 -> decoded",
+           is_hls_playlist(decode_text(playlist_bytes, "utf-8")))
+    _check("bogus charset name -> decoded, not LookupError",
+           is_hls_playlist(decode_text(playlist_bytes, "not-a-real-charset")))
+    _check("pure ASCII unchanged",
+           decode_text(b"#EXTM3U\n") == "#EXTM3U\n", repr(decode_text(b"#EXTM3U\n")))
+    # Binary bytes must come back as *some* string (and simply not look like a
+    # playlist) instead of blowing up the caller.
+    binary_body = bytes(range(256))
+    _check("binary body survives decoding",
+           not is_hls_playlist(decode_text(binary_body, "utf-8")),
+           repr(decode_text(binary_body, "utf-8")[:24]))
 
     print("---", "ALL PASSED" if not failures else f"{len(failures)} FAILURE(S)")
     for name in failures:

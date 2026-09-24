@@ -287,17 +287,29 @@ class PageScan:
     detail: str = ""
 
 
-async def _first_valid(client, urls: Sequence[str]) -> Optional[str]:
-    """First candidate that really is an HLS playlist."""
+async def _first_valid(client, urls: Sequence[str]) -> Tuple[Optional[str], str]:
+    """First candidate that really is an HLS playlist, plus why the rest failed.
+
+    Returns ``(url, detail)``. *url* is ``None`` when no candidate turned out to
+    be a playlist; *detail* is then a short, log-friendly note about the last
+    rejection (``HTTP 403``, a timeout, "not a playlist (12 KB)" …) so the
+    caller's "no-valid-manifest" line can say what actually happened instead of
+    leaving a bare candidate count to guess from.
+    """
+    detail = ""
     for url in urls:
+        short = url.split("?", 1)[0]
         try:
             text = await client.fetch_text(url)
         except Exception as e:
-            print(f"[HLS] Candidate rejected ({e})")
+            detail = f"{type(e).__name__}: {e}"
+            print(f"[HLS] Candidate rejected ({short}): {detail}")
             continue
         if is_hls_playlist(text):
-            return url
-    return None
+            return url, ""
+        detail = f"{short} is not a playlist ({len(text)} B)"
+        print(f"[HLS] Candidate rejected ({detail})")
+    return None, detail
 
 
 async def resolve_stream_from_page(
@@ -323,8 +335,9 @@ async def resolve_stream_from_page(
         return PageScan(page_url=page_url, reason="not-a-page")
 
     candidates = find_manifests(html, page_url, limit=limit)
+    detail = ""
     if candidates:
-        url = await _first_valid(client, candidates)
+        url, detail = await _first_valid(client, candidates)
         if url:
             return PageScan(
                 url=url, page_url=page_url, reason="ok", candidates=len(candidates),
@@ -342,18 +355,22 @@ async def resolve_stream_from_page(
             sub_candidates = find_manifests(sub, embed, limit=limit)
             if not sub_candidates:
                 continue
-            url = await _first_valid(client, sub_candidates)
+            url, sub_detail = await _first_valid(client, sub_candidates)
             if url:
                 return PageScan(
                     url=url, page_url=embed, reason="ok",
                     candidates=len(sub_candidates),
                 )
+            # The embed hop is the deepest attempt, so its reason is the most
+            # useful one to report.
+            detail = sub_detail
 
     return PageScan(
         page_url=page_url,
         reason="no-manifest" if not candidates else "no-valid-manifest",
         candidates=len(candidates),
         player_page=looks_like_player_page(html),
+        detail=detail,
     )
 
 
@@ -533,12 +550,43 @@ if __name__ == "__main__":
                 body=b"PK\x03\x04" + b"0" * 512, content_type="application/zip",
                 headers={"Content-Disposition": 'attachment; filename="x.zip"'})
 
+        async def page_bad_charset(request):
+            """Page whose only candidate is a playlist with a stray cp1252 byte."""
+            return web.Response(
+                text='<html><body><script>var src = "/media/master-cp1252.m3u8";'
+                     "</script></body></html>",
+                content_type="text/html")
+
+        async def master_bad_charset(request):
+            # No charset in the header plus a stray 0xe9 in the body: exactly the
+            # shape that used to raise UnicodeDecodeError out of resp.text() and
+            # turn a perfectly good manifest into "Candidate rejected".
+            body = (b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n"
+                    b"# caf\xe9\nindex.m3u8\n")
+            return web.Response(body=body,
+                                content_type="application/vnd.apple.mpegurl")
+
+        async def page_junk_candidate(request):
+            """Page offering a candidate that is not a playlist at all."""
+            return web.Response(
+                text='<html><body><script>var src = "/media/notaplaylist.m3u8";'
+                     "</script></body></html>",
+                content_type="text/html")
+
+        async def not_a_playlist(request):
+            return web.Response(body=b"<html>caf\xe9 not a playlist</html>",
+                                content_type="application/vnd.apple.mpegurl")
+
         app = web.Application()
         app.router.add_get("/page", page)
         app.router.add_get("/media/master.m3u8", master)
         app.router.add_get("/media/index.m3u8", media)
         app.router.add_get("/media/seg0.ts", segment)
         app.router.add_get("/file.zip", real_file)
+        app.router.add_get("/page-bad-charset", page_bad_charset)
+        app.router.add_get("/media/master-cp1252.m3u8", master_bad_charset)
+        app.router.add_get("/page-junk-candidate", page_junk_candidate)
+        app.router.add_get("/media/notaplaylist.m3u8", not_a_playlist)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -590,6 +638,27 @@ if __name__ == "__main__":
             # 5) A real file is never downloaded twice by the sniffer.
             file_text = await client.fetch_page_text(f"{base}/file.zip")
             _check("attachment/binary page refused", file_text is None, str(file_text))
+
+            # 6) Regression for the production crash: a playlist whose body
+            #    carries a stray cp1252 byte while the response declares no
+            #    charset. ``resp.text()`` raised UnicodeDecodeError there, the
+            #    scan logged "Candidate rejected" and a perfectly good manifest
+            #    was thrown away.
+            scan_bad = await resolve_stream_from_page(client, f"{base}/page-bad-charset")
+            _check("non-utf8 playlist with no charset still accepted",
+                   scan_bad.reason == "ok" and bool(scan_bad.url),
+                   f"{scan_bad.reason} {scan_bad.detail!r}")
+            raw = await client.fetch_text(f"{base}/media/master-cp1252.m3u8")
+            _check("such a body decodes into a playlist", is_hls_playlist(raw),
+                   repr(raw[:32]))
+
+            # 7) A candidate that is not a playlist must say so, not raise.
+            scan_junk = await resolve_stream_from_page(
+                client, f"{base}/page-junk-candidate")
+            _check("non-playlist candidate reports why",
+                   scan_junk.url is None and scan_junk.reason == "no-valid-manifest"
+                   and "not a playlist" in scan_junk.detail,
+                   f"{scan_junk.reason} {scan_junk.detail!r}")
         finally:
             if client is not None:
                 await client.close()
