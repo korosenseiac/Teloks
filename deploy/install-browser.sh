@@ -99,30 +99,47 @@ fi
 
 echo
 echo "3/4  Downloading Chromium into $BROWSER_CACHE ..."
+# Always run this: it is a no-op when the build is already current, and it is the
+# only thing that repairs the case where an earlier run downloaded an OLD build
+# (afterwards `pip install --upgrade playwright` wants a newer revision, which
+# looks exactly like "Chromium is not downloaded").
 bot_playwright "$VENV_PY" -m playwright install chromium
 
 echo
-if ls "$BROWSER_CACHE"/chromium-* >/dev/null 2>&1; then
-  echo "4/4  Chromium is in place: $(ls -d "$BROWSER_CACHE"/chromium-* | head -1)"
-  # Chromium copies from earlier attempts under other accounts just waste disk.
-  for stale in /home/*/.cache/ms-playwright /root/.cache/ms-playwright; do
-    [ -d "$stale" ] || continue
-    [ "$stale" = "$BROWSER_CACHE" ] && continue
-    echo "     NOTE: an unused copy from an earlier run is at $stale"
-    echo "           (safe to delete, frees ~450 MB): sudo rm -rf $stale"
-  done
+echo "4/4  Verifying..."
+# Ask Playwright itself which executable it launches. A `chromium-*` directory
+# listing proves nothing: a stale build left by an older Playwright passes that
+# check while the bot still reports Chromium as missing.
+bot_playwright "$VENV_PY" -c '
+import os, sys
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    path = p.chromium.executable_path
+print("  wanted:", path)
+print("  exists:", os.path.exists(path))
+sys.exit(0 if os.path.exists(path) else 1)
+' || echo "     (the build above does not match this Playwright version)"
+
+# Chromium copies from earlier attempts under other accounts just waste disk.
+for stale in /home/*/.cache/ms-playwright /root/.cache/ms-playwright; do
+  [ -d "$stale" ] || continue
+  [ "$stale" = "$BROWSER_CACHE" ] && continue
+  echo "     NOTE: an unused copy from an earlier run is at $stale"
+  echo "           (safe to delete, frees ~450 MB): sudo rm -rf $stale"
+done
+
+echo
+echo "Launching Chromium as $BOT_USER (the real check - the bot does the same)..."
+if bot_playwright bash -c "cd '$BOT_DIR' && '$VENV_PY' -m app.hls.browser"; then
   echo
-  echo "Running the module self-test as $BOT_USER..."
-  bot_playwright bash -c "cd '$BOT_DIR' && '$VENV_PY' -m app.hls.browser" \
-    || echo "WARN: the self-test above did not pass."
+  echo "Done. Restart the bot now:"
+  echo "  sudo systemctl restart telegram-forwarder"
 else
-  echo "4/4  ERROR: no Chromium found in $BROWSER_CACHE" >&2
-  echo "     Retry with the bot's OWN interpreter (not the system python) and -H:" >&2
+  echo "ERROR: the browser self-test above did not pass." >&2
+  echo "     It prints which build Playwright wants and what the cache holds;" >&2
+  echo "     a mismatch there means the download step failed - re-run this script" >&2
+  echo "     and read its output, or install by hand with the bot's interpreter:" >&2
   echo "       sudo -H -u $BOT_USER env PLAYWRIGHT_BROWSERS_PATH=$BROWSER_CACHE \\" >&2
   echo "         $VENV_PY -m playwright install chromium" >&2
   exit 1
 fi
-
-echo
-echo "Done. Restart the bot now:"
-echo "  sudo systemctl restart telegram-forwarder"

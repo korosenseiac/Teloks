@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -101,8 +102,7 @@ def browser_available() -> bool:
             print(f"[HLS] Browser engine unavailable: 'playwright' is not installed "
                   f"in {sys.executable} — install it as the user that runs the bot:\n"
                   f"      {sys.executable} -m pip install playwright\n"
-                  f"      {sys.executable} -m playwright install chromium\n"
-                  f"      (or simply run: sudo bash deploy/install-browser.sh)")
+                  f"{_install_hint()}")
     return _AVAILABLE
 
 
@@ -381,6 +381,45 @@ def _install_hint() -> str:
     )
 
 
+#: Playwright's launch error names the executable it wanted: "Executable doesn't
+#: exist at <path>". We quote that path back so the log says where it looked.
+_MISSING_EXE = re.compile(r"Executable doesn't exist at (.+)", re.MULTILINE)
+
+
+def _describe_cache(wanted: str) -> str:
+    """One log line: the build Playwright wants vs. what the cache holds.
+
+    "Chromium is not downloaded" covers two very different situations, and only
+    one of them needs a download:
+
+    * nothing is in the cache at all - the download never completed, and
+    * the cache holds an *older* ``chromium-<rev>`` because the ``playwright``
+      package was upgraded afterwards. Playwright only launches the build
+      matching its own version, so a 450 MB browser sits there unusable while the
+      bot reports it as missing. Re-running the download is the fix.
+
+    Printing both makes that visible instead of costing another round trip.
+    """
+    if not wanted:
+        return "      cache contains:   (unknown - Playwright did not name a path)"
+    # <cache>/chromium-<rev>/<platform dir>/<executable>
+    build = os.path.basename(os.path.dirname(os.path.dirname(wanted)))
+    cache = os.path.dirname(os.path.dirname(os.path.dirname(wanted)))
+    if not os.path.isdir(cache):
+        return f"      cache contains:   {cache} does not exist (download never ran)"
+    try:
+        builds = sorted(
+            name for name in os.listdir(cache)
+            if name.startswith(("chromium", "chrome", "ffmpeg"))
+        )
+    except Exception as e:
+        return f"      cache contains:   unreadable ({type(e).__name__}: {e})"
+    if not builds:
+        return f"      cache contains:   nothing in {cache} (download never completed)"
+    stale = "" if build in builds else "  <- OLDER than this Playwright wants"
+    return f"      cache contains:   {', '.join(builds)}{stale}"
+
+
 def _log_launch_failure(err: Exception) -> None:
     """One clear log line per failure mode, with the fix where we know it."""
     global _HINT_LOGGED
@@ -388,8 +427,18 @@ def _log_launch_failure(err: Exception) -> None:
     if "Executable doesn't exist" in message or "playwright install" in message:
         if not _HINT_LOGGED:
             _HINT_LOGGED = True
+            match = _MISSING_EXE.search(message)
+            wanted = (match.group(1).strip() if match else "")
+            # Report the cache Playwright actually used (it also honours
+            # PLAYWRIGHT_BROWSERS_PATH); fall back to the Linux default.
+            cache = (
+                os.path.dirname(os.path.dirname(os.path.dirname(wanted)))
+                if wanted else os.path.expanduser("~/.cache/ms-playwright")
+            )
             print(f"[HLS] Browser engine: Chromium is not downloaded for this user "
-                  f"(cache: {os.path.expanduser('~/.cache/ms-playwright')}).\n"
+                  f"(cache: {cache}).\n"
+                  f"      playwright wants: {wanted or '(not named in the error)'}\n"
+                  f"{_describe_cache(wanted)}\n"
                   f"{_install_hint()}")
         return
     if "shared librar" in message.lower() or "libnss" in message.lower():
