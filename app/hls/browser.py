@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -97,8 +98,11 @@ def browser_available() -> bool:
     if _AVAILABLE is None:
         _AVAILABLE = importlib.util.find_spec("playwright") is not None
         if not _AVAILABLE:
-            print("[HLS] Browser engine unavailable: 'playwright' is not installed "
-                  "(pip install playwright && python -m playwright install chromium)")
+            print(f"[HLS] Browser engine unavailable: 'playwright' is not installed "
+                  f"in {sys.executable} — install it as the user that runs the bot:\n"
+                  f"      {sys.executable} -m pip install playwright\n"
+                  f"      {sys.executable} -m playwright install chromium\n"
+                  f"      (or simply run: sudo bash deploy/install-browser.sh)")
     return _AVAILABLE
 
 
@@ -358,8 +362,11 @@ def _log_launch_failure(err: Exception) -> None:
     if "Executable doesn't exist" in message or "playwright install" in message:
         if not _HINT_LOGGED:
             _HINT_LOGGED = True
-            print("[HLS] Browser engine: Chromium is not downloaded — run "
-                  "'python -m playwright install chromium' in the bot's venv.")
+            print(f"[HLS] Browser engine: Chromium is not downloaded for this user "
+                  f"(cache: {os.path.expanduser('~/.cache/ms-playwright')}).\n"
+                  f"      Fix it as the account that runs the bot, then restart:\n"
+                  f"        sudo -u botuser {sys.executable} -m playwright install chromium\n"
+                  f"      (or simply run: sudo bash deploy/install-browser.sh)")
         return
     print(f"[HLS] Browser engine unavailable: {type(err).__name__}: {err}")
 
