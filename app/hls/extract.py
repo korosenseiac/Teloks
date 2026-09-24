@@ -35,7 +35,7 @@ import html as _html
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import SplitResult, urljoin, urlsplit
 
 from app.config import (
     HLS_PAGE_FOLLOW_EMBED,
@@ -58,13 +58,21 @@ OTHER_STREAM_EXTENSIONS = (".mpd", ".mp4", ".webm", ".flv")
 #: CSS ``url(...)`` closers, prose commas and sentence dots.
 _TRAILING_JUNK = " \"'`,;)]}.!?\\"
 
+#: Characters that can never appear raw inside a URL we would fetch. Brackets and
+#: braces matter most: a JS template literal such as ``//${host}[${id}]`` reaches
+#: ``urlsplit()`` as an unmatched ``[`` and used to abort the whole page scan with
+#: "Invalid IPv6 URL" — even when the real manifest was sitting further down the
+#: page.
+_URL_STOP = r"""\s\"'<>\\`\[\]{}$"""
+
 #: Absolute and protocol-relative URLs anywhere in the page.
-_ABS_URL = re.compile(r"""(?:https?:)?//[^\s"'<>\\`]+""", re.IGNORECASE)
+_ABS_URL = re.compile(r"""(?:https?:)?//[^""" + _URL_STOP + r"""]+""", re.IGNORECASE)
 
 #: Page-relative manifest paths, e.g. ``/hls/1234/master.m3u8``.
 #: The lookbehind stops it from re-matching the path part of a full URL.
 _REL_MANIFEST = re.compile(
-    r"""(?<![\w/])(/[^\s"'<>\\`()]*\.(?:m3u8?|mpd|mp4)[^\s"'<>\\`()]*)""",
+    r"""(?<![\w/])(/[^""" + _URL_STOP + r"""()]*\.(?:m3u8?|mpd|mp4)[^"""
+    + _URL_STOP + r"""()]*)""",
     re.IGNORECASE,
 )
 
@@ -100,28 +108,50 @@ def _unescape(text: str) -> str:
     return _html.unescape(text)
 
 
+def _safe_urlsplit(url: str) -> Optional[SplitResult]:
+    """``urlsplit`` that never raises on page junk.
+
+    Python's parser rejects an unmatched ``[`` / ``]`` in the host — which is
+    exactly what a JS template literal (``//${host}[${id}]``) or a mangled URL
+    looks like — and a broken page must never take a job down, so every parse in
+    this module goes through here. ``None`` means "not a URL we can use".
+    """
+    try:
+        return urlsplit(url)
+    except ValueError:
+        return None
+
+
 def _clean_candidate(raw: str, base_url: str) -> str:
     """Turn a raw match into an absolute URL (or ``""`` when unusable)."""
     url = (raw or "").strip().strip("\"'").rstrip(_TRAILING_JUNK)
     if not url:
         return ""
+    if url.lower().startswith(("http://", "https://")):
+        return url if _safe_urlsplit(url) else ""
     if url.startswith("//"):
-        scheme = urlsplit(base_url).scheme or "https"
-        return f"{scheme}:{url}"
+        base = _safe_urlsplit(base_url)
+        if base is None or not base.netloc:
+            return ""
+        return f"{base.scheme or 'https'}:{url}"
     if url.startswith("/"):
-        parts = urlsplit(base_url)
-        if parts.scheme and parts.netloc:
-            return f"{parts.scheme}://{parts.netloc}{url}"
+        base = _safe_urlsplit(base_url)
+        if base is None or not base.scheme or not base.netloc:
+            return ""
+        return f"{base.scheme}://{base.netloc}{url}"
+    try:
+        joined = urljoin(base_url, url)
+    except ValueError:
         return ""
-    if not url.lower().startswith(("http://", "https://")):
-        return urljoin(base_url, url)
-    return url
+    return joined if _safe_urlsplit(joined) else ""
 
 
 def _looks_like_stream(url: str) -> bool:
     """True when the URL path ends in a playable source extension."""
-    path = urlsplit(url).path.lower()
-    return path.endswith(HLS_EXTENSIONS + OTHER_STREAM_EXTENSIONS)
+    parts = _safe_urlsplit(url)
+    if parts is None:
+        return False
+    return parts.path.lower().endswith(HLS_EXTENSIONS + OTHER_STREAM_EXTENSIONS)
 
 
 def _rank(url: str) -> Tuple[int, int, int, int]:
@@ -131,7 +161,8 @@ def _rank(url: str) -> Tuple[int, int, int, int]:
     with a query string (the freshly minted, signed one) wins over a bare path,
     and ``.mpd``/``.mp4`` come last because the pipeline cannot download them.
     """
-    path = urlsplit(url).path.lower()
+    parts = _safe_urlsplit(url)
+    path = (parts.path if parts is not None else "").lower()
     is_hls = 0 if path.endswith(HLS_EXTENSIONS) else 1
     term = path.rsplit("/", 1)[-1]
     is_master = 0 if ("master" in term or "manifest" in term) else 1
@@ -175,7 +206,11 @@ def find_manifests(html: str, base_url: str, limit: int = 3) -> List[str]:
     seen = set()
 
     def _add(raw: str) -> None:
-        url = _clean_candidate(raw, base_url)
+        try:
+            url = _clean_candidate(raw, base_url)
+        except ValueError:
+            # A hostile/broken page must never abort the scan; skip the junk.
+            return
         if not url or url in seen or not _looks_like_stream(url):
             return
         seen.add(url)
@@ -205,7 +240,10 @@ def find_embed_urls(html: str, base_url: str, limit: int = 2) -> List[str]:
     seen = set()
     for match in _EMBED.finditer(text):
         raw = match.group(1) or match.group(2) or match.group(3) or ""
-        url = _clean_candidate(raw, base_url)
+        try:
+            url = _clean_candidate(raw, base_url)
+        except ValueError:
+            continue
         if not url or url in seen or not url.lower().startswith(("http://", "https://")):
             continue
         low = url.lower()
@@ -416,6 +454,35 @@ if __name__ == "__main__":
            looks_like_player_page('<script src="hls.js"></script><video id="v">'))
     _check("plain page not a player page",
            not looks_like_player_page("<html><body><p>blog post</p></body></html>"))
+
+    print("--- hostile page junk never aborts the scan ---")
+    # The production shape that broke the scan: a JS template literal with an
+    # unmatched '[' reached urlsplit() as a bad host ("Invalid IPv6 URL") and
+    # killed the whole page, even though the real manifest was further down.
+    junk_page = (
+        "<html><head><script>var tpl = `//${cdnHost}[${videoId}]/v`;"
+        "var re = /a[b]/; var x = 'https://host]x/path/master.m3u8';</script>"
+        "</head><body>"
+        '<script>var src = "https://cdn.example.com/hls/master.m3u8?t=real";</script>'
+        "</body></html>"
+    )
+    junk_base = "https://jamesbornmain.com/e/upnuod4v9rr3"
+    _check("template-literal junk skipped, real manifest still found",
+           find_manifests(junk_page, junk_base)
+           == ["https://cdn.example.com/hls/master.m3u8?t=real"],
+           str(find_manifests(junk_page, junk_base)))
+    _check("unmatched brackets dropped (no ValueError)",
+           find_manifests("x //a[b]c y //[abc z", BASE) == [],
+           str(find_manifests("x //a[b]c y //[abc z", BASE)))
+    _check("sole closing bracket dropped",
+           find_manifests('<a href="https://host]x/path/master.m3u8">a</a>', BASE) == [],
+           str(find_manifests('<a href="https://host]x/path/master.m3u8">a</a>', BASE)))
+    _check("malformed base URL tolerated (manifests)",
+           find_manifests('<source src="/hls/master.m3u8">', "https://[x/e/1") == [],
+           str(find_manifests('<source src="/hls/master.m3u8">', "https://[x/e/1")))
+    _check("malformed base URL tolerated (embeds)",
+           find_embed_urls('<iframe src="/embed/1"></iframe>', "https://[x/e/1") == [],
+           str(find_embed_urls('<iframe src="/embed/1"></iframe>', "https://[x/e/1")))
 
     print("--- page scan against a client-bound CDN (loopback) ---")
 

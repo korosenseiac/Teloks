@@ -147,10 +147,14 @@ def default_headers(url: str) -> Dict[str, str]:
 
     The origin of the stream URL is the best proxy for the page that embedded
     the player, and it is what makes a large number of otherwise-403 streams
-    work.
+    work. A malformed URL is tolerated (no ``Referer``) rather than raising:
+    page URLs come from chat messages and junk must never break a job.
     """
     headers: Dict[str, str] = {"User-Agent": _USER_AGENT, "Accept": "*/*"}
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return headers
     if parsed.scheme and parsed.netloc:
         headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
     return headers

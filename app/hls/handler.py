@@ -139,7 +139,11 @@ def _name_from_page(page_url: Optional[str]) -> Optional[str]:
     """
     if not page_url:
         return None
-    slug = os.path.basename(urlparse(page_url).path.rstrip("/"))
+    try:
+        slug = os.path.basename(urlparse(page_url).path.rstrip("/"))
+    except ValueError:
+        # Malformed URL (e.g. an unmatched '[' in the host): no name from it.
+        return None
     stem = os.path.splitext(slug)[0]
     stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._")
     if len(stem) < 3 or stem.lower() in _USELESS_SLUGS:
@@ -312,13 +316,14 @@ async def page_hls_handler(bot: Client, message: Message) -> bool:
         await message.reply_text(process_limit_message())
         return True
 
-    # A browser sends the whole document URL as Referer, not just the origin —
-    # and anti-hotlink CDNs check exactly that, both for the page fetch itself
-    # and for the candidate playlists it validates.
-    page_headers = default_headers(page_url)
-    page_headers["Referer"] = page_url
-    client = HlsClient(page_headers)
+    client: Optional[HlsClient] = None
     try:
+        # A browser sends the whole document URL as Referer, not just the origin
+        # — and anti-hotlink CDNs check exactly that, both for the page fetch
+        # and for the candidate playlists it validates.
+        page_headers = default_headers(page_url)
+        page_headers["Referer"] = page_url
+        client = HlsClient(page_headers)
         scan = await resolve_stream_from_page(
             client,
             page_url,
@@ -330,7 +335,8 @@ async def page_hls_handler(bot: Client, message: Message) -> bool:
               f"{type(e).__name__}: {e}")
         return False
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
 
     if not scan.url:
         print(f"[HLS] Page scan: no manifest in {page_url.split('?', 1)[0]} "
