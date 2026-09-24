@@ -6,6 +6,11 @@
 #
 #   sudo bash deploy/install-browser.sh          (sudo is required, see below)
 #
+# Run this from your admin user, NOT from the bot account: on AWS/Lightsail that
+# is the default 'ubuntu' user, which has passwordless sudo. 'botuser' is a
+# service account with no password and no sudo rights, so running it from there
+# only produces an unanswerable password prompt.
+#
 # Chromium lives in a *per-user* cache, so it must be installed for the account
 # that runs the bot. Running this without sudo would install it for whoever
 # typed the command and the bot would still say "Chromium is not downloaded".
@@ -28,6 +33,19 @@ die() {
 }
 
 [ -x "$VENV_PY" ] || die "Bot venv not found at $BOT_DIR/venv (set BOT_DIR=... and retry)."
+
+# The bot account is a service account: no password, no sudo rights. Running
+# this from inside it can only end in a sudo password prompt that nothing can
+# answer, so say so before that happens.
+if [ "$(id -un)" = "$BOT_USER" ] && ! sudo -n true 2>/dev/null; then
+  die "you are running this AS '$BOT_USER', which is a service account with no
+       password and no sudo rights. Leave it first and run this from your admin
+       user instead (on AWS/Lightsail that is the default 'ubuntu' user, which
+       has passwordless sudo):
+
+         exit                                    # leave the botuser shell
+         cd $BOT_DIR && sudo bash deploy/install-browser.sh"
+fi
 
 # Root can install for the bot user; a user with passwordless sudo can too.
 # Anything else would install Chromium into the WRONG user's cache, which looks
