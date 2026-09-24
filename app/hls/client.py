@@ -45,6 +45,18 @@ _SEGMENT_TIMEOUT = aiohttp.ClientTimeout(total=300, sock_connect=60, sock_read=1
 # Flush buffered bytes to disk once this many are pending.
 _FLUSH_THRESHOLD = 4 * 1024 * 1024
 
+# Headers for a *page* fetch (manifest extraction): a browser asks for HTML and
+# accepts the JSON/script wrappers some players use instead of plain markup.
+_PAGE_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,"
+              "text/plain;q=0.8,*/*;q=0.5",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_PAGE_CONTENT_TYPES = {
+    "application/xhtml+xml", "application/json", "application/ld+json",
+    "application/javascript", "application/x-javascript",
+}
+
 
 # ---------------------------------------------------------------------------
 # Proxy configuration
@@ -246,6 +258,44 @@ class HlsClient:
             return await resp.read()
 
 
+    async def fetch_page_text(
+        self, url: str, max_bytes: int = 4 * 1024 * 1024
+    ) -> Optional[str]:
+        """Fetch an HTML/JSON *page* for manifest extraction.
+
+        Returns ``None`` — instead of raising — for anything that is not a page
+        (a file download, an image, a playlist), so the caller can simply step
+        aside and let the normal handlers deal with the link. The body is read
+        up to *max_bytes*, so a huge page can never stall a job.
+        """
+        session = await self._get_session()
+        async with session.get(
+            url, headers=_PAGE_HEADERS, timeout=_TIMEOUT,
+            allow_redirects=True, ssl=False,
+        ) as resp:
+            if resp.status >= 400:
+                raise ValueError(f"HTTP {resp.status} for {url.split('?', 1)[0]}")
+            if "attachment" in (resp.headers.get("Content-Disposition") or "").lower():
+                return None
+            ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ctype and not (
+                ctype.startswith("text/")
+                or ctype in _PAGE_CONTENT_TYPES
+                or ctype.endswith(("+json", "+xml"))
+            ):
+                return None
+
+            body = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                body.extend(chunk)
+                if len(body) >= max_bytes:
+                    break
+            encoding = resp.get_encoding() or "utf-8"
+            try:
+                return bytes(body).decode(encoding, "ignore")
+            except LookupError:
+                return bytes(body).decode("utf-8", "ignore")
+
     async def download_to(
         self,
         url: str,
@@ -348,6 +398,8 @@ if __name__ == "__main__":
            args[args.index("-headers") + 1].endswith("\r\n"), str(args))
     _check("UA not duplicated into -headers",
            "User-Agent" not in args[args.index("-headers") + 1], str(args))
+    _check("page fetch asks for HTML",
+           _PAGE_HEADERS["Accept"].startswith("text/html"), str(_PAGE_HEADERS))
 
     print("--- proxy ---")
     _check("socks5 detected", is_socks_proxy("socks5://u:p@h:1080"))

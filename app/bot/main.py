@@ -38,7 +38,10 @@ from app.torrent.handler import (
     MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
 )
 from app.direct.handler import direct_link_handler, process_direct_download, DIRECT_LINK_PATTERN
-from app.hls.handler import hls_link_handler, process_hls_download, HLS_LINK_PATTERN
+from app.hls.handler import (
+    hls_link_handler, page_hls_handler, process_hls_download,
+    HLS_LINK_PATTERN, PAGE_LINK_PATTERN,
+)
 from app.utils.caption import (
     get_caption_state, clear_caption_state, list_caption_states, has_caption_state,
     get_exclude_keyboard, parse_caption_callback, set_caption_thumb,
@@ -161,6 +164,7 @@ def _start_job_from_caption_state(
                 enable_caption=enable_caption,
                 exclude_words=exclude_words,
                 url=state.get("url"),
+                page_url=state.get("page_url"),
                 slot_sid=slot_sid,
             )
         )
@@ -958,6 +962,35 @@ async def torrent_file_upload_handler(client: Client, message: Message):
     mime = getattr(doc, "mime_type", "") or ""
     if is_torrent(fname) or mime == "application/x-bittorrent":
         await torrent_file_handler(client, message)
+
+
+@app.on_message(filters.regex(PAGE_LINK_PATTERN) & filters.private, group=-3)
+async def page_hls_message_handler(client: Client, message: Message):
+    """Try to read a video *page* before every other link handler sees it.
+
+    Groups run in ascending order, so this runs before the m3u8 handler (group
+    -2) and before the Direct handler (group 0). It looks at any http(s) link
+    that no other pipeline owns, extracts the m3u8 the page embeds — minted for
+    THIS server, which is what makes client-bound signed CDNs work — and hands
+    it to the HLS pipeline.
+
+    When no manifest is found the message is NOT claimed, so the link keeps
+    flowing to the Direct handler exactly as before.
+    """
+    if not HLS_ENABLED:
+        return
+    claimed = False
+    try:
+        claimed = await page_hls_handler(client, message)
+    except StopPropagation:
+        raise  # never mask propagation control flow
+    except Exception as e:
+        # Print it ourselves: the claim below would stop Pyrogram from ever
+        # logging the original traceback.
+        print(f"[HLS] Page handler failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+    if claimed:
+        message.stop_propagation()
 
 
 @app.on_message(filters.regex(HLS_LINK_PATTERN) & filters.private, group=-2)

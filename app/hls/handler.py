@@ -13,14 +13,23 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import tempfile
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 from pyrogram import Client
 from pyrogram.types import Message
 
-from app.config import BACKUP_GROUP_ID, HLS_ENABLED
+from app.config import (
+    BACKUP_GROUP_ID,
+    HLS_ENABLED,
+    HLS_PAGE_EXTRACT,
+    HLS_PAGE_HINT,
+    HLS_PAGE_MAX_BYTES,
+    HLS_PAGE_MAX_CANDIDATES,
+)
 from app.bot.session_manager import manager
 from app.database.db import (
     get_user_session,
@@ -28,6 +37,7 @@ from app.database.db import (
     log_forward,
 )
 from app.direct.handler import (
+    EXCLUSIVE_DOMAINS,
     _generate_video_thumb,
     _get_backup_group_peer,
     _get_video_metadata,
@@ -36,9 +46,11 @@ from app.direct.handler import (
     _split_video_part,
     _upload_file_to_backup,
 )
-from app.hls.client import default_headers
+from app.hls.client import HlsClient, default_headers
 from app.hls.downloader import download_hls_to_mp4, reason_message
+from app.hls.extract import resolve_stream_from_page
 from app.hls.playlist import HLS_LINK_PATTERN
+
 from app.mediafire.streamer import FileStreamer
 from app.terabox.progress import ProgressTracker
 from app.utils.caption import (
@@ -54,6 +66,49 @@ from app.utils.streamer import SessionInvalidError
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+#: A link that *might* be a video page: any http(s) URL no other pipeline owns.
+#: The negative lookaheads stop this handler from ever stealing traffic from the
+#: HLS (``.m3u8``), torrent/magnet, terabox, mediafire and ``t.me`` handlers, and
+#: from wasting a page fetch on an obvious file download — those keep working
+#: exactly as before. The patterns of the sibling pipelines are re-checked at
+#: run time too (``_owned_by_other_pipeline``), so the list can never drift.
+PAGE_LINK_PATTERN = re.compile(
+    r"https?://"
+    r"(?!(?:" + "|".join(re.escape(d) for d in sorted(EXCLUSIVE_DOMAINS)) + r"))"
+    r"(?![^\s<>\"']*\.m3u8?(?:[?#]|$))"
+    r"(?![^\s<>\"']*\.(?:torrent|mp4|mkv|avi|mov|webm|flv|wmv|ts|mp3|m4a|aac|"
+    r"zip|rar|7z|tar|gz|pdf|docx?|xlsx?|apk|exe|iso|jpg|jpeg|png|gif|webp|"
+    r"srt|vtt|ass)(?:[?#]|$))"
+    r"[^\s<>\"']+",
+    re.IGNORECASE,
+)
+
+#: Page slugs that say nothing about the video.
+_USELESS_SLUGS = {
+    "video", "videos", "watch", "view", "embed", "player", "play", "index",
+    "page", "post", "v", "e", "w", "id", "download", "file", "stream",
+}
+
+
+def _owned_by_other_pipeline(text: str) -> bool:
+    """True when another link handler must keep this message.
+
+    Imported lazily (all of these modules are already loaded by the bot) so the
+    only thing that has to stay in sync with them is this one list.
+    """
+    from app.mediafire.handler import MEDIAFIRE_LINK_PATTERN
+    from app.terabox.handler import TERABOX_LINK_PATTERN
+    from app.torrent.handler import MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN
+
+    return any(
+        pattern.search(text)
+        for pattern in (
+            HLS_LINK_PATTERN, MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
+            TERABOX_LINK_PATTERN, MEDIAFIRE_LINK_PATTERN,
+        )
+    )
+
 
 def _name_from_url(url: str) -> str:
     """Derive a display name from an m3u8 URL (falls back to ``stream.m3u8``)."""
@@ -72,6 +127,24 @@ def _name_from_url(url: str) -> str:
     if stem.lower() in ("index", "playlist", "master", "manifest", "out") and parent:
         return f"{parent}.m3u8"
     return f"{stem}.m3u8"
+
+
+def _name_from_page(page_url: Optional[str]) -> Optional[str]:
+    """Display name from a page URL (``/video/135123-fc2-ppv-4332967.html``).
+
+    A page-derived job would otherwise be named after the CDN path
+    (``upnuod4v9rr3_,n,.urlset``), which tells the user nothing. Returns ``None``
+    when the slug carries no information, so the caller falls back to the
+    manifest URL.
+    """
+    if not page_url:
+        return None
+    slug = os.path.basename(urlparse(page_url).path.rstrip("/"))
+    stem = os.path.splitext(slug)[0]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-._")
+    if len(stem) < 3 or stem.lower() in _USELESS_SLUGS:
+        return None
+    return stem[:120]
 
 
 async def _load_custom_thumb(bot: Client, message: Message) -> Optional[bytes]:
@@ -110,11 +183,19 @@ async def _load_custom_thumb(bot: Client, message: Message) -> Optional[bytes]:
 # Entry point — called by the bot's message handler
 # ---------------------------------------------------------------------------
 
-async def hls_link_handler(bot: Client, message: Message) -> None:
-    """Validate an m3u8 link, reserve a job slot and ask about captions.
+async def _begin_hls_job(
+    bot: Client,
+    message: Message,
+    url: str,
+    *,
+    page_url: Optional[str] = None,
+) -> bool:
+    """Guard, reserve a slot and ask about captions for *url*.
 
-    The download itself only starts once the caption flow is answered (see
-    ``process_hls_download``), exactly like the Direct and Torrent handlers.
+    Shared by both entry points (a raw ``.m3u8`` link, and a page we extracted a
+    manifest from). Returns True when the message is handled — a job was started,
+    or the user was told why it cannot start — and False when HLS is disabled,
+    in which case the caller leaves the message to the Direct handler.
     """
     from app.bot.main import (
         has_free_slot, process_limit_message, reserve_process,
@@ -122,23 +203,23 @@ async def hls_link_handler(bot: Client, message: Message) -> None:
 
     if not HLS_ENABLED:
         # Nothing to do: the caller leaves the message to the Direct handler.
-        return
+        return False
 
     user_id = message.from_user.id
 
     if not has_free_slot(user_id):
         await message.reply_text(process_limit_message())
-        return
+        return True
 
     user_session = await get_user_session(user_id)
     if not user_session:
         await message.reply_text("❌ Belum login. Sila /start untuk login.")
-        return
+        return True
 
     user_client = await manager.get_client(user_id)
     if not user_client:
         await message.reply_text("❌ Sesi tidak sah. Sila login semula.")
-        return
+        return True
 
     user_profile = await get_user_profile(user_id)
     if not user_profile:
@@ -147,23 +228,21 @@ async def hls_link_handler(bot: Client, message: Message) -> None:
             "Sila set profile anda terlebih dahulu.\n\n"
             "👇 **Pilih jantina anda:**"
         )
-        return
+        return True
 
-    message_text = message.text or message.caption or ""
-    match = HLS_LINK_PATTERN.search(message_text)
-    if not match:
-        await message.reply_text("❌ Tidak dapat mengesan URL m3u8 yang sah.")
-        return
-    url = match.group(0).strip()
-
-    print(f"[HLS] user={user_id} url={url[:100]}")
+    # Never log a signed URL in full: its query string is the credential.
+    shown = url.split("?", 1)[0]
+    if page_url:
+        print(f"[HLS] user={user_id} page={page_url.split('?', 1)[0]} -> {shown[:100]}")
+    else:
+        print(f"[HLS] user={user_id} url={shown[:100]}")
 
     # Reserve the slot *before* the caption prompt: the prompt is already a job,
     # so spamming links can never start more jobs than allowed.
     slot = reserve_process(user_id, "hls", prompt_msg=message)
     if slot is None:
         await message.reply_text(process_limit_message())
-        return
+        return True
 
     status_msg = await message.reply_text(
         "🎬 **Tetapan Caption Video (HLS/m3u8)**\n\n"
@@ -183,6 +262,95 @@ async def hls_link_handler(bot: Client, message: Message) -> None:
         status_msg=status_msg,
         sid=slot.sid,
         url=url,
+        page_url=page_url or "",
+    )
+    return True
+
+
+async def hls_link_handler(bot: Client, message: Message) -> None:
+    """Validate an m3u8 link, reserve a job slot and ask about captions.
+
+    The download itself only starts once the caption flow is answered (see
+    ``process_hls_download``), exactly like the Direct and Torrent handlers.
+    """
+    message_text = message.text or message.caption or ""
+    match = HLS_LINK_PATTERN.search(message_text)
+    if not match:
+        await message.reply_text("❌ Tidak dapat mengesan URL m3u8 yang sah.")
+        return
+    await _begin_hls_job(bot, message, match.group(0).strip())
+
+
+async def page_hls_handler(bot: Client, message: Message) -> bool:
+    """Start an HLS job from a *page* link, using the manifest it embeds.
+
+    This is the cure for CDNs that only honour playlist URLs minted for the
+    client that loaded the page (the token carries that client's IP/ASN, so a
+    URL copied out of a browser gets 403 from this server whatever headers it
+    sends). Loading the page ourselves — same proxy, same headers as the
+    download — makes the site mint the playlist for *us*, and the child URLs
+    inside that master are then signed for us too.
+
+    Returns True when the message is claimed (a job started, or the user was
+    told why it cannot start) and False when the link should keep flowing to the
+    Direct handler — which is the case for every link that turns out not to be a
+    video page.
+    """
+    from app.bot.main import has_free_slot, process_limit_message
+
+    if not (HLS_ENABLED and HLS_PAGE_EXTRACT):
+        return False
+
+    message_text = message.text or message.caption or ""
+    match = PAGE_LINK_PATTERN.search(message_text)
+    if not match or _owned_by_other_pipeline(message_text):
+        return False
+    page_url = match.group(0).strip()
+
+    # Never spend a page fetch on a user who could not start a job anyway.
+    if not has_free_slot(message.from_user.id):
+        await message.reply_text(process_limit_message())
+        return True
+
+    # A browser sends the whole document URL as Referer, not just the origin —
+    # and anti-hotlink CDNs check exactly that, both for the page fetch itself
+    # and for the candidate playlists it validates.
+    page_headers = default_headers(page_url)
+    page_headers["Referer"] = page_url
+    client = HlsClient(page_headers)
+    try:
+        scan = await resolve_stream_from_page(
+            client,
+            page_url,
+            max_bytes=HLS_PAGE_MAX_BYTES,
+            limit=HLS_PAGE_MAX_CANDIDATES,
+        )
+    except Exception as e:
+        print(f"[HLS] Page scan failed for {page_url.split('?', 1)[0]}: "
+              f"{type(e).__name__}: {e}")
+        return False
+    finally:
+        await client.close()
+
+    if not scan.url:
+        print(f"[HLS] Page scan: no manifest in {page_url.split('?', 1)[0]} "
+              f"({scan.reason}, {scan.candidates} candidate(s))")
+        if HLS_PAGE_HINT and scan.player_page:
+            try:
+                await message.reply_text(
+                    "🔎 Halaman ini memainkan video tetapi pautan strimnya tidak "
+                    "boleh dibaca terus dari halaman.\n\n"
+                    "Sila hantar pautan `.m3u8` (buka video di pelayar → F12 → "
+                    "Network → tapis `m3u8` → salin pautan)."
+                )
+            except Exception:
+                pass
+        return False
+
+    print(f"[HLS] Page scan: manifest found ({scan.candidates} candidate(s)) "
+          f"via {scan.page_url.split('?', 1)[0]}")
+    return await _begin_hls_job(
+        bot, message, scan.url, page_url=scan.page_url or page_url,
     )
 
 
@@ -198,6 +366,7 @@ async def process_hls_download(
     status_msg: Message,
     *,
     url: Optional[str] = None,
+    page_url: Optional[str] = None,
     enable_caption: bool = False,
     exclude_words: Optional[str] = None,
     slot_sid: Optional[str] = None,
@@ -216,6 +385,7 @@ async def process_hls_download(
 
     user_id = user_id or message.from_user.id
     url = url or kwargs.get("url")
+    page_url = page_url or kwargs.get("page_url")
     if not url:
         await safe_edit(status_msg, "❌ URL tidak sah.")
         return
@@ -246,9 +416,13 @@ async def process_hls_download(
     )
     slot.status_msg = status_msg
 
-    file_name = _name_from_url(url)
+    # A page-derived job knows the page the player lived on: that page URL is
+    # what a browser sends as Referer, and anti-hotlink CDNs check exactly that.
+    file_name = _name_from_page(page_url) or _name_from_url(url)
     mp4_name = f"{os.path.splitext(file_name)[0]}.mp4"
     headers = default_headers(url)
+    if page_url:
+        headers["Referer"] = page_url
 
     tracker: Optional[ProgressTracker] = None
     temp_mp4: Optional[str] = None

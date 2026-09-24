@@ -115,6 +115,30 @@ HLS_TEMP_DIR = os.getenv("HLS_TEMP_DIR", "")
 # the configured SOCKS5 proxy is blocked by (or cannot reach) the HLS CDN.
 HLS_DISABLE_PROXY = os.getenv("HLS_DISABLE_PROXY", "false").lower() in ("1", "true", "yes", "on")
 
+# Page → manifest extraction. Some CDNs only accept the playlist URL *they*
+# minted for the client that loaded the page (the token embeds that client's
+# IP/ASN), so a playlist URL copied out of a browser gets 403 from this server
+# whatever headers it sends. When enabled, a *page* link is fetched with the
+# same client/proxy as the download, the m3u8 inside it is extracted, and that
+# freshly minted URL is downloaded instead — the site then signs it for us.
+# Links that turn out not to be video pages keep flowing to the Direct handler.
+HLS_PAGE_EXTRACT = os.getenv("HLS_PAGE_EXTRACT", "true").lower() in ("1", "true", "yes", "on")
+
+# Bytes of a page read while looking for a manifest (the scan stops there).
+HLS_PAGE_MAX_BYTES = int(os.getenv("HLS_PAGE_MAX_BYTES", str(4 * 1024 * 1024)))
+
+# How many candidate manifest URLs one page may offer. Each candidate is
+# verified with a real request before it is used, so this also caps that work.
+HLS_PAGE_MAX_CANDIDATES = int(os.getenv("HLS_PAGE_MAX_CANDIDATES", "3"))
+
+# Follow ONE embed/iframe hop when the submitted page has no manifest of its own
+# (players are often hidden behind /embed/…).
+HLS_PAGE_FOLLOW_EMBED = os.getenv("HLS_PAGE_FOLLOW_EMBED", "true").lower() in ("1", "true", "yes", "on")
+
+# Reply with a short hint when a page clearly embeds a player but no readable
+# manifest was found, so the user knows to send the .m3u8 link instead.
+HLS_PAGE_HINT = os.getenv("HLS_PAGE_HINT", "true").lower() in ("1", "true", "yes", "on")
+
 # ---------------------------------------------------------------------------
 # Concurrency
 # ---------------------------------------------------------------------------

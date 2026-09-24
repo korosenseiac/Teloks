@@ -193,6 +193,23 @@ HLS_REENCODE_FALLBACK=false
 # Connect directly instead of through proxy.txt for HLS downloads.
 HLS_DISABLE_PROXY=false
 
+# Page → manifest extraction. Some CDNs only accept the playlist URL they minted
+# for the client that loaded the page (the token carries that client's IP/ASN),
+# so a URL copied out of a browser gets 403 here however it is requested. When
+# enabled, a page link is fetched with the same client/proxy as the download,
+# the m3u8 inside it is extracted, and that freshly minted URL is downloaded
+# instead. Links that are not video pages keep going to the Direct handler.
+HLS_PAGE_EXTRACT=true
+
+# Bytes of a page read while scanning / how many candidate URLs it may offer
+# (every candidate is verified with a real request before it is used) / follow
+# one embed-iframe hop when the page itself has no manifest / hint the user when
+# a player page yielded nothing readable.
+HLS_PAGE_MAX_BYTES=4194304
+HLS_PAGE_MAX_CANDIDATES=3
+HLS_PAGE_FOLLOW_EMBED=true
+HLS_PAGE_HINT=true
+
 # Leave empty to write MP4s into the system temp dir (cleanup is automatic).
 HLS_TEMP_DIR=
 
