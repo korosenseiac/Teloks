@@ -7,3 +7,7 @@ aiohttp
 aiohttp-socks
 rarfile
 Pillow
+# Optional: last-resort headless browser for pages whose stream URL is only built
+# in JavaScript. The package is small; the browser itself is fetched once with:
+#   python -m playwright install chromium        (see deploy/install-browser.sh)
+playwright

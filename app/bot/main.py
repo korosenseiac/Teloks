@@ -165,6 +165,7 @@ def _start_job_from_caption_state(
                 exclude_words=exclude_words,
                 url=state.get("url"),
                 page_url=state.get("page_url"),
+                force_direct=state.get("force_direct"),
                 slot_sid=slot_sid,
             )
         )

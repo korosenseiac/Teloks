@@ -73,6 +73,21 @@ cd $BOT_DIR
 sudo -u botuser $BOT_DIR/venv/bin/pip install -r requirements.txt --upgrade
 echo -e "${GREEN}[✓]${NC} Dependencies updated"
 
+# Step 4.6: Optional headless browser for JS-only player pages
+# (see app/hls/browser.py). Idempotent and never fatal: the HLS pipeline works
+# without it. Set SKIP_BROWSER=1 to skip the ~170 MB download.
+if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwright" 2>/dev/null; then
+    BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-/home/botuser/.cache/ms-playwright}"
+    if ls "$BROWSER_CACHE"/chromium-* >/dev/null 2>&1; then
+        echo -e "${GREEN}[✓]${NC} Headless browser already installed"
+    else
+        echo "Installing headless Chromium (~170 MB) for JS-only player pages..."
+        sudo -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+            $BOT_DIR/venv/bin/python -m playwright install chromium \
+            || echo -e "${YELLOW}[!]${NC} Chromium install failed (disk/RAM?) - continuing without it; retry later with: bot browser"
+    fi
+fi
+
 # Step 4.5: Update management script
 echo -e "${BLUE}[4.5/5] Updating management script...${NC}"
 cat > /usr/local/bin/bot << 'EOF'
@@ -145,6 +160,20 @@ case "$1" in
         sudo -u botuser $BOT_DIR/venv/bin/pip install -r requirements.txt --upgrade
         echo "Dependencies updated."
         echo ""
+        # Optional headless browser for JS-only player pages (idempotent,
+        # never fatal). Set SKIP_BROWSER=1 to skip the ~170 MB download.
+        if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwright" 2>/dev/null; then
+            BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-/home/botuser/.cache/ms-playwright}"
+            if ls "$BROWSER_CACHE"/chromium-* >/dev/null 2>&1; then
+                echo "Headless browser already installed."
+            else
+                echo "Installing headless Chromium (~170 MB) for JS-only player pages..."
+                sudo -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+                    $BOT_DIR/venv/bin/python -m playwright install chromium \
+                    || echo "WARN: Chromium install failed (disk/RAM?) - continuing without it. Retry with: bot browser"
+            fi
+        fi
+        echo ""
         echo "[5/5] Starting bot..."
         sudo systemctl start $SERVICE_NAME
         echo "Bot started."
@@ -155,6 +184,13 @@ case "$1" in
         echo "Backup: $BACKUP_DIR"
         echo "Check status: bot status"
         echo "View logs: bot logs"
+        ;;
+    browser)
+        echo "========================================="
+        echo "  Optional Headless Browser (HLS)"
+        echo "========================================="
+        echo ""
+        sudo bash $BOT_DIR/deploy/install-browser.sh
         ;;
     *)
         echo "Telegram Forwarder Bot Management"
@@ -170,6 +206,7 @@ case "$1" in
         echo "  logs-tail   - Show last N logs (default 100)"
         echo "  edit-env    - Edit environment variables"
         echo "  edit-proxy  - Edit HTTP proxy configuration"
+        echo "  browser     - Install/verify the optional headless browser"
         echo "  update      - Pull latest version from GitHub and restart"
         ;;
 esac

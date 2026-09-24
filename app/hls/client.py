@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote, urlparse
 
 import aiohttp
@@ -61,6 +61,13 @@ _PAGE_CONTENT_TYPES = {
 # ---------------------------------------------------------------------------
 # Proxy configuration
 # ---------------------------------------------------------------------------
+
+#: Sentinel for ``HlsClient(proxy_url=...)``: "decide from proxy.txt" (default).
+#: Pass ``None`` to force a direct connection for one job — used when the page
+#: was resolved by a browser that could not use the configured proxy, so the
+#: token it minted is bound to the direct address.
+AUTO_PROXY = object()
+
 
 def read_proxy_url() -> Optional[str]:
     """Build a proxy URL from ``proxy.txt`` (or the deployed fallback path).
@@ -191,10 +198,18 @@ class HlsClient:
     finished job can never close the session of a second concurrent job.
     """
 
-    def __init__(self, headers: Optional[Dict[str, str]] = None) -> None:
+    def __init__(
+        self,
+        headers: Optional[Dict[str, str]] = None,
+        proxy_url: Any = AUTO_PROXY,
+    ) -> None:
         self.headers = dict(headers or {})
         self._session: Optional[aiohttp.ClientSession] = None
-        self._proxy_url: Optional[str] = read_proxy_url()
+        # AUTO_PROXY (the default) follows proxy.txt; None forces a direct
+        # connection for this client only (see app/hls/browser.py).
+        self._proxy_url: Optional[str] = (
+            read_proxy_url() if proxy_url is AUTO_PROXY else proxy_url
+        )
 
     # ------------------------------------------------------------- session
 

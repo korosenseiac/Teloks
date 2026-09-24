@@ -123,6 +123,20 @@ sudo -u $BOT_USER $BOT_DIR/venv/bin/pip install --upgrade pip
 sudo -u $BOT_USER $BOT_DIR/venv/bin/pip install -r requirements.txt
 print_status "Virtual environment created and dependencies installed"
 
+# Optional: headless Chromium for player pages whose stream URL is only built in
+# JavaScript (app/hls/browser.py). Skip with SKIP_BROWSER=1; never fatal.
+if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwright" 2>/dev/null; then
+    BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-/home/$BOT_USER/.cache/ms-playwright}"
+    if ls "$BROWSER_CACHE"/chromium-* >/dev/null 2>&1; then
+        print_status "Headless browser already installed"
+    else
+        print_info "Installing headless Chromium (~170 MB) for JS-only player pages..."
+        sudo -u $BOT_USER env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+            $BOT_DIR/venv/bin/python -m playwright install chromium \
+            || print_warning "Chromium install failed (disk/RAM?) - the bot works without it; retry later with: bash deploy/install-browser.sh"
+    fi
+fi
+
 # Step 6: Create .env file template if not exists
 echo ""
 echo -e "${BLUE}Step 6: Setting up environment configuration...${NC}"
@@ -209,6 +223,19 @@ HLS_PAGE_MAX_BYTES=4194304
 HLS_PAGE_MAX_CANDIDATES=3
 HLS_PAGE_FOLLOW_EMBED=true
 HLS_PAGE_HINT=true
+
+# Headless-browser fallback for pages whose stream URL is only built in
+# JavaScript (obfuscated players, bot/fingerprint checks, no m3u8 in the HTML).
+# Requires the optional component: run  bash deploy/install-browser.sh  once.
+# Without it this stage is skipped and the page scan behaves as before.
+HLS_BROWSER_ENABLED=true
+HLS_BROWSER_TIMEOUT=60
+HLS_BROWSER_IDLE=120
+HLS_BROWSER_MAX_CONCURRENCY=1
+# auto = use proxy.txt (falls back to direct for an authenticated SOCKS5 proxy,
+# which Chromium cannot use); none = always direct.
+HLS_BROWSER_PROXY=auto
+HLS_BROWSER_BLOCK_ADS=true
 
 # Leave empty to write MP4s into the system temp dir (cleanup is automatic).
 HLS_TEMP_DIR=

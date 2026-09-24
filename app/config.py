@@ -139,6 +139,33 @@ HLS_PAGE_FOLLOW_EMBED = os.getenv("HLS_PAGE_FOLLOW_EMBED", "true").lower() in ("
 # manifest was found, so the user knows to send the .m3u8 link instead.
 HLS_PAGE_HINT = os.getenv("HLS_PAGE_HINT", "true").lower() in ("1", "true", "yes", "on")
 
+# Headless-browser fallback (optional). Some hosts build the playlist URL inside
+# obfuscated JavaScript behind device/bot fingerprinting — there is no .m3u8 in
+# the HTML and no JSON endpoint to call, so only running the page can reach it.
+# With Playwright + Chromium installed the page is opened once, the first m3u8
+# request is captured, and that URL (minted for OUR egress, which is what makes
+# signed CDNs work) is downloaded normally. Without the package this is skipped.
+#   install: pip install playwright && python -m playwright install chromium
+HLS_BROWSER_ENABLED = os.getenv("HLS_BROWSER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+# Seconds to wait for the page to request its manifest.
+HLS_BROWSER_TIMEOUT = int(os.getenv("HLS_BROWSER_TIMEOUT", "60"))
+
+# Chromium is closed again after this many idle seconds (frees ~400 MB RAM).
+HLS_BROWSER_IDLE = int(os.getenv("HLS_BROWSER_IDLE", "120"))
+
+# How many browser jobs may run at once (each context costs RAM).
+HLS_BROWSER_MAX_CONCURRENCY = int(os.getenv("HLS_BROWSER_MAX_CONCURRENCY", "1"))
+
+# Browser proxy: "auto" uses proxy.txt, "none" goes direct. Chromium cannot use
+# an authenticated SOCKS5 proxy, so "auto" falls back to a direct connection
+# there (with a log line).
+HLS_BROWSER_PROXY = os.getenv("HLS_BROWSER_PROXY", "auto").strip().lower()
+
+# Abort ads/images/fonts/CSS and known ad hosts while scanning: faster, cheaper,
+# and it keeps the page from pulling megabytes of ad media.
+HLS_BROWSER_BLOCK_ADS = os.getenv("HLS_BROWSER_BLOCK_ADS", "true").lower() in ("1", "true", "yes", "on")
+
 # ---------------------------------------------------------------------------
 # Concurrency
 # ---------------------------------------------------------------------------

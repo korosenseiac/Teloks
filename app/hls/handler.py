@@ -16,7 +16,7 @@ import os
 import re
 import shutil
 import tempfile
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from pyrogram import Client
@@ -24,6 +24,8 @@ from pyrogram.types import Message
 
 from app.config import (
     BACKUP_GROUP_ID,
+    HLS_BROWSER_ENABLED,
+    HLS_BROWSER_TIMEOUT,
     HLS_ENABLED,
     HLS_PAGE_EXTRACT,
     HLS_PAGE_HINT,
@@ -46,7 +48,8 @@ from app.direct.handler import (
     _split_video_part,
     _upload_file_to_backup,
 )
-from app.hls.client import HlsClient, default_headers
+from app.hls.browser import browser_available, resolve_stream_with_browser
+from app.hls.client import AUTO_PROXY, HlsClient, default_headers, read_proxy_url
 from app.hls.downloader import download_hls_to_mp4, reason_message
 from app.hls.extract import resolve_stream_from_page
 from app.hls.playlist import HLS_LINK_PATTERN
@@ -193,6 +196,7 @@ async def _begin_hls_job(
     url: str,
     *,
     page_url: Optional[str] = None,
+    force_direct: bool = False,
 ) -> bool:
     """Guard, reserve a slot and ask about captions for *url*.
 
@@ -267,6 +271,7 @@ async def _begin_hls_job(
         sid=slot.sid,
         url=url,
         page_url=page_url or "",
+        force_direct=force_direct,
     )
     return True
 
@@ -283,6 +288,58 @@ async def hls_link_handler(bot: Client, message: Message) -> None:
         await message.reply_text("❌ Tidak dapat mengesan URL m3u8 yang sah.")
         return
     await _begin_hls_job(bot, message, match.group(0).strip())
+
+
+async def _browser_stage(
+    message: Message,
+    page_url: str,
+    fallback_page: str,
+) -> Tuple[str, str, bool]:
+    """Resolve the manifest by running the page in a headless browser.
+
+    Last resort for hosts that build the playlist URL inside obfuscated JS behind
+    bot/device fingerprinting (no ``.m3u8`` in the HTML, no JSON API to call).
+    Returns ``(url, page_url, force_direct)``; ``("", fallback_page, False)`` when
+    the engine is not installed, the page yields nothing, or anything goes
+    wrong — the caller then behaves exactly as before.
+
+    ``force_direct`` is True when Chromium had to connect directly while
+    ``proxy.txt`` is configured: the token it just minted is bound to that direct
+    address, so the download must use the same egress or it would 403.
+    """
+    if not HLS_BROWSER_ENABLED or not browser_available():
+        return "", fallback_page, False
+
+    status_msg = None
+    try:
+        # This stage can take a while, so say something instead of staying quiet.
+        status_msg = await message.reply_text("🌐 Membuka halaman di pelayar…")
+    except Exception:
+        status_msg = None
+
+    try:
+        scan = await resolve_stream_with_browser(page_url, timeout=HLS_BROWSER_TIMEOUT)
+    except Exception as e:
+        print(f"[HLS] Browser stage failed for {page_url.split('?', 1)[0]}: "
+              f"{type(e).__name__}: {e}")
+        return "", fallback_page, False
+    finally:
+        if status_msg is not None:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+    if scan.url:
+        force_direct = (not scan.used_proxy) and read_proxy_url() is not None
+        if force_direct:
+            print("[HLS] Browser had to go direct while proxy.txt is configured — "
+                  "this job will download directly too, so the minted URL matches "
+                  "the address it was minted for")
+        return scan.url, page_url, force_direct
+    print(f"[HLS] Browser stage: no manifest in {page_url.split('?', 1)[0]} "
+          f"({scan.reason or 'unknown'})")
+    return "", fallback_page, False
 
 
 async def page_hls_handler(bot: Client, message: Message) -> bool:
@@ -338,9 +395,19 @@ async def page_hls_handler(bot: Client, message: Message) -> bool:
         if client is not None:
             await client.close()
 
-    if not scan.url:
+    url = scan.url or ""
+    page_used = scan.page_url or page_url
+    force_direct = False
+
+    if not url:
         print(f"[HLS] Page scan: no manifest in {page_url.split('?', 1)[0]} "
               f"({scan.reason}, {scan.candidates} candidate(s))")
+        # Last resort: JS-only players. Run the page in Chromium and take the
+        # first m3u8 it requests — that URL is minted for OUR egress, which is
+        # also what makes client-bound signed CDNs work.
+        url, page_used, force_direct = await _browser_stage(message, page_url, page_used)
+
+    if not url:
         if HLS_PAGE_HINT and scan.player_page:
             try:
                 await message.reply_text(
@@ -353,10 +420,9 @@ async def page_hls_handler(bot: Client, message: Message) -> bool:
                 pass
         return False
 
-    print(f"[HLS] Page scan: manifest found ({scan.candidates} candidate(s)) "
-          f"via {scan.page_url.split('?', 1)[0]}")
+    print(f"[HLS] Page scan: manifest found via {page_used.split('?', 1)[0]}")
     return await _begin_hls_job(
-        bot, message, scan.url, page_url=scan.page_url or page_url,
+        bot, message, url, page_url=page_used, force_direct=force_direct,
     )
 
 
@@ -373,6 +439,7 @@ async def process_hls_download(
     *,
     url: Optional[str] = None,
     page_url: Optional[str] = None,
+    force_direct: bool = False,
     enable_caption: bool = False,
     exclude_words: Optional[str] = None,
     slot_sid: Optional[str] = None,
@@ -392,6 +459,7 @@ async def process_hls_download(
     user_id = user_id or message.from_user.id
     url = url or kwargs.get("url")
     page_url = page_url or kwargs.get("page_url")
+    force_direct = bool(force_direct or kwargs.get("force_direct"))
     if not url:
         await safe_edit(status_msg, "❌ URL tidak sah.")
         return
@@ -472,6 +540,9 @@ async def process_hls_download(
             on_chunk=_on_chunk,
             on_meta=_on_meta,
             out_dir=work_dir,
+            # A page resolved by a browser that had to go direct must download
+            # directly too: its token is bound to that address.
+            proxy_url=None if force_direct else AUTO_PROXY,
         )
 
         tracker = holder["tracker"]

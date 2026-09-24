@@ -57,6 +57,7 @@ from app.config import (
     HLS_TIMEOUT,
 )
 from app.hls.client import (
+    AUTO_PROXY,
     HlsClient,
     default_headers,
     ffmpeg_header_args,
@@ -796,6 +797,7 @@ async def download_hls_to_mp4(
     out_dir: Optional[str] = None,
     max_height: Optional[int] = None,
     max_duration: Optional[int] = None,
+    proxy_url: Any = AUTO_PROXY,
 ) -> HlsResult:
     """Download an HLS stream and remux it into a local MP4.
 
@@ -823,6 +825,11 @@ async def download_hls_to_mp4(
         temp directory.
     max_height, max_duration : int | None
         Per-job overrides of ``HLS_MAX_HEIGHT`` / ``HLS_MAX_DURATION``.
+    proxy_url : str | None
+        ``AUTO_PROXY`` (default) follows ``proxy.txt``; ``None`` forces a direct
+        connection for this job, which is what a page resolved by the headless
+        browser needs when that browser could not use the proxy (the token it
+        minted is bound to the address that asked for it).
 
     Returns
     -------
@@ -840,7 +847,7 @@ async def download_hls_to_mp4(
         return result
 
     base_headers = dict(headers) if headers else default_headers(url)
-    client = HlsClient(headers=base_headers)
+    client = HlsClient(headers=base_headers, proxy_url=proxy_url)
 
     height_cap = HLS_MAX_HEIGHT if max_height is None else max_height
     duration_cap = HLS_MAX_DURATION if max_duration is None else max_duration
