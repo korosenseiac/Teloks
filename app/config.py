@@ -68,6 +68,54 @@ CONVERT_CONCURRENCY = int(os.getenv("CONVERT_CONCURRENCY", "1"))
 CONVERT_TEMP_DIR = os.getenv("CONVERT_TEMP_DIR", "")
 
 # ---------------------------------------------------------------------------
+# HLS / m3u8 → MP4 (download + stream-copy remux)
+# ---------------------------------------------------------------------------
+# Enabled by default. The stream is downloaded (parallel, SOCKS5-proxy aware)
+# and remuxed into MP4 with the SAME method as MKV → MP4 above: ffmpeg stream
+# copy, no re-encode, no quality loss. Every failure path falls back to the
+# next engine, and a complete failure reports an error instead of uploading a
+# broken file.
+HLS_ENABLED = os.getenv("HLS_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+# Which download engine to use:
+#   auto     — proxy-aware Python segment downloader first, ffmpeg as fallback
+#              (recommended: the segment downloader is parallel AND routes
+#               through the same proxy.txt SOCKS5 tunnel as every other
+#               download in this bot, which ffmpeg cannot use)
+#   segments — Python segment downloader only
+#   ffmpeg   — let ffmpeg fetch the playlist itself (single process, sequential,
+#              no SOCKS5 support)
+HLS_ENGINE = os.getenv("HLS_ENGINE", "auto").strip().lower()
+
+# Highest variant to keep from a master playlist (0 = best available).
+# e.g. 720 downloads the best variant up to 720p, which keeps MP4s small.
+HLS_MAX_HEIGHT = int(os.getenv("HLS_MAX_HEIGHT", "0"))
+
+# Cap the recording length in seconds. Live streams (no #EXT-X-ENDLIST) never
+# end on their own, and a very long VOD would fill the disk before uploading;
+# 0 disables the cap (live streams then record until the user taps 🚫 Batal).
+HLS_MAX_DURATION = int(os.getenv("HLS_MAX_DURATION", "0"))
+
+# Parallel segment downloads and per-segment retries.
+HLS_SEGMENT_WORKERS = int(os.getenv("HLS_SEGMENT_WORKERS", "4"))
+HLS_SEGMENT_RETRIES = int(os.getenv("HLS_SEGMENT_RETRIES", "3"))
+
+# Hard timeout (seconds) for one ffmpeg download/remux before it is killed.
+HLS_TIMEOUT = int(os.getenv("HLS_TIMEOUT", "1800"))
+
+# Last-resort full re-encode when the stream cannot be stream-copied at all
+# (rare: exotic codecs). Costs CPU time — off by default.
+HLS_REENCODE_FALLBACK = os.getenv("HLS_REENCODE_FALLBACK", "false").lower() in ("1", "true", "yes", "on")
+
+# Where the finished MP4 is written. Empty = the system temp dir (the job's own
+# temp directory owns the cleanup, plus cleanup_orphaned_hls_dirs() at startup).
+HLS_TEMP_DIR = os.getenv("HLS_TEMP_DIR", "")
+
+# Ignore proxy.txt for HLS downloads and connect directly instead. Useful when
+# the configured SOCKS5 proxy is blocked by (or cannot reach) the HLS CDN.
+HLS_DISABLE_PROXY = os.getenv("HLS_DISABLE_PROXY", "false").lower() in ("1", "true", "yes", "on")
+
+# ---------------------------------------------------------------------------
 # Concurrency
 # ---------------------------------------------------------------------------
 # How many download/upload jobs a SINGLE user may run at the same time.

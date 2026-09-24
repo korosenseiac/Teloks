@@ -21,7 +21,7 @@ from pyrogram.raw.types import (
     InputPeerChannel,
     InputFile
 )
-from app.config import API_ID, API_HASH, BOT_TOKEN, BACKUP_GROUP_ID
+from app.config import API_ID, API_HASH, BOT_TOKEN, BACKUP_GROUP_ID, HLS_ENABLED
 from app.database.db import add_user, save_user_session, log_forward, get_user_session, save_backup_group_cache, get_backup_group_cache, get_user_profile
 from app.bot.session_manager import manager
 from app.bot import process_registry
@@ -38,6 +38,7 @@ from app.torrent.handler import (
     MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
 )
 from app.direct.handler import direct_link_handler, process_direct_download, DIRECT_LINK_PATTERN
+from app.hls.handler import hls_link_handler, process_hls_download, HLS_LINK_PATTERN
 from app.utils.caption import (
     get_caption_state, clear_caption_state, list_caption_states, has_caption_state,
     get_exclude_keyboard, parse_caption_callback, set_caption_thumb,
@@ -150,6 +151,16 @@ def _start_job_from_caption_state(
                 exclude_words=exclude_words,
                 url=state.get("url"),
                 skip_non_videos=state.get("skip_non_videos", False),
+                slot_sid=slot_sid,
+            )
+        )
+    elif source_type == "hls":
+        asyncio.create_task(
+            process_hls_download(
+                client, user_id, orig_msg, status_msg,
+                enable_caption=enable_caption,
+                exclude_words=exclude_words,
+                url=state.get("url"),
                 slot_sid=slot_sid,
             )
         )
@@ -947,6 +958,32 @@ async def torrent_file_upload_handler(client: Client, message: Message):
     mime = getattr(doc, "mime_type", "") or ""
     if is_torrent(fname) or mime == "application/x-bittorrent":
         await torrent_file_handler(client, message)
+
+
+@app.on_message(filters.regex(HLS_LINK_PATTERN) & filters.private, group=-2)
+async def hls_link_message_handler(client: Client, message: Message):
+    """Intercept .m3u8 / .m3u links BEFORE the Direct handler sees them.
+
+    The Direct handler matches any http(s) link and would download the playlist
+    itself as a document, so this runs in a lower group (groups are sorted by
+    number, so -2 always runs before group 0) and stops propagation once the HLS
+    job owns the message.
+
+    When HLS support is disabled the handler returns without stopping
+    propagation, so the link keeps flowing to the Direct handler as before.
+    """
+    if not HLS_ENABLED:
+        return
+    try:
+        await hls_link_handler(client, message)
+    except StopPropagation:
+        raise  # never mask propagation control flow
+    except Exception as e:
+        # Print it ourselves: the claim below would stop Pyrogram from ever
+        # logging the original traceback.
+        print(f"[HLS] Handler failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+    message.stop_propagation()
 
 
 @app.on_message(filters.regex(DIRECT_LINK_PATTERN) & filters.private)

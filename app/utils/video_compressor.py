@@ -106,6 +106,16 @@ def _sem() -> asyncio.Semaphore:
     return _SEM
 
 
+def convert_semaphore() -> asyncio.Semaphore:
+    """Public accessor for the shared remux semaphore.
+
+    Other pipelines (e.g. the HLS → MP4 remux in ``app/hls/downloader.py``) use
+    this so the VPS never runs more conversions at once than
+    ``CONVERT_CONCURRENCY`` allows, whatever the source format is.
+    """
+    return _sem()
+
+
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------

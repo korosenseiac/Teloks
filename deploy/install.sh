@@ -164,6 +164,38 @@ CONVERT_CONCURRENCY=1
 # pipeline's own temp dir (recommended — cleanup is automatic).
 CONVERT_TEMP_DIR=
 
+# ---------------------------------------------------------------------------
+# HLS / m3u8 → MP4 (download + stream-copy remux, same method as MKV → MP4)
+# ---------------------------------------------------------------------------
+# Enabled by default. m3u8 links are downloaded and remuxed to MP4 (ffmpeg
+# -c copy, no quality loss) instead of ending up as a playlist document.
+HLS_ENABLED=true
+
+# auto = proxy-aware parallel segment downloader first, ffmpeg as fallback
+# (recommended: only the segment downloader can use the proxy.txt SOCKS5 route).
+HLS_ENGINE=auto
+
+# Highest variant kept from a master playlist (0 = best available).
+HLS_MAX_HEIGHT=0
+
+# Max recording length in seconds. Live streams never end by themselves; 0
+# disables the cap (they then record until the user taps 🚫 Batal).
+HLS_MAX_DURATION=0
+
+# Parallel segment downloads / retries per segment / ffmpeg hard timeout (s).
+HLS_SEGMENT_WORKERS=4
+HLS_SEGMENT_RETRIES=3
+HLS_TIMEOUT=1800
+
+# Last-resort full re-encode when a stream cannot be stream-copied at all.
+HLS_REENCODE_FALLBACK=false
+
+# Connect directly instead of through proxy.txt for HLS downloads.
+HLS_DISABLE_PROXY=false
+
+# Leave empty to write MP4s into the system temp dir (cleanup is automatic).
+HLS_TEMP_DIR=
+
 # How many download/upload jobs ONE user may run at the same time. Each job has
 # its own "🚫 Batal" button, and a job that is still waiting at the caption
 # prompt already counts against this limit. 2 doubles per-user throughput;
