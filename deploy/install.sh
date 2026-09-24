@@ -125,9 +125,21 @@ print_status "Virtual environment created and dependencies installed"
 
 # Optional: headless Chromium for player pages whose stream URL is only built in
 # JavaScript (app/hls/browser.py). Skip with SKIP_BROWSER=1; never fatal.
+#
+# The check asks Playwright for the exact executable it launches instead of
+# globbing chromium-* in the cache: a build left by an older Playwright (or by an
+# install that ran with the wrong HOME) satisfies a glob but cannot be launched,
+# so the download below would be skipped while the bot reports Chromium missing.
+browser_ready() {
+    sudo -H -u "$BOT_USER" env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+        "$BOT_DIR/venv/bin/python" -c 'import os, sys
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    sys.exit(0 if os.path.exists(p.chromium.executable_path) else 1)' 2>/dev/null
+}
 if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwright" 2>/dev/null; then
     BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-/home/$BOT_USER/.cache/ms-playwright}"
-    if ls "$BROWSER_CACHE"/chromium-* >/dev/null 2>&1; then
+    if browser_ready; then
         print_status "Headless browser already installed"
     else
         print_info "Installing headless Chromium (~170 MB) for JS-only player pages..."

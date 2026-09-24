@@ -20,6 +20,21 @@ SERVICE_NAME="telegram-forwarder"
 REPO_URL="https://github.com/korosenseiac/Teloks.git"
 BACKUP_DIR="/opt/telegram-forwarder-bot-backup-$(date +%Y%m%d_%H%M%S)"
 
+# Is Playwright's own Chromium really there? ($1 = bot user, default botuser)
+#
+# Ask Playwright for the exact executable it launches and test that path. A stale
+# chromium-* directory left by an older Playwright - or by an install that ran
+# with the wrong HOME - passes a `ls chromium-*` glob while the bot still reports
+# "Chromium is not downloaded", so the ~170 MB download gets silently skipped on
+# every update. Playwright only launches the build matching its own version.
+browser_ready() {
+    sudo -H -u "${1:-botuser}" env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+        "$BOT_DIR/venv/bin/python" -c 'import os, sys
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    sys.exit(0 if os.path.exists(p.chromium.executable_path) else 1)' 2>/dev/null
+}
+
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}  Telegram Forwarder Bot - Updater${NC}"
 echo -e "${BLUE}========================================${NC}"
@@ -78,7 +93,7 @@ echo -e "${GREEN}[✓]${NC} Dependencies updated"
 # without it. Set SKIP_BROWSER=1 to skip the ~170 MB download.
 if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwright" 2>/dev/null; then
     BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-/home/botuser/.cache/ms-playwright}"
-    if ls "$BROWSER_CACHE"/chromium-* >/dev/null 2>&1; then
+    if browser_ready botuser; then
         echo -e "${GREEN}[✓]${NC} Headless browser already installed"
     else
         echo "Installing headless Chromium (~170 MB) for JS-only player pages..."
@@ -101,6 +116,17 @@ cat > /usr/local/bin/bot << 'EOF'
 
 SERVICE_NAME="telegram-forwarder"
 BOT_DIR="/opt/telegram-forwarder-bot"
+
+# Is Playwright's own Chromium really there? A stale chromium-* from an older
+# Playwright passes `ls chromium-*` but cannot be launched, which is how the
+# download below used to be skipped forever. Ask Playwright for its own path.
+browser_ready() {
+    sudo -H -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+        "$BOT_DIR/venv/bin/python" -c 'import os, sys
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    sys.exit(0 if os.path.exists(p.chromium.executable_path) else 1)' 2>/dev/null
+}
 
 case "$1" in
     start)
@@ -170,7 +196,7 @@ case "$1" in
         # never fatal). Set SKIP_BROWSER=1 to skip the ~170 MB download.
         if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwright" 2>/dev/null; then
             BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-/home/botuser/.cache/ms-playwright}"
-            if ls "$BROWSER_CACHE"/chromium-* >/dev/null 2>&1; then
+            if browser_ready; then
                 echo "Headless browser already installed."
             else
                 echo "Installing headless Chromium (~170 MB) for JS-only player pages..."

@@ -110,15 +110,28 @@ echo "4/4  Verifying..."
 # Ask Playwright itself which executable it launches. A `chromium-*` directory
 # listing proves nothing: a stale build left by an older Playwright passes that
 # check while the bot still reports Chromium as missing.
-bot_playwright "$VENV_PY" -c '
-import os, sys
+WANTED="$(bot_playwright "$VENV_PY" -c '
 from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
-    path = p.chromium.executable_path
-print("  wanted:", path)
-print("  exists:", os.path.exists(path))
-sys.exit(0 if os.path.exists(path) else 1)
-' || echo "     (the build above does not match this Playwright version)"
+    print(p.chromium.executable_path)
+' 2>/dev/null || true)"
+if [ -n "$WANTED" ] && [ -x "$WANTED" ]; then
+  echo "     wanted: $WANTED"
+  echo "     exists: yes"
+else
+  echo "     wanted: ${WANTED:-<unknown - Playwright could not report it>}"
+  echo "     exists: NO - the download above did not produce this build"
+fi
+
+# Builds from an older Playwright are unusable (~450 MB each): Playwright only
+# launches the revision matching its own version. Name the leftovers so the disk
+# can be reclaimed instead of quietly filling up.
+for build in "$BROWSER_CACHE"/chromium-*; do
+  [ -d "$build" ] || continue
+  case "$WANTED" in "$build"/*) continue ;; esac
+  echo "     NOTE: $(basename "$build") is not the build this Playwright launches"
+  echo "           (unusable, ~450 MB) - free it with: sudo rm -rf $build"
+done
 
 # Chromium copies from earlier attempts under other accounts just waste disk.
 for stale in /home/*/.cache/ms-playwright /root/.cache/ms-playwright; do
