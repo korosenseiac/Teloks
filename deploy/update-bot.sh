@@ -82,7 +82,13 @@ if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwr
         echo -e "${GREEN}[✓]${NC} Headless browser already installed"
     else
         echo "Installing headless Chromium (~170 MB) for JS-only player pages..."
-        sudo -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+        # Libraries first (as root), then the browser into the BOT user's cache.
+        # -H and an explicit PLAYWRIGHT_BROWSERS_PATH matter: plain "sudo -u"
+        # keeps the invoking user's HOME, which would put Chromium in the wrong
+        # cache while the bot reports "Chromium is not downloaded".
+        $BOT_DIR/venv/bin/python -m playwright install-deps chromium \
+            || echo -e "${YELLOW}[!]${NC} install-deps failed - continuing"
+        sudo -H -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
             $BOT_DIR/venv/bin/python -m playwright install chromium \
             || echo -e "${YELLOW}[!]${NC} Chromium install failed (disk/RAM?) - continuing without it; retry later with: bot browser"
     fi
@@ -168,7 +174,12 @@ case "$1" in
                 echo "Headless browser already installed."
             else
                 echo "Installing headless Chromium (~170 MB) for JS-only player pages..."
-                sudo -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+                # Libraries as root, browser as the bot user with -H (a plain
+                # "sudo -u" keeps the caller's HOME and downloads to the wrong
+                # cache, which the bot then cannot find).
+                sudo $BOT_DIR/venv/bin/python -m playwright install-deps chromium \
+                    || echo "WARN: install-deps failed - continuing."
+                sudo -H -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
                     $BOT_DIR/venv/bin/python -m playwright install chromium \
                     || echo "WARN: Chromium install failed (disk/RAM?) - continuing without it. Retry with: bot browser"
             fi

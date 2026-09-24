@@ -131,7 +131,11 @@ if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwr
         print_status "Headless browser already installed"
     else
         print_info "Installing headless Chromium (~170 MB) for JS-only player pages..."
-        sudo -u $BOT_USER env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+        # Libraries as root, browser as the bot user with -H: a plain "sudo -u"
+        # keeps the caller's HOME, so Chromium would land in the wrong cache.
+        $BOT_DIR/venv/bin/python -m playwright install-deps chromium \
+            || print_warning "install-deps failed - retry: $BOT_DIR/venv/bin/python -m playwright install-deps chromium"
+        sudo -H -u $BOT_USER env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
             $BOT_DIR/venv/bin/python -m playwright install chromium \
             || print_warning "Chromium install failed (disk/RAM?) - the bot works without it; retry later with: bash deploy/install-browser.sh"
     fi

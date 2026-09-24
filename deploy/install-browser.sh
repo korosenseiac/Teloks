@@ -66,37 +66,60 @@ BOT_HOME="$(getent passwd "$BOT_USER" | cut -d: -f6 || true)"
 BOT_HOME="${BOT_HOME:-/home/$BOT_USER}"
 BROWSER_CACHE="${PLAYWRIGHT_BROWSERS_PATH:-$BOT_HOME/.cache/ms-playwright}"
 
+# Chromium must land in the BOT user's cache. Running the download as that user
+# is NOT enough on its own: sudo keeps the *invoking* user's HOME unless -H is
+# given, so the browser would quietly be installed into /home/ubuntu/.cache and
+# the bot would keep reporting "Chromium is not downloaded". So: run as the bot
+# user, with -H, and pin PLAYWRIGHT_BROWSERS_PATH as well.
+bot_playwright() {
+  sudo -H -u "$BOT_USER" env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" "$@"
+}
+
 echo "Bot user:       $BOT_USER"
 echo "Browser cache:  $BROWSER_CACHE"
 echo "Disk space:"
 df -h "$BOT_DIR" | tail -1
 echo
 
-echo "1/3  Installing the Playwright package..."
-sudo -u "$BOT_USER" "$VENV_PY" -m pip install --upgrade -q playwright
+echo "1/4  Installing the Playwright package..."
+bot_playwright "$VENV_PY" -m pip install --upgrade -q playwright
 
 echo
-echo "2/3  Downloading Chromium (~170 MB download, ~450 MB on disk)..."
+echo "2/4  Installing Chromium's system libraries (apt, needs root)..."
+# `playwright install --with-deps` must NOT be used here: it would call sudo
+# itself, from inside the bot account, and hang on a password that account does
+# not have. Dependencies and the download are two separate steps.
 if [ "$WITH_DEPS" = "1" ]; then
-  # --with-deps needs root: it installs the shared libraries Chromium needs.
-  sudo -u "$BOT_USER" "$VENV_PY" -m playwright install --with-deps chromium
+  "$VENV_PY" -m playwright install-deps chromium \
+    || echo "WARN: install-deps failed - retry later with: $VENV_PY -m playwright install-deps chromium"
 else
-  sudo -u "$BOT_USER" "$VENV_PY" -m playwright install chromium
-  echo "NOTE: if Chromium complains about missing libraries, run:"
-  echo "      sudo $VENV_PY -m playwright install-deps chromium"
+  sudo "$VENV_PY" -m playwright install-deps chromium \
+    || echo "WARN: install-deps failed - retry later with: sudo $VENV_PY -m playwright install-deps chromium"
 fi
 
 echo
+echo "3/4  Downloading Chromium into $BROWSER_CACHE ..."
+bot_playwright "$VENV_PY" -m playwright install chromium
+
+echo
 if ls "$BROWSER_CACHE"/chromium-* >/dev/null 2>&1; then
-  echo "3/3  Chromium is in place: $(ls -d "$BROWSER_CACHE"/chromium-* | head -1)"
+  echo "4/4  Chromium is in place: $(ls -d "$BROWSER_CACHE"/chromium-* | head -1)"
+  # Chromium copies from earlier attempts under other accounts just waste disk.
+  for stale in /home/*/.cache/ms-playwright /root/.cache/ms-playwright; do
+    [ -d "$stale" ] || continue
+    [ "$stale" = "$BROWSER_CACHE" ] && continue
+    echo "     NOTE: an unused copy from an earlier run is at $stale"
+    echo "           (safe to delete, frees ~450 MB): sudo rm -rf $stale"
+  done
   echo
   echo "Running the module self-test as $BOT_USER..."
-  sudo -u "$BOT_USER" bash -c "cd '$BOT_DIR' && '$VENV_PY' -m app.hls.browser" \
+  bot_playwright bash -c "cd '$BOT_DIR' && '$VENV_PY' -m app.hls.browser" \
     || echo "WARN: the self-test above did not pass."
 else
-  echo "3/3  ERROR: no Chromium found in $BROWSER_CACHE" >&2
-  echo "     Retry with the bot's OWN interpreter (not the system python):" >&2
-  echo "       sudo -u $BOT_USER $VENV_PY -m playwright install chromium" >&2
+  echo "4/4  ERROR: no Chromium found in $BROWSER_CACHE" >&2
+  echo "     Retry with the bot's OWN interpreter (not the system python) and -H:" >&2
+  echo "       sudo -H -u $BOT_USER env PLAYWRIGHT_BROWSERS_PATH=$BROWSER_CACHE \\" >&2
+  echo "         $VENV_PY -m playwright install chromium" >&2
   exit 1
 fi
 
