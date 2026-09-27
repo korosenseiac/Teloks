@@ -56,6 +56,21 @@ def _restricted_connector() -> aiohttp.TCPConnector:
     return aiohttp.TCPConnector(ssl=_TERABOX_SSL_CTX)
 
 
+def _is_valid_id(value: Any) -> bool:
+    """
+    True only for a real, non-zero TeraBox numeric id.
+
+    TeraBox share pages are SPAs that ship *placeholder* metadata
+    (``"shareid":0``, ``"uk":0``) before their XHR completes — and the
+    string ``"0"`` is truthy in Python, so a plain ``if result["shareid"]``
+    silently turns "page not readable" into "success".
+    """
+    if value is None:
+        return False
+    text = str(value).strip()
+    return text.isdigit() and int(text) > 0
+
+
 # ---------------------------------------------------------------------------
 # TeraBoxClient
 # ---------------------------------------------------------------------------
@@ -347,12 +362,26 @@ class TeraBoxClient:
         """
         base = f"https://{share_host}" if share_host else self.domain
 
+        # A new link means every piece of share state from the previous one
+        # is stale (the client is a singleton shared by all users).
+        self.reset_share_state()
+
         # -------- Strategy 1: Browser-session scrape --------
         page_data = await self._scrape_share_page(base, surl)
-        if page_data and page_data.get("shareid"):
-            print(f"[TB] short_url_info → got data from scrape")
+        if page_data and _is_valid_id(page_data.get("shareid")):
+            print(
+                f"[TB] short_url_info → got valid data from scrape "
+                f"(shareid={page_data['shareid']})"
+            )
             self._apply_randsk(page_data)
-            return {**page_data, "errno": 0}
+            return await self._complete_share_info(
+                {**page_data, "errno": 0}, surl, share_host
+            )
+        if page_data:
+            print(
+                f"[TB] short_url_info → scrape rejected: shareid="
+                f"{page_data.get('shareid')!r} is a placeholder — trying REST API"
+            )
 
         # -------- Strategy 2: REST API with multiple configs --------
         browser_ua = (
@@ -409,7 +438,17 @@ class TeraBoxClient:
                             errno = data.get("errno", -1)
                             print(f"[TB] short_url_info({desc}) ← HTTP {resp.status} | errno={errno} | keys={list(data.keys())}")
                             if errno == 0:
-                                return data
+                                if _is_valid_id(data.get("shareid")):
+                                    self._apply_randsk(data)
+                                    return await self._complete_share_info(
+                                        data, surl, share_host
+                                    )
+                                print(
+                                    f"[TB] short_url_info({desc}) → errno=0 but "
+                                    f"placeholder shareid={data.get('shareid')!r}, continuing"
+                                )
+                                last_data = data
+                                continue
                             last_data = data
                             if errno not in (400210, -6):
                                 return data  # Non-verify error, stop trying
@@ -419,6 +458,58 @@ class TeraBoxClient:
 
         print(f"[TB] short_url_info → all strategies exhausted")
         return last_data
+
+    async def _complete_share_info(
+        self,
+        info: Dict[str, Any],
+        surl: str,
+        share_host: Optional[str],
+    ) -> Dict[str, Any]:
+        """
+        Ensure the payload actually carries a usable root file list.
+
+        ``/api/shorturlinfo`` returns the share *metadata*
+        (shareid/uk/sign/timestamp/randsk) while the root listing is served
+        by ``/share/list``.  Without this step the handler would receive
+        ``errno=0`` with an empty ``file_list`` — i.e. the misleading
+        "no files in this link" case.
+        """
+        items = info.get("file_list") or info.get("list") or []
+        if items:
+            info["file_list"] = items
+            return info
+
+        # /s/ codes always carry the 1-char type prefix (see _scrape_one_domain).
+        prefix_surl = surl if surl.startswith("1") else ("1" + surl)
+        print("[TB] _complete_share_info → metadata only, fetching root list via short_url_list")
+        listing = await self.short_url_list(prefix_surl, "", share_host=share_host)
+        if listing and listing.get("errno") == 0:
+            items = listing.get("list") or listing.get("file_list") or []
+            if items:
+                info["list"] = items
+                info["file_list"] = items
+                print(f"[TB] _complete_share_info → got {len(items)} root item(s)")
+                return info
+        print("[TB] _complete_share_info → share/list returned no items")
+        return info
+
+    def reset_share_state(self) -> None:
+        """
+        Forget everything learned about the *previous* share.
+
+        ``TeraBoxClient`` is a module-level singleton, so share tokens would
+        otherwise leak from one link to the next — and the placeholder
+        ``"0"`` written by a failed scrape could never be overwritten because
+        ``_apply_randsk`` used to skip non-empty attributes.
+        """
+        self._share_uk = ""
+        self._share_id = ""
+        self._share_sign = ""
+        self._share_timestamp = ""
+        self._randsk = ""
+        self._share_jar = None
+        self._share_domain = ""
+        self._scrape_seen_domains = []
 
     def _apply_randsk(self, data: Dict[str, Any]) -> None:
         """Extract share auth tokens from an API response and store them."""
@@ -445,7 +536,10 @@ class TeraBoxClient:
                     f"| added randsk for {self._share_domain}"
                 )
 
-        # Store share identifiers needed for share/list
+        # Store share identifiers needed for share/list.
+        # Real values always overwrite older ones (a placeholder "0" written
+        # by an earlier failed scrape must never stick) and placeholders are
+        # rejected outright.
         for src, attr in [
             ("uk", "_share_uk"), ("uk_str", "_share_uk"),
             ("shareid", "_share_id"),
@@ -453,7 +547,12 @@ class TeraBoxClient:
             ("timestamp", "_share_timestamp"),
         ]:
             val = data.get(src)
-            if val and not getattr(self, attr, ""):
+            if not val:
+                continue
+            if attr in ("_share_uk", "_share_id") and not _is_valid_id(val):
+                print(f"[TB] _apply_share_tokens → ignoring placeholder {attr}={val!r}")
+                continue
+            if str(val) != getattr(self, attr, ""):
                 setattr(self, attr, str(val))
 
         print(
@@ -492,7 +591,7 @@ class TeraBoxClient:
         for domain in domains:
             print(f"[TB] _scrape → domain {domain}")
             result = await self._scrape_one_domain(domain, surl, browser_ua, mobile_ua)
-            if result and result.get("shareid"):
+            if result and _is_valid_id(result.get("shareid")):
                 return result
 
         print(f"[TB] _scrape → all domains/endpoints failed")
@@ -610,11 +709,16 @@ class TeraBoxClient:
                         print(f"[TB]   {desc} → got jsToken")
 
                     result = self._parse_share_html(html)
-                    if result and result.get("shareid"):
+                    if result and _is_valid_id(result.get("shareid")):
                         print(f"[TB]   {desc} → SUCCESS shareid={result['shareid']}")
                         self._share_jar = jar
                         self._share_domain = resp_domain
                         return result
+                    if result:
+                        print(
+                            f"[TB]   {desc} → parsed placeholder shareid="
+                            f"{result.get('shareid')!r}, ignoring"
+                        )
 
                 # ------ Step 3: Try REST API on redirect-target domains ------
                 # Pages redirected to different domains (e.g. 1024terabox.com →
@@ -681,9 +785,19 @@ class TeraBoxClient:
     def _parse_share_html(html: str) -> Optional[Dict[str, Any]]:
         """
         Extract share data (shareid, uk, file_list) from TeraBox HTML.
-        Tries multiple known patterns.
+        Tries multiple known patterns, and only accepts a result that carries
+        a *real* (non-zero) shareid — TeraBox SPA shells embed placeholder
+        ``"shareid":0`` / ``"uk":0`` values (with an empty ``fileList``) that
+        must never be mistaken for a readable share.
         """
         result: Dict[str, Any] = {}
+
+        def _accept(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            """Return *payload* only when it carries a real (non-placeholder) id."""
+            if _is_valid_id(payload.get("shareid")):
+                payload["_meta_only"] = not payload.get("file_list")
+                return payload
+            return None
 
         # Pattern 1: window.__INITIAL_STATE__ = {...}
         for pat in (
@@ -700,20 +814,34 @@ class TeraBoxClient:
                         if isinstance(v, dict) and ("shareid" in v or "share_id" in v):
                             share = v
                             break
+                    if not _is_valid_id(share.get("shareid") or share.get("share_id")):
+                        # SPA shell: the real node lives at <state>.share.shareInfo
+                        for v in state.values():
+                            if isinstance(v, dict) and isinstance(v.get("shareInfo"), dict):
+                                share = v["shareInfo"]
+                                print("[TB]   __INITIAL_STATE__ → using .share.shareInfo node")
+                                break
                     result["shareid"] = str(share.get("shareid") or share.get("share_id", ""))
                     result["uk"] = str(share.get("uk") or share.get("owner_id", ""))
                     fl = share.get("file_list") or share.get("list", [])
                     if isinstance(fl, dict):
                         fl = fl.get("list", [])
+                    if not fl:
+                        fl = share.get("fileList") or state.get("fileList") or []
                     result["file_list"] = fl
-                    if result.get("shareid"):
-                        return result
+                    ok = _accept(result)
+                    if ok:
+                        return ok
+                    print(
+                        f"[TB]   __INITIAL_STATE__ placeholder shareid="
+                        f"{result['shareid']!r} → discarded"
+                    )
                 except json.JSONDecodeError as e:
                     print(f"[TB]   __INITIAL_STATE__ JSON error: {e}")
                 break
 
         # Pattern 2: locals.init({...})
-        if not result.get("shareid"):
+        if not _is_valid_id(result.get("shareid")):
             m = re.search(r'locals\.init\((\{.+?\})\)', html, re.DOTALL)
             if m:
                 try:
@@ -722,13 +850,14 @@ class TeraBoxClient:
                     result["shareid"] = str(data.get("shareid", ""))
                     result["uk"] = str(data.get("uk", ""))
                     result["file_list"] = data.get("file_list", [])
-                    if result.get("shareid"):
-                        return result
+                    ok = _accept(result)
+                    if ok:
+                        return ok
                 except json.JSONDecodeError:
                     pass
 
         # Pattern 3: window.jsData = {...}
-        if not result.get("shareid"):
+        if not _is_valid_id(result.get("shareid")):
             m = re.search(r'window\.jsData\s*=\s*(\{.+?\})\s*;', html, re.DOTALL)
             if m:
                 try:
@@ -740,13 +869,14 @@ class TeraBoxClient:
                     if isinstance(fl, dict):
                         fl = fl.get("list", [])
                     result["file_list"] = fl
-                    if result.get("shareid"):
-                        return result
+                    ok = _accept(result)
+                    if ok:
+                        return ok
                 except json.JSONDecodeError:
                     pass
 
         # Pattern 4: Any large JSON object in <script> with shareid
-        if not result.get("shareid"):
+        if not _is_valid_id(result.get("shareid")):
             for script_m in re.finditer(
                 r'<script[^>]*>([^<]{200,})</script>', html, re.DOTALL
             ):
@@ -768,22 +898,31 @@ class TeraBoxClient:
                             if isinstance(fl, dict):
                                 fl = fl.get("list", [])
                             result["file_list"] = fl
-                            if result.get("shareid"):
-                                return result
+                            ok = _accept(result)
+                            if ok:
+                                return ok
                     except (json.JSONDecodeError, ValueError):
                         continue
 
-        # Pattern 5: Regex extraction (last resort)
-        if not result.get("shareid"):
+        # Pattern 5: Regex extraction (last resort).
+        # TeraBox SPA shells always ship "shareid":0 / "uk":0 in their
+        # bootstrapping state, so a match that is not a positive id means
+        # "page not readable" — never a valid share.
+        if not _is_valid_id(result.get("shareid")):
             sid = re.search(r'"shareid"\s*:\s*"?(\d+)"?', html)
             uk = re.search(r'"uk"\s*:\s*"?(\d+)"?', html)
-            if sid:
-                result["shareid"] = sid.group(1)
-            if uk:
-                result["uk"] = uk.group(1)
-            if result.get("shareid"):
+            raw_sid = sid.group(1) if sid else None
+            raw_uk = uk.group(1) if uk else None
+            if _is_valid_id(raw_sid):
+                result["shareid"] = raw_sid
+                result["uk"] = str(raw_uk) if raw_uk else ""
+                result["file_list"] = result.get("file_list") or []
                 print(f"[TB]   regex fallback: shareid={result['shareid']} uk={result.get('uk')}")
-                return result
+                return _accept(result)
+            print(
+                f"[TB]   regex fallback matched shareid={raw_sid!r} uk={raw_uk!r} "
+                f"→ rejected (placeholder)"
+            )
 
         # Debug: log script tags
         scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)

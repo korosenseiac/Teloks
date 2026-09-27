@@ -647,11 +647,32 @@ async def terabox_link_handler(bot: Client, message: Message) -> None:
         from_uk = str(info.get("uk", ""))
         print(f"[TB:handler] share_id={share_id!r} from_uk={from_uk!r}")
 
+        # A real share always has positive numeric ids — "0"/"0" is the
+        # placeholder an unreadable SPA page reports (see _is_valid_id).
+        if not (share_id.isdigit() and int(share_id) > 0
+                and from_uk.isdigit() and int(from_uk) > 0):
+            print(f"[TB:handler] incomplete share metadata: {info}")
+            await safe_edit(status_msg,
+                "❌ Tidak dapat membaca maklumat link ini. "
+                "Sila cuba semula atau guna link lain."
+            )
+            return
+
         # 3. Transfer ALL share items into a temp folder on YOUR TeraBox account first.
         #    We do this because share/list throws errno=105, so we navigate locally.
         root_items = info.get("file_list") or info.get("list", [])
         if not root_items:
-            await safe_edit(status_msg, "❌ Tiada fail dijumpai dalam link ini.")
+            # Last chance: metadata is valid but the listing was not part of the
+            # shorturlinfo payload — ask /share/list for the root directory.
+            print("[TB:handler] no root items in metadata — retrying via short_url_list")
+            await safe_edit(status_msg, "🔍 Membaca senarai fail…")
+            listing = await tb.short_url_list(surl, "", share_host=share_host)
+            if listing and listing.get("errno") == 0:
+                root_items = listing.get("list") or listing.get("file_list") or []
+        if not root_items:
+            await safe_edit(status_msg,
+                f"❌ Link ini tidak dapat dibaca atau tiada fail. (errno={info.get('errno', '?')})"
+            )
             return
 
         temp_folder = f"/terabox_temp_{uuid.uuid4().hex[:12]}"
