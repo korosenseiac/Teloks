@@ -14,7 +14,7 @@ import re
 import ssl
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import yarl
@@ -69,6 +69,93 @@ def _is_valid_id(value: Any) -> bool:
         return False
     text = str(value).strip()
     return text.isdigit() and int(text) > 0
+
+
+def _find_share_info_node(
+    node: Any, parent: Optional[Dict[str, Any]] = None, depth: int = 0
+) -> Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]]:
+    """
+    Depth-first search for the dict that carries a *real* share id.
+
+    TeraBox keeps moving its payload around: older pages exposed it as
+    ``state["share"]``; current pages nest it at
+    ``state["pinia"]["share"]["shareInfo"]``.  Instead of hard-coding a path,
+    walk the whole decoded state and accept the first node that has both a
+    positive ``shareid`` and a positive owner ``uk`` (the SPA also ships a
+    decoy ``"uk": 0`` in its logged-out user store).
+    """
+    if depth > 12:
+        return None
+    if isinstance(node, dict):
+        if _is_valid_id(node.get("shareid")) and (
+            _is_valid_id(node.get("uk")) or _is_valid_id(node.get("owner_id"))
+        ):
+            return node, parent
+        for value in node.values():
+            found = _find_share_info_node(value, node, depth + 1)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for value in node[:50]:
+            found = _find_share_info_node(value, parent, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def _find_file_list_node(node: Any, depth: int = 0) -> List[Dict[str, Any]]:
+    """Return the longest list of file entries (dicts carrying ``fs_id``)."""
+    if depth > 12:
+        return []
+    best: List[Dict[str, Any]] = []
+    if isinstance(node, list):
+        if node and all(isinstance(x, dict) and "fs_id" in x for x in node[:3]):
+            best = [x for x in node if isinstance(x, dict)]
+        else:
+            for value in node[:50]:
+                candidate = _find_file_list_node(value, depth + 1)
+                if len(candidate) > len(best):
+                    best = candidate
+    elif isinstance(node, dict):
+        for value in node.values():
+            candidate = _find_file_list_node(value, depth + 1)
+            if len(candidate) > len(best):
+                best = candidate
+    return best
+
+
+def _find_json_object(text: str, start: int) -> Optional[str]:
+    """
+    Return the brace-balanced ``{...}`` object that begins at *start*.
+
+    Used by the regex fallback to lift a ``"shareInfo": {...}`` blob out of
+    raw HTML without being fooled by nested objects (a non-greedy regex stops
+    at the first inner ``}``).  String literals and escapes are respected.
+    """
+    if start < 0 or start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:idx + 1]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -368,10 +455,19 @@ class TeraBoxClient:
 
         # -------- Strategy 1: Browser-session scrape --------
         page_data = await self._scrape_share_page(base, surl)
-        if page_data and _is_valid_id(page_data.get("shareid")):
+        # A usable payload needs BOTH a real shareid and the owner uk: the
+        # owner id is what /share/list (and share_transfer) key on, so a
+        # "shareid but no uk" scrape is only a half-answer and must not stop
+        # us from trying the REST API.
+        if (
+            page_data
+            and _is_valid_id(page_data.get("shareid"))
+            and _is_valid_id(page_data.get("uk"))
+        ):
             print(
                 f"[TB] short_url_info → got valid data from scrape "
-                f"(shareid={page_data['shareid']})"
+                f"(shareid={page_data['shareid']} uk={page_data['uk']} "
+                f"files={len(page_data.get('file_list') or [])})"
             )
             self._apply_randsk(page_data)
             return await self._complete_share_info(
@@ -379,9 +475,13 @@ class TeraBoxClient:
             )
         if page_data:
             print(
-                f"[TB] short_url_info → scrape rejected: shareid="
-                f"{page_data.get('shareid')!r} is a placeholder — trying REST API"
+                f"[TB] short_url_info → scrape incomplete: shareid="
+                f"{page_data.get('shareid')!r} uk={page_data.get('uk')!r} — "
+                f"trying REST API"
             )
+        # Keep whatever the scrape managed to read so the handler can report a
+        # meaningful "incomplete metadata" error if the API is blocked too.
+        scrape_fallback = page_data
 
         # -------- Strategy 2: REST API with multiple configs --------
         browser_ua = (
@@ -457,7 +557,7 @@ class TeraBoxClient:
                     continue
 
         print(f"[TB] short_url_info → all strategies exhausted")
-        return last_data
+        return last_data or scrape_fallback
 
     async def _complete_share_info(
         self,
@@ -477,6 +577,16 @@ class TeraBoxClient:
         items = info.get("file_list") or info.get("list") or []
         if items:
             info["file_list"] = items
+            return info
+
+        # /share/list keys on the owner uk.  Without it the request can only
+        # come back errno=105 ("share not found"), so don't waste the round
+        # trips — the handler will surface an "incomplete metadata" error.
+        if not _is_valid_id(self._share_uk):
+            print(
+                "[TB] _complete_share_info → owner uk is missing/placeholder; "
+                "skipping /share/list"
+            )
             return info
 
         # /s/ codes always carry the 1-char type prefix (see _scrape_one_domain).
@@ -710,7 +820,11 @@ class TeraBoxClient:
 
                     result = self._parse_share_html(html)
                     if result and _is_valid_id(result.get("shareid")):
-                        print(f"[TB]   {desc} → SUCCESS shareid={result['shareid']}")
+                        print(
+                            f"[TB]   {desc} → SUCCESS shareid={result['shareid']} "
+                            f"uk={result.get('uk')} "
+                            f"files={len(result.get('file_list') or [])}"
+                        )
                         self._share_jar = jar
                         self._share_domain = resp_domain
                         return result
@@ -785,60 +899,87 @@ class TeraBoxClient:
     def _parse_share_html(html: str) -> Optional[Dict[str, Any]]:
         """
         Extract share data (shareid, uk, file_list) from TeraBox HTML.
+
         Tries multiple known patterns, and only accepts a result that carries
-        a *real* (non-zero) shareid — TeraBox SPA shells embed placeholder
-        ``"shareid":0`` / ``"uk":0`` values (with an empty ``fileList``) that
-        must never be mistaken for a readable share.
+        a *real* (non-zero) shareid **and** owner uk — TeraBox SPA shells
+        embed placeholder ``"shareid":0`` / ``"uk":0`` values (with an empty
+        ``fileList``) that must never be mistaken for a readable share.  The
+        payload is searched recursively because the current pages nest it at
+        ``__INITIAL_STATE__.pinia.share.shareInfo``.
         """
         result: Dict[str, Any] = {}
 
         def _accept(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            """Return *payload* only when it carries a real (non-placeholder) id."""
-            if _is_valid_id(payload.get("shareid")):
+            """Return *payload* only when it has a real shareid and owner uk."""
+            if _is_valid_id(payload.get("shareid")) and _is_valid_id(payload.get("uk")):
                 payload["_meta_only"] = not payload.get("file_list")
                 return payload
             return None
 
         # Pattern 1: window.__INITIAL_STATE__ = {...}
-        for pat in (
-            r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});\s*</script',
-            r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});\s*\n',
-        ):
-            m = re.search(pat, html, re.DOTALL)
-            if m:
-                try:
-                    state = json.loads(m.group(1))
-                    print(f"[TB]   found __INITIAL_STATE__ keys={list(state.keys())[:12]}")
-                    share = state
-                    for k, v in state.items():
-                        if isinstance(v, dict) and ("shareid" in v or "share_id" in v):
-                            share = v
-                            break
-                    if not _is_valid_id(share.get("shareid") or share.get("share_id")):
-                        # SPA shell: the real node lives at <state>.share.shareInfo
-                        for v in state.values():
-                            if isinstance(v, dict) and isinstance(v.get("shareInfo"), dict):
-                                share = v["shareInfo"]
-                                print("[TB]   __INITIAL_STATE__ → using .share.shareInfo node")
+        # Brace-match the blob instead of using a non-greedy regex, so nested
+        # objects and "};" sequences inside strings can never truncate it.
+        state_m = re.search(r'window\.__INITIAL_STATE__\s*=\s*', html)
+        state_blob = _find_json_object(html, state_m.end()) if state_m else None
+        if state_blob:
+            try:
+                state = json.loads(state_blob)
+                print(f"[TB]   found __INITIAL_STATE__ keys={list(state.keys())[:12]}")
+
+                found = _find_share_info_node(state)
+                if found:
+                    share, parent = found
+                    file_list: List[Dict[str, Any]] = []
+                    # The root listing normally sits next to shareInfo
+                    # (pinia.share.shareFiles); fall back to a deep search.
+                    if parent:
+                        for key in ("shareFiles", "fileList", "file_list", "list"):
+                            value = parent.get(key)
+                            if isinstance(value, list) and value:
+                                file_list = value
                                 break
-                    result["shareid"] = str(share.get("shareid") or share.get("share_id", ""))
-                    result["uk"] = str(share.get("uk") or share.get("owner_id", ""))
-                    fl = share.get("file_list") or share.get("list", [])
-                    if isinstance(fl, dict):
-                        fl = fl.get("list", [])
-                    if not fl:
-                        fl = share.get("fileList") or state.get("fileList") or []
-                    result["file_list"] = fl
+                    if not file_list:
+                        file_list = _find_file_list_node(state)
+                    if not file_list:
+                        # Deep links carry a single file in shareInfo.fileInfo.
+                        file_info = share.get("fileInfo")
+                        if isinstance(file_info, dict) and file_info.get("fs_id"):
+                            file_list = [file_info]
+
+                    result["shareid"] = str(
+                        share.get("shareid") or share.get("share_id") or ""
+                    )
+                    result["uk"] = str(share.get("uk") or share.get("owner_id") or "")
+                    result["sign"] = str(share.get("sign") or "")
+                    result["timestamp"] = str(share.get("timestamp") or "")
+                    result["file_list"] = file_list
+
+                    print(
+                        f"[TB]   shareInfo → shareid={result['shareid']} "
+                        f"uk={result['uk']} files={len(file_list)}"
+                    )
+                    total = share.get("filesTotal")
+                    if total is not None and file_list and _is_valid_id(total):
+                        if int(total) != len(file_list):
+                            print(
+                                f"[TB]   WARNING: shareInfo.filesTotal={total} but "
+                                f"SSR listed {len(file_list)} entry/entries — "
+                                f"the listing may be paginated"
+                            )
+
                     ok = _accept(result)
                     if ok:
                         return ok
                     print(
-                        f"[TB]   __INITIAL_STATE__ placeholder shareid="
-                        f"{result['shareid']!r} → discarded"
+                        f"[TB]   __INITIAL_STATE__ rejected shareid="
+                        f"{result['shareid']!r} uk={result['uk']!r} → discarded"
                     )
-                except json.JSONDecodeError as e:
-                    print(f"[TB]   __INITIAL_STATE__ JSON error: {e}")
-                break
+                else:
+                    print(
+                        "[TB]   __INITIAL_STATE__ → no node with shareid+uk found"
+                    )
+            except json.JSONDecodeError as e:
+                print(f"[TB]   __INITIAL_STATE__ JSON error: {e}")
 
         # Pattern 2: locals.init({...})
         if not _is_valid_id(result.get("shareid")):
@@ -907,22 +1048,58 @@ class TeraBoxClient:
         # Pattern 5: Regex extraction (last resort).
         # TeraBox SPA shells always ship "shareid":0 / "uk":0 in their
         # bootstrapping state, so a match that is not a positive id means
-        # "page not readable" — never a valid share.
+        # "page not readable" — never a valid share.  Crucially, both ids must
+        # come from the SAME object: current pages also carry unrelated
+        # "uk":0 entries (logged-out user store), and pairing the real
+        # shareid with such a placeholder is what produced the misleading
+        # errno=105 on /share/list.
         if not _is_valid_id(result.get("shareid")):
-            sid = re.search(r'"shareid"\s*:\s*"?(\d+)"?', html)
-            uk = re.search(r'"uk"\s*:\s*"?(\d+)"?', html)
-            raw_sid = sid.group(1) if sid else None
-            raw_uk = uk.group(1) if uk else None
-            if _is_valid_id(raw_sid):
-                result["shareid"] = raw_sid
-                result["uk"] = str(raw_uk) if raw_uk else ""
+            share_info: Optional[Dict[str, Any]] = None
+            info_m = re.search(r'"shareInfo"\s*:\s*(\{)', html)
+            if info_m:
+                blob = _find_json_object(html, info_m.start(1))
+                if blob:
+                    try:
+                        candidate = json.loads(blob)
+                    except json.JSONDecodeError:
+                        candidate = None
+                    if (
+                        isinstance(candidate, dict)
+                        and _is_valid_id(candidate.get("shareid"))
+                        and _is_valid_id(candidate.get("uk"))
+                    ):
+                        share_info = candidate
+
+            if share_info:
+                result["shareid"] = str(
+                    share_info.get("shareid") or share_info.get("share_id") or ""
+                )
+                result["uk"] = str(
+                    share_info.get("uk") or share_info.get("owner_id") or ""
+                )
+                result["sign"] = str(share_info.get("sign") or "")
+                result["timestamp"] = str(share_info.get("timestamp") or "")
                 result["file_list"] = result.get("file_list") or []
-                print(f"[TB]   regex fallback: shareid={result['shareid']} uk={result.get('uk')}")
+                print(
+                    f"[TB]   regex fallback (shareInfo JSON): shareid="
+                    f"{result['shareid']} uk={result['uk']}"
+                )
                 return _accept(result)
-            print(
-                f"[TB]   regex fallback matched shareid={raw_sid!r} uk={raw_uk!r} "
-                f"→ rejected (placeholder)"
+
+            pair = re.search(
+                r'"shareid"\s*:\s*"?(\d+)"?\s*,\s*"uk"\s*:\s*"?(\d+)"?', html
             )
+            if pair and _is_valid_id(pair.group(1)) and _is_valid_id(pair.group(2)):
+                result["shareid"] = pair.group(1)
+                result["uk"] = pair.group(2)
+                result["file_list"] = result.get("file_list") or []
+                print(
+                    f"[TB]   regex fallback (paired ids): shareid={result['shareid']} "
+                    f"uk={result['uk']}"
+                )
+                return _accept(result)
+
+            print("[TB]   regex fallback → no real shareid+uk pair found")
 
         # Debug: log script tags
         scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
