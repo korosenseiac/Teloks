@@ -2163,6 +2163,337 @@ class TestHls403FixesAndStealth(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.cleanup()
 
+    async def test_extract_skips_mp4_and_decodes_voe_json(self):
+        import base64
+
+        def _encode_voe(payload_obj) -> str:
+            raw2 = json.dumps(payload_obj).encode("utf-8")
+            rev = base64.b64encode(raw2)
+            shifted = rev[::-1]
+            raw1 = bytes((b + 3) % 256 for b in shifted)
+            b64_1 = base64.b64encode(raw1).decode("ascii")
+            # Inject VOE junk tokens, then ROT13.
+            obf = f"{b64_1[:8]}@${b64_1[8:16]}^^{b64_1[16:]}"
+            return obf.translate(extract_mod._VOE_ROT13_TRANS)
+
+        encoded_cfg = _encode_voe({
+            "fallback": "https://cdn.example.com/clip.mp4",
+            "source": "https://stream.example.com/hls/master.m3u8?token=abc123",
+        })
+        oversized_block = json.dumps(["A" * (extract_mod._VOE_MAX_BLOCK_CHARS + 50)])
+        html = (
+            '<html><body>'
+            '<video src="https://cdn.example.com/Big_Buck_Bunny_1080_10s_5MB.mp4"></video>'
+            '<script type="application/json">["not-valid-voe!!@@"]</script>'
+            f'<script type="application/json">{oversized_block}</script>'
+            f'<script type="application/json">{json.dumps([encoded_cfg])}</script>'
+            '</body></html>'
+        )
+
+        decoded_blobs = extract_mod._decoded_voe_json_blobs(html)
+        self.assertEqual(len(decoded_blobs), 1)
+        self.assertIn("master.m3u8?token=abc123", decoded_blobs[0])
+
+        manifests = extract_mod.find_manifests(html, "https://voe.example/e/abc123", limit=5)
+        self.assertGreaterEqual(len(manifests), 1)
+        self.assertEqual(
+            manifests[0],
+            "https://stream.example.com/hls/master.m3u8?token=abc123",
+        )
+
+        self.assertTrue(extract_mod._is_non_hls_media_url("https://cdn.example.com/video.mp4"))
+        self.assertTrue(extract_mod._is_non_hls_media_url("https://cdn.example.com/video.webm?a=1"))
+        self.assertFalse(extract_mod._is_non_hls_media_url("https://cdn.example.com/master.m3u8?a=1"))
+        self.assertFalse(extract_mod._is_non_hls_media_url("https://cdn.example.com/play.mp4?u=a.m3u8"))
+
+        class FakeClient:
+            def __init__(self):
+                self.fetched = []
+
+            async def fetch_text_with_url(self, url, *, headers=None):
+                self.fetched.append(url)
+                if "master.m3u8" in url:
+                    return "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg0.ts\n", url
+                raise AssertionError(f"Unexpected URL fetch: {url}")
+
+        fc = FakeClient()
+        only_mp4_url, mp4_detail, _ = await extract_mod._first_valid(
+            fc,
+            ["https://cdn.example.com/Big_Buck_Bunny_1080_10s_5MB.mp4"],
+            referer_url="https://voe.example/e/abc123",
+        )
+        self.assertIsNone(only_mp4_url)
+        self.assertIn("skipped non-HLS candidate", mp4_detail)
+        self.assertEqual(fc.fetched, [])
+
+        fc2 = FakeClient()
+        picked, _, _ = await extract_mod._first_valid(
+            fc2,
+            [
+                "https://cdn.example.com/Big_Buck_Bunny_1080_10s_5MB.mp4",
+                "https://stream.example.com/hls/master.m3u8?token=abc123",
+            ],
+            referer_url="https://voe.example/e/abc123",
+        )
+        self.assertEqual(picked, "https://stream.example.com/hls/master.m3u8?token=abc123")
+        self.assertEqual(fc2.fetched, ["https://stream.example.com/hls/master.m3u8?token=abc123"])
+
+    async def test_client_fetch_text_rejects_binary_and_oversized(self):
+        chunks_written = 0
+        octet_chunks_written = 0
+        app = web.Application()
+
+        async def mp4_ep(request: web.Request):
+            return web.Response(
+                body=b"\x00\x00\x00\x20ftypmp42" * 20,
+                content_type="video/mp4",
+            )
+
+        async def octet_ep(request: web.Request):
+            return web.Response(
+                body=b"\x00\x01\x02\x03",
+                content_type="application/octet-stream",
+            )
+
+        async def ok_octet_m3u8_ep(request: web.Request):
+            return web.Response(
+                body=b"\xef\xbb\xbf  #EXTM3U\n#EXTINF:1.0,\nseg.ts\n#EXT-X-ENDLIST\n",
+                content_type="application/octet-stream",
+            )
+
+        async def stream_octet_bin_ep(request: web.Request):
+            nonlocal octet_chunks_written
+            resp = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            await resp.prepare(request)
+            try:
+                first = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 1008
+                for idx in range(20):
+                    octet_chunks_written += 1
+                    await resp.write(first if idx == 0 else b"\x00" * 1024)
+                    await asyncio.sleep(0.01)
+            except Exception:
+                pass
+            return resp
+
+        async def hls_ep(request: web.Request):
+            return web.Response(
+                text="#EXTM3U\n#EXT-X-TARGETDURATION:6\n",
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def big_cl_ep(request: web.Request):
+            return web.Response(
+                body=b"X" * 4096,
+                content_type="text/plain",
+            )
+
+        async def huge_stream_ep(request: web.Request):
+            nonlocal chunks_written
+            resp = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "text/plain"},
+            )
+            await resp.prepare(request)
+            try:
+                for _ in range(20):
+                    chunks_written += 1
+                    await resp.write(b"Z" * 1024)
+                    await asyncio.sleep(0.01)
+            except Exception:
+                pass
+            return resp
+
+        app.router.add_get("/video.mp4", mp4_ep)
+        app.router.add_get("/blob.bin", octet_ep)
+        app.router.add_get("/ok_octet.m3u8", ok_octet_m3u8_ep)
+        app.router.add_get("/stream_octet.bin", stream_octet_bin_ep)
+        app.router.add_get("/ok.m3u8", hls_ep)
+        app.router.add_get("/big_cl.txt", big_cl_ep)
+        app.router.add_get("/huge_stream.txt", huge_stream_ep)
+
+        runner, base = await self._start_server(app)
+        client = _client_mod.HlsClient(proxy_url=None)
+        try:
+            with self.assertRaises(ValueError):
+                await client.fetch_text_with_url(f"{base}/video.mp4")
+
+            with self.assertRaises(ValueError):
+                await client.fetch_text_with_url(f"{base}/blob.bin")
+
+            octet_txt, octet_u = await client.fetch_text_with_url(f"{base}/ok_octet.m3u8")
+            self.assertIn("#EXTM3U", octet_txt)
+            self.assertIn("#EXT-X-ENDLIST", octet_txt)
+            self.assertTrue(octet_u.endswith("/ok_octet.m3u8"))
+
+            octet_chunks_written = 0
+            with self.assertRaises(ValueError):
+                await client.fetch_text_with_url(f"{base}/stream_octet.bin")
+            self.assertLess(octet_chunks_written, 20)
+
+            txt, final_u = await client.fetch_text_with_url(f"{base}/ok.m3u8")
+            self.assertIn("#EXTM3U", txt)
+            self.assertTrue(final_u.endswith("/ok.m3u8"))
+
+            with self.assertRaises(ValueError):
+                await client.fetch_text_with_url(f"{base}/big_cl.txt", max_bytes=1024)
+
+            chunks_written = 0
+            with self.assertRaises(ValueError):
+                await client.fetch_text_with_url(f"{base}/huge_stream.txt", max_bytes=1500)
+            self.assertLess(chunks_written, 20)
+        finally:
+            await client.close()
+            await runner.cleanup()
+
+    async def test_browser_mismatch_hint_cached_fallback_and_fast_tap(self):
+        import contextlib
+        import io
+
+        # 1. _log_launch_failure hint routing: non-/home cache prints mismatch hint (not ProtectHome)
+        non_home_cache = os.path.join(self.work, "opt-ms-playwright")
+        os.makedirs(os.path.join(non_home_cache, "chromium-1243"), exist_ok=True)
+        wanted_missing = os.path.join(
+            non_home_cache, "chromium-1255", "chrome-linux64", "chrome",
+        )
+        orig_hint_logged = browser_mod._HINT_LOGGED
+        try:
+            browser_mod._HINT_LOGGED = False
+            buf = io.StringIO()
+            with patch.object(browser_mod, "_home_masked", return_value=True), \
+                 contextlib.redirect_stdout(buf):
+                browser_mod._log_launch_failure(
+                    RuntimeError(f"Executable doesn't exist at {wanted_missing}")
+                )
+            out_mismatch = buf.getvalue()
+            self.assertIn("older Chromium revision", out_mismatch)
+            self.assertIn("deploy/install-browser.sh", out_mismatch)
+            self.assertNotIn("ProtectHome=true", out_mismatch)
+
+            # Masked /home path still prints _sandbox_hint
+            browser_mod._HINT_LOGGED = False
+            buf2 = io.StringIO()
+            with patch.object(browser_mod, "_home_masked", return_value=True), \
+                 contextlib.redirect_stdout(buf2):
+                browser_mod._log_launch_failure(
+                    RuntimeError(
+                        "Executable doesn't exist at "
+                        "/home/botuser/.cache/ms-playwright/chromium-1255/chrome-linux64/chrome"
+                    )
+                )
+            self.assertIn("ProtectHome=true", buf2.getvalue())
+        finally:
+            browser_mod._HINT_LOGGED = orig_hint_logged
+
+        # 2. _find_cached_chromium_executable + _get_browser executable_path fallback
+        pw_cache = os.path.join(self.work, "pw-cache")
+        old_full = os.path.join(pw_cache, "chromium-1240", "chrome-linux64", "chrome")
+        new_full = os.path.join(pw_cache, "chromium-1243", "chrome-linux64", "chrome")
+        old_hs = os.path.join(
+            pw_cache, "chromium_headless_shell-1240", "chrome-headless-shell-win64",
+            "chrome-headless-shell.exe",
+        )
+        new_hs = os.path.join(
+            pw_cache, "chromium_headless_shell-1243", "chrome-headless-shell-linux64",
+            "chrome-headless-shell",
+        )
+        for p in (old_full, new_full, old_hs, new_hs):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as fh:
+                fh.write(b"fake")
+
+        await browser_mod.close_browser()
+        fake_browser = MagicMock()
+        fake_browser.is_connected.return_value = True
+        fake_browser.close = AsyncMock(return_value=None)
+        launch_calls = []
+
+        async def _fake_launch(**kwargs):
+            launch_calls.append(dict(kwargs))
+            if "executable_path" not in kwargs:
+                raise RuntimeError(f"Executable doesn't exist at {wanted_missing}")
+            return fake_browser
+
+        fake_pw = types.SimpleNamespace(
+            chromium=types.SimpleNamespace(launch=_fake_launch),
+            stop=AsyncMock(return_value=None),
+        )
+        fake_cm = MagicMock()
+        fake_cm.start = AsyncMock(return_value=fake_pw)
+
+        env_patch = {
+            "PLAYWRIGHT_BROWSERS_PATH": pw_cache,
+            "LOCALAPPDATA": "",
+        }
+        with patch.dict(os.environ, env_patch, clear=False), \
+             patch.object(browser_mod, "_CACHE_CANDIDATES", ()), \
+             patch("os.path.expanduser", return_value=os.path.join(self.work, "missing-home-cache")):
+            picked_exe = browser_mod._find_cached_chromium_executable()
+            self.assertEqual(os.path.normpath(picked_exe or ""), os.path.normpath(new_hs))
+
+            with patch("playwright.async_api.async_playwright", return_value=fake_cm):
+                try:
+                    got_browser, is_eph = await browser_mod._get_browser(
+                        proxy=None, proxy_key=("direct", None), using_warp=False,
+                    )
+                    self.assertIs(got_browser, fake_browser)
+                    self.assertFalse(is_eph)
+                finally:
+                    if browser_mod._idle_task is not None:
+                        browser_mod._idle_task.cancel()
+                        try:
+                            await browser_mod._idle_task
+                        except BaseException:
+                            pass
+                        browser_mod._idle_task = None
+                    await browser_mod.close_browser()
+
+        self.assertEqual(len(launch_calls), 2)
+        self.assertNotIn("executable_path", launch_calls[0])
+        self.assertEqual(
+            os.path.normpath(launch_calls[1].get("executable_path", "")),
+            os.path.normpath(new_hs),
+        )
+
+        # 3. Blocked ad requests do not stall quiet wait; early _read_tap returns fast
+        if browser_mod.browser_available():
+            app = web.Application()
+
+            async def tap_ad_watch(request: web.Request):
+                return web.Response(
+                    text=(
+                        "<html><body><video id='v'></video><script>"
+                        "window.jwplayer = function(){ return { setup: function(cfg){} }; };"
+                        "window.jwplayer().setup({ playlist: [{ sources: [{ file: '/cdn/tapped.m3u8?k=v' }] }] });"
+                        "let i = 0;"
+                        "setInterval(function(){ i++; "
+                        "fetch('https://pagead2.googlesyndication.com/pagead.js?n=' + i).catch(function(){}); "
+                        "}, 450);"
+                        "</script></body></html>"
+                    ),
+                    content_type="text/html",
+                )
+
+            app.router.add_get("/watch", tap_ad_watch)
+            runner, base = await self._start_server(app)
+            try:
+                t0 = time.monotonic()
+                with patch.object(browser_mod, "ensure_proxy_ready", new=AsyncMock(return_value=None)), \
+                     patch.object(browser_mod, "_playwright_proxy", return_value=None):
+                    scan_tap = await browser_mod.resolve_stream_with_browser(
+                        f"{base}/watch", timeout=15,
+                    )
+                    await browser_mod.close_browser()
+                elapsed = time.monotonic() - t0
+                self.assertEqual(scan_tap.reason, "ok")
+                self.assertEqual(scan_tap.source, "player-config")
+                self.assertEqual(scan_tap.url, f"{base}/cdn/tapped.m3u8?k=v")
+                self.assertLess(elapsed, 11.0)
+            finally:
+                await runner.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

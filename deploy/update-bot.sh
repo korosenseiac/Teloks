@@ -18,7 +18,7 @@ NC='\033[0m'
 BOT_DIR="/opt/telegram-forwarder-bot"
 SERVICE_NAME="telegram-forwarder"
 REPO_URL="https://github.com/korosenseiac/Teloks.git"
-BACKUP_DIR="/opt/telegram-forwarder-bot-backup-$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="${BACKUP_DIR:-/opt/telegram-forwarder-bot-backup-$(date +%Y%m%d_%H%M%S)}"
 
 # Is Chromium usable as the bot user? ($1 = bot user, default botuser)
 #
@@ -28,10 +28,63 @@ BACKUP_DIR="/opt/telegram-forwarder-bot-backup-$(date +%Y%m%d_%H%M%S)"
 # chromium_headless_shell build. Launching covers both, plus the system libraries
 # and the cache path itself.
 browser_ready() {
-    sudo -H -u "${1:-botuser}" env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+    local cache_dir="${BROWSER_CACHE:-${PLAYWRIGHT_BROWSERS_PATH:-$BOT_DIR/ms-playwright}}"
+    sudo -H -u "${1:-botuser}" env PLAYWRIGHT_BROWSERS_PATH="$cache_dir" \
         "$BOT_DIR/venv/bin/python" -c 'from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
     p.chromium.launch(headless=True).close()' 2>/dev/null
+}
+
+active_chromium_revisions() {
+    "$BOT_DIR/venv/bin/python" -c '
+import json, pathlib, re
+import playwright
+revs = set()
+bj = pathlib.Path(playwright.__file__).resolve().parent / "driver" / "package" / "browsers.json"
+if bj.is_file():
+    try:
+        for b in json.loads(bj.read_text(encoding="utf-8")).get("browsers", []):
+            if b.get("name") in ("chromium", "chromium-headless-shell") and b.get("revision"):
+                revs.add(str(b["revision"]))
+    except Exception:
+        pass
+if not revs:
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        m = re.search(r"chromium(?:_headless_shell)?-(\d+)", p.chromium.executable_path or "")
+        if m:
+            revs.add(m.group(1))
+print(" ".join(sorted(revs)))
+' 2>/dev/null || true
+}
+
+prune_stale_chromium_builds() {
+    local cache_dir="$1"
+    [ -n "$cache_dir" ] && [ -d "$cache_dir" ] || return 0
+    local active_revs
+    active_revs="$(active_chromium_revisions)"
+    [ -n "$active_revs" ] || return 0
+    local build base rev keep active
+    for build in "$cache_dir"/chromium-* "$cache_dir"/chromium_headless_shell-*; do
+        [ -d "$build" ] || continue
+        base="$(basename "$build")"
+        rev="${base#chromium_headless_shell-}"
+        rev="${rev#chromium-}"
+        case "$rev" in
+            ""|*[!0-9]*) continue ;;
+        esac
+        keep=0
+        for active in $active_revs; do
+            if [ "$rev" = "$active" ]; then
+                keep=1
+                break
+            fi
+        done
+        if [ "$keep" = "0" ]; then
+            echo "Pruning stale Chromium build: $base"
+            rm -rf "$build" || true
+        fi
+    done
 }
 
 # Make the SERVICE able to see that browser. The unit is hardened with
@@ -65,38 +118,40 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Step 1: Create backup
-echo -e "${BLUE}[1/5] Creating backup...${NC}"
-mkdir -p $BACKUP_DIR
-cp -r $BOT_DIR/* $BACKUP_DIR/ 2>/dev/null || true
-echo -e "${GREEN}[✓]${NC} Backup created at $BACKUP_DIR"
+if [ "${SKIP_BACKUP_AND_PULL:-0}" != "1" ]; then
+    # Step 1: Create backup
+    echo -e "${BLUE}[1/5] Creating backup...${NC}"
+    mkdir -p "$BACKUP_DIR"
+    cp -r "$BOT_DIR"/* "$BACKUP_DIR"/ 2>/dev/null || true
+    echo -e "${GREEN}[✓]${NC} Backup created at $BACKUP_DIR"
 
-# Step 2: Stop bot
-echo -e "${BLUE}[2/5] Stopping bot...${NC}"
-systemctl stop $SERVICE_NAME
-echo -e "${GREEN}[✓]${NC} Bot stopped"
+    # Step 2: Stop bot
+    echo -e "${BLUE}[2/5] Stopping bot...${NC}"
+    systemctl stop "$SERVICE_NAME"
+    echo -e "${GREEN}[✓]${NC} Bot stopped"
 
-# Step 3: Pull latest code from GitHub
-echo -e "${BLUE}[3/5] Pulling latest code from GitHub...${NC}"
-cd $BOT_DIR
+    # Step 3: Pull latest code from GitHub
+    echo -e "${BLUE}[3/5] Pulling latest code from GitHub...${NC}"
+    cd "$BOT_DIR"
 
-# Initialize git if not already a repo
-if [ ! -d "$BOT_DIR/.git" ]; then
-    sudo -u botuser git init
-    sudo -u botuser git remote add origin $REPO_URL
+    # Initialize git if not already a repo
+    if [ ! -d "$BOT_DIR/.git" ]; then
+        sudo -u botuser git init
+        sudo -u botuser git remote add origin "$REPO_URL"
+    fi
+
+    # Fetch and reset to latest
+    chown -R botuser:botuser "$BOT_DIR/.git"
+    sudo -u botuser git fetch origin
+    sudo -u botuser git reset --hard origin/main 2>/dev/null || sudo -u botuser git reset --hard origin/master
+
+    # Restore .env and session files from backup
+    cp "$BACKUP_DIR/.env" "$BOT_DIR/.env" 2>/dev/null || true
+    cp "$BACKUP_DIR"/*.session "$BOT_DIR"/ 2>/dev/null || true
+
+    chown -R botuser:botuser "$BOT_DIR"
+    echo -e "${GREEN}[✓]${NC} Code updated to latest version"
 fi
-
-# Fetch and reset to latest
-chown -R botuser:botuser $BOT_DIR/.git
-sudo -u botuser git fetch origin
-sudo -u botuser git reset --hard origin/main 2>/dev/null || sudo -u botuser git reset --hard origin/master
-
-# Restore .env and session files from backup
-cp $BACKUP_DIR/.env $BOT_DIR/.env 2>/dev/null || true
-cp $BACKUP_DIR/*.session $BOT_DIR/ 2>/dev/null || true
-
-chown -R botuser:botuser $BOT_DIR
-echo -e "${GREEN}[✓]${NC} Code updated to latest version"
 
 # Step 4: Update dependencies
 echo -e "${BLUE}[4/5] Updating dependencies...${NC}"
@@ -118,6 +173,7 @@ if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwr
     ensure_service_browser_path
     if browser_ready botuser; then
         echo -e "${GREEN}[✓]${NC} Headless browser already installed"
+        prune_stale_chromium_builds "$BROWSER_CACHE"
     else
         echo "Installing headless Chromium (~170 MB) for JS-only player pages..."
         # Libraries first (as root), then the browser into the BOT user's cache.
@@ -129,6 +185,9 @@ if [ "${SKIP_BROWSER:-0}" != "1" ] && $BOT_DIR/venv/bin/python -c "import playwr
         sudo -H -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
             $BOT_DIR/venv/bin/python -m playwright install chromium \
             || echo -e "${YELLOW}[!]${NC} Chromium install failed (disk/RAM?) - continuing without it; retry later with: bot browser"
+        if browser_ready botuser; then
+            prune_stale_chromium_builds "$BROWSER_CACHE"
+        fi
     fi
 fi
 
@@ -144,27 +203,81 @@ BOT_DIR="/opt/telegram-forwarder-bot"
 # stale build passes) nor executable_path (full Chromium, while headless uses
 # chromium_headless_shell) proves the bot can start anything.
 browser_ready() {
-    sudo -H -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
+    local cache_dir="${BROWSER_CACHE:-${PLAYWRIGHT_BROWSERS_PATH:-$BOT_DIR/ms-playwright}}"
+    sudo -H -u botuser env PLAYWRIGHT_BROWSERS_PATH="$cache_dir" \
         "$BOT_DIR/venv/bin/python" -c 'from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
     p.chromium.launch(headless=True).close()' 2>/dev/null
+}
+
+active_chromium_revisions() {
+    "$BOT_DIR/venv/bin/python" -c '
+import json, pathlib, re
+import playwright
+revs = set()
+bj = pathlib.Path(playwright.__file__).resolve().parent / "driver" / "package" / "browsers.json"
+if bj.is_file():
+    try:
+        for b in json.loads(bj.read_text(encoding="utf-8")).get("browsers", []):
+            if b.get("name") in ("chromium", "chromium-headless-shell") and b.get("revision"):
+                revs.add(str(b["revision"]))
+    except Exception:
+        pass
+if not revs:
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        m = re.search(r"chromium(?:_headless_shell)?-(\d+)", p.chromium.executable_path or "")
+        if m:
+            revs.add(m.group(1))
+print(" ".join(sorted(revs)))
+' 2>/dev/null || true
+}
+
+prune_stale_chromium_builds() {
+    local cache_dir="$1"
+    [ -n "$cache_dir" ] && [ -d "$cache_dir" ] || return 0
+    local active_revs
+    active_revs="$(active_chromium_revisions)"
+    [ -n "$active_revs" ] || return 0
+    local build base rev keep active
+    for build in "$cache_dir"/chromium-* "$cache_dir"/chromium_headless_shell-*; do
+        [ -d "$build" ] || continue
+        base="$(basename "$build")"
+        rev="${base#chromium_headless_shell-}"
+        rev="${rev#chromium-}"
+        case "$rev" in
+            ""|*[!0-9]*) continue ;;
+        esac
+        keep=0
+        for active in $active_revs; do
+            if [ "$rev" = "$active" ]; then
+                keep=1
+                break
+            fi
+        done
+        if [ "$keep" = "0" ]; then
+            echo "Pruning stale Chromium build: $base"
+            sudo rm -rf "$build" || true
+        fi
+    done
 }
 
 # The unit is hardened with ProtectHome=true, which empties /home for the bot and
 # makes a browser under /home unusable (Playwright defaults to
 # $HOME/.cache/ms-playwright). A drop-in, so it survives unit rewrites.
 ensure_service_browser_path() {
+    local cache_dir="${BROWSER_CACHE:-${PLAYWRIGHT_BROWSERS_PATH:-$BOT_DIR/ms-playwright}}"
     [ -f "/etc/systemd/system/$SERVICE_NAME.service" ] || return 0
     if systemctl show -p Environment "$SERVICE_NAME" 2>/dev/null \
-        | grep -qF "PLAYWRIGHT_BROWSERS_PATH=$BROWSER_CACHE" \
-      || grep -qF "PLAYWRIGHT_BROWSERS_PATH=$BROWSER_CACHE" \
+        | grep -qF "PLAYWRIGHT_BROWSERS_PATH=$cache_dir" \
+      || grep -qF "PLAYWRIGHT_BROWSERS_PATH=$cache_dir" \
            "/etc/systemd/system/$SERVICE_NAME.service.d/browser-cache.conf" 2>/dev/null; then
         return 0
     fi
-    echo "Pointing the service at $BROWSER_CACHE (it cannot see /home)..."
+    echo "Pointing the service at $cache_dir (it cannot see /home)..."
     sudo mkdir -p "/etc/systemd/system/$SERVICE_NAME.service.d" || return 0
     printf '[Service]\n# Written by the updater: ProtectHome=true hides /home from the service,\n# so the Chromium cache must live where the service can read it.\nEnvironment=PLAYWRIGHT_BROWSERS_PATH=%s\n' \
-        "$BROWSER_CACHE" \
+        "$cache_dir" \
         | sudo tee "/etc/systemd/system/$SERVICE_NAME.service.d/browser-cache.conf" >/dev/null || return 0
     sudo systemctl daemon-reload || true
 }
@@ -229,6 +342,10 @@ case "$1" in
         sudo chown -R botuser:botuser $BOT_DIR
         echo "Code updated to latest version."
         echo ""
+        if [ -f "$BOT_DIR/deploy/update-bot.sh" ]; then
+            sudo SKIP_BACKUP_AND_PULL=1 SKIP_BROWSER="${SKIP_BROWSER:-0}" BACKUP_DIR="$BACKUP_DIR" bash "$BOT_DIR/deploy/update-bot.sh"
+            exit $?
+        fi
         echo "[4/5] Updating dependencies..."
         sudo -u botuser $BOT_DIR/venv/bin/pip install -r requirements.txt --upgrade
         echo "Dependencies updated."
@@ -242,6 +359,7 @@ case "$1" in
             ensure_service_browser_path
             if browser_ready; then
                 echo "Headless browser already installed."
+                prune_stale_chromium_builds "$BROWSER_CACHE"
             else
                 echo "Installing headless Chromium (~170 MB) for JS-only player pages..."
                 # Libraries as root, browser as the bot user with -H (a plain
@@ -252,6 +370,9 @@ case "$1" in
                 sudo -H -u botuser env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" \
                     $BOT_DIR/venv/bin/python -m playwright install chromium \
                     || echo "WARN: Chromium install failed (disk/RAM?) - continuing without it. Retry with: bot browser"
+                if browser_ready; then
+                    prune_stale_chromium_builds "$BROWSER_CACHE"
+                fi
             fi
         fi
         echo ""

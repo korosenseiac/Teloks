@@ -33,9 +33,10 @@ import base64
 import binascii
 import html as _html
 import inspect
+import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import SplitResult, unquote, urljoin, urlsplit
 
 from app.config import (
@@ -104,6 +105,17 @@ _EMBED = re.compile(
 #: Base64 blobs (some players ship the manifest URL encoded). 40 chars catches
 #: short URLs (~30 bytes) while keeping the search cheap.
 _B64_BLOB = re.compile(r"""[A-Za-z0-9+/_-]{40,}={0,2}""")
+
+_JSON_SCRIPT_RE = re.compile(
+    r"""<script\b[^>]*\btype\s*=\s*(?:"application/json"|'application/json')[^>]*>(.*?)</script>""",
+    re.IGNORECASE | re.DOTALL,
+)
+_VOE_ROT13_TRANS = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+    "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm",
+)
+_VOE_MARKERS = ("@$", "^^", "~@", "%?", "*~", "!!", "#&")
+_VOE_MAX_BLOCK_CHARS = 128 * 1024
 
 #: Markers that a page embeds a player (used only for the user-facing hint).
 _PLAYER_MARKERS = (
@@ -259,13 +271,82 @@ def _decoded_blobs(text: str, limit: int = 12) -> List[str]:
     return out
 
 
+def _decode_voe_payload(encoded: Any) -> Optional[str]:
+    if not isinstance(encoded, str) or not encoded or len(encoded) > _VOE_MAX_BLOCK_CHARS:
+        return None
+    try:
+        step = encoded.translate(_VOE_ROT13_TRANS)
+        for tok in _VOE_MARKERS:
+            step = step.replace(tok, "")
+        raw1 = base64.b64decode(step + "=" * (-len(step) % 4), validate=False)
+        shifted = bytes((b - 3) % 256 for b in raw1)
+        rev = shifted[::-1]
+        raw2 = base64.b64decode(rev + b"=" * (-len(rev) % 4), validate=False)
+        decoded = raw2.decode("utf-8")
+        obj = json.loads(decoded)
+        if isinstance(obj, (dict, list)):
+            return decoded
+    except Exception:
+        return None
+    return None
+
+
+def _decoded_voe_json_blobs(html: str, limit: int = 6) -> List[str]:
+    """Decode bounded VOE ``<script type="application/json">`` config blobs."""
+    if not html or limit <= 0:
+        return []
+    out: List[str] = []
+    scanned = 0
+    max_scan = max(limit * 4, 24)
+    for match in _JSON_SCRIPT_RE.finditer(html):
+        scanned += 1
+        if scanned > max_scan or len(out) >= limit:
+            break
+        raw_block = (match.group(1) or "").strip()
+        if not raw_block or len(raw_block) > _VOE_MAX_BLOCK_CHARS:
+            continue
+        try:
+            arr = json.loads(raw_block)
+        except Exception:
+            continue
+        if not isinstance(arr, list):
+            continue
+        for item in arr[:4]:
+            decoded = _decode_voe_payload(item)
+            if decoded:
+                out.append(decoded)
+                if len(out) >= limit:
+                    break
+    return out
+
+
+def _iter_voe_json_urls(obj: Any, depth: int = 0) -> Iterable[str]:
+    if depth > 4:
+        return
+    if isinstance(obj, str):
+        yield obj
+        return
+    if isinstance(obj, list):
+        for item in obj[:16]:
+            yield from _iter_voe_json_urls(item, depth + 1)
+        return
+    if isinstance(obj, dict):
+        priority = ("source", "hls", "file", "src", "url")
+        for key in priority:
+            if key in obj:
+                yield from _iter_voe_json_urls(obj[key], depth + 1)
+        for key, val in obj.items():
+            if key not in priority:
+                yield from _iter_voe_json_urls(val, depth + 1)
+
+
 def find_manifests(html: str, base_url: str, limit: int = 3) -> List[str]:
     """Every stream/manifest URL referenced by *html*, best candidate first.
 
     Handles the encodings seen in the wild: plain URLs in attributes or JS
     strings, escaped slashes (``https:\\/\\/…``), ``\\x2f`` hex escapes,
     ``&amp;`` entities, percent-encoded URLs, protocol-relative and
-    page-relative paths, and base64 config blobs.
+    page-relative paths, and base64 / VOE JSON config blobs.
     """
     if not html:
         return []
@@ -302,6 +383,20 @@ def find_manifests(html: str, base_url: str, limit: int = 3) -> List[str]:
         for match in _REL_MANIFEST.finditer(blob):
             _add(match.group(1))
         for match in _PLAYER_URL_KV.finditer(blob):
+            raw_kv = match.group(1) or match.group(2) or ""
+            _add(raw_kv, allow_query_m3u8=True)
+    for vblob in _decoded_voe_json_blobs(html):
+        try:
+            vobj = json.loads(vblob)
+        except Exception:
+            vobj = None
+        if vobj is not None:
+            for candidate in _iter_voe_json_urls(vobj):
+                if ".m3u8" in candidate.lower() or candidate.lower().startswith(("http://", "https://", "/")):
+                    _add(candidate, allow_query_m3u8=True)
+        for match in _ABS_URL.finditer(vblob):
+            _add(match.group(0))
+        for match in _PLAYER_URL_KV.finditer(vblob):
             raw_kv = match.group(1) or match.group(2) or ""
             _add(raw_kv, allow_query_m3u8=True)
 
@@ -515,6 +610,14 @@ def _collect_cookies(client: Any, manifest_url: str, page_url: str) -> Dict[str,
     return cookies
 
 
+def _is_non_hls_media_url(url: str) -> bool:
+    parts = _safe_urlsplit(url)
+    path_low = (parts.path if parts is not None else url.split("?", 1)[0]).lower()
+    if ".m3u8" in url.lower() or path_low.endswith((".m3u8", ".m3u")):
+        return False
+    return path_low.endswith(OTHER_STREAM_EXTENSIONS)
+
+
 async def _first_valid(
     client: Any,
     urls: Sequence[str],
@@ -528,11 +631,16 @@ async def _first_valid(
     detail = ""
     for url in urls:
         short = redact_url(url)
+        if _is_non_hls_media_url(url):
+            detail = f"skipped non-HLS candidate ({short})"
+            print(f"[HLS] Candidate skipped ({short}): non-HLS media")
+            continue
         attempts = _header_attempts(referer_url, url)
         # If client doesn't support per-request headers (mock), run once.
-        supports_headers = _supports_kwarg(
-            getattr(client, "fetch_text_with_url", client.fetch_text), "headers"
-        )
+        fetcher = getattr(client, "fetch_text_with_url", None)
+        if not callable(fetcher):
+            fetcher = getattr(client, "fetch_text", None)
+        supports_headers = _supports_kwarg(fetcher, "headers")
         if not supports_headers:
             attempts = [{}]
 

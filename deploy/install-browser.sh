@@ -96,6 +96,58 @@ service_cache_path() {
     | tr ' ' '\n' | sed -n 's/^PLAYWRIGHT_BROWSERS_PATH=//p' | tail -1
 }
 
+active_chromium_revisions() {
+  "$VENV_PY" -c '
+import json, pathlib, re
+import playwright
+revs = set()
+bj = pathlib.Path(playwright.__file__).resolve().parent / "driver" / "package" / "browsers.json"
+if bj.is_file():
+    try:
+        for b in json.loads(bj.read_text(encoding="utf-8")).get("browsers", []):
+            if b.get("name") in ("chromium", "chromium-headless-shell") and b.get("revision"):
+                revs.add(str(b["revision"]))
+    except Exception:
+        pass
+if not revs:
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        m = re.search(r"chromium(?:_headless_shell)?-(\d+)", p.chromium.executable_path or "")
+        if m:
+            revs.add(m.group(1))
+print(" ".join(sorted(revs)))
+' 2>/dev/null || true
+}
+
+prune_stale_chromium_builds() {
+  local cache_dir="$1"
+  [ -n "$cache_dir" ] && [ -d "$cache_dir" ] || return 0
+  local active_revs
+  active_revs="$(active_chromium_revisions)"
+  [ -n "$active_revs" ] || return 0
+  local build base rev keep active
+  for build in "$cache_dir"/chromium-* "$cache_dir"/chromium_headless_shell-*; do
+    [ -d "$build" ] || continue
+    base="$(basename "$build")"
+    rev="${base#chromium_headless_shell-}"
+    rev="${rev#chromium-}"
+    case "$rev" in
+      ""|*[!0-9]*) continue ;;
+    esac
+    keep=0
+    for active in $active_revs; do
+      if [ "$rev" = "$active" ]; then
+        keep=1
+        break
+      fi
+    done
+    if [ "$keep" = "0" ]; then
+      echo "     Pruning stale Chromium build: $base"
+      as_root rm -rf "$build" || true
+    fi
+  done
+}
+
 # Point the service at $BROWSER_CACHE. Playwright falls back to
 # $HOME/.cache/ms-playwright, which ProtectHome=true makes unreachable, so
 # without this the bot cannot find the browser however often it is installed.
@@ -203,7 +255,21 @@ for stale in /home/*/.cache/ms-playwright /root/.cache/ms-playwright; do
 done
 
 echo
-echo "Launching Chromium as $BOT_USER (the real check - the bot does the same)..."
+echo "Launching Chromium as $BOT_USER (verifying Playwright's active build)..."
+direct_launch_ok=0
+if [ -n "$WANTED" ] && [ -x "$WANTED" ] && bot_playwright "$VENV_PY" -c '
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    b = p.chromium.launch(headless=True)
+    b.close()
+'; then
+  direct_launch_ok=1
+else
+  echo "ERROR: direct Playwright Chromium launch failed (wanted: ${WANTED:-<unset>})." >&2
+  exit 1
+fi
+
+echo "Running app.hls.browser self-test as $BOT_USER..."
 if ! bot_playwright bash -c "cd '$BOT_DIR' && '$VENV_PY' -m app.hls.browser"; then
   echo "ERROR: the browser self-test above did not pass." >&2
   echo "     It prints which build Playwright wants and what the cache holds;" >&2
@@ -212,6 +278,9 @@ if ! bot_playwright bash -c "cd '$BOT_DIR' && '$VENV_PY' -m app.hls.browser"; th
   echo "       sudo -H -u $BOT_USER env PLAYWRIGHT_BROWSERS_PATH=$BROWSER_CACHE \\" >&2
   echo "         $VENV_PY -m playwright install chromium" >&2
   exit 1
+fi
+if [ "$direct_launch_ok" = "1" ] && [ -n "$WANTED" ] && [ -x "$WANTED" ]; then
+  prune_stale_chromium_builds "$BROWSER_CACHE"
 fi
 
 echo

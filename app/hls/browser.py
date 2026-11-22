@@ -142,6 +142,109 @@ def _resolve_browser_cache() -> None:
             return
 
 
+def _find_cached_chromium_executable() -> Optional[str]:
+    """Locate an existing cached Chromium executable, preferring newer headless-shell builds."""
+    roots: list[str] = []
+    env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env_path:
+        roots.append(env_path)
+    for candidate in _CACHE_CANDIDATES:
+        if candidate not in roots:
+            roots.append(candidate)
+    user_cache = os.path.expanduser("~/.cache/ms-playwright")
+    if user_cache not in roots:
+        roots.append(user_cache)
+    local_app = os.environ.get("LOCALAPPDATA")
+    if local_app:
+        win_cache = os.path.join(local_app, "ms-playwright")
+        if win_cache not in roots:
+            roots.append(win_cache)
+
+    candidates: list[Tuple[int, int, str]] = []
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            entries = os.listdir(root)
+        except Exception:
+            continue
+        for entry in entries:
+            m = re.match(r"^(chromium_headless_shell|chromium)-(\d+)$", entry)
+            if not m:
+                continue
+            kind, rev_s = m.group(1), m.group(2)
+            tier = 0 if kind == "chromium_headless_shell" else 1
+            rev = int(rev_s)
+            build_dir = os.path.join(root, entry)
+            if not os.path.isdir(build_dir):
+                continue
+
+            rel_targets: list[Tuple[str, ...]] = []
+            if kind == "chromium_headless_shell":
+                rel_targets.extend([
+                    ("chrome-headless-shell-linux64", "chrome-headless-shell"),
+                    ("chrome-headless-shell-linux-arm64", "chrome-headless-shell"),
+                    ("chrome-headless-shell-win64", "chrome-headless-shell.exe"),
+                ])
+                try:
+                    for sub in sorted(os.listdir(build_dir)):
+                        if sub.startswith("chrome-headless-shell-mac"):
+                            rel_targets.append((sub, "chrome-headless-shell"))
+                except Exception:
+                    pass
+            else:
+                rel_targets.extend([
+                    ("chrome-linux64", "chrome"),
+                    ("chrome-linux", "chrome"),
+                    ("chrome-win64", "chrome.exe"),
+                    ("chrome-win", "chrome.exe"),
+                ])
+                try:
+                    for sub in sorted(os.listdir(build_dir)):
+                        if sub.startswith("chrome-mac"):
+                            rel_targets.append((
+                                sub,
+                                "Google Chrome for Testing.app",
+                                "Contents",
+                                "MacOS",
+                                "Google Chrome for Testing",
+                            ))
+                            rel_targets.append((sub, "chrome"))
+                except Exception:
+                    pass
+
+            for parts in rel_targets:
+                exe = os.path.join(build_dir, *parts)
+                if os.path.isfile(exe):
+                    candidates.append((tier, -rev, exe))
+                    break
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2]
+
+
+async def _launch_chromium_with_fallback(pw: Any, launch_kwargs: Dict[str, Any]) -> Any:
+    """Launch Playwright Chromium, falling back to an existing cached build if missing."""
+    try:
+        return await pw.chromium.launch(**launch_kwargs)
+    except Exception as orig_err:
+        if "Executable doesn't exist" not in str(orig_err):
+            raise
+        fallback_exe = _find_cached_chromium_executable()
+        if not fallback_exe:
+            raise
+        print(
+            f"[HLS] Browser: Playwright expected build missing — falling back to cached "
+            f"Chromium {fallback_exe}; update with 'sudo bash deploy/install-browser.sh'"
+        )
+        try:
+            return await pw.chromium.launch(**{**launch_kwargs, "executable_path": fallback_exe})
+        except Exception:
+            raise orig_err
+
+
 def browser_available() -> bool:
     """True when the ``playwright`` package is importable."""
     global _AVAILABLE
@@ -508,7 +611,7 @@ async def _get_browser(
                     eph_kwargs: Dict[str, Any] = {"headless": True, "args": list(_LAUNCH_ARGS)}
                     if proxy:
                         eph_kwargs["proxy"] = proxy
-                    eph_browser = await _pw.chromium.launch(**eph_kwargs)
+                    eph_browser = await _launch_chromium_with_fallback(_pw, eph_kwargs)
                     print(
                         f"[HLS] Ephemeral browser started (proxy={'yes' if proxy else 'no'}, "
                         f"warp={'yes' if using_warp else 'no'})"
@@ -532,7 +635,7 @@ async def _get_browser(
     kwargs: Dict[str, Any] = {"headless": True, "args": list(_LAUNCH_ARGS)}
     if proxy:
         kwargs["proxy"] = proxy
-    _browser = await _pw.chromium.launch(**kwargs)
+    _browser = await _launch_chromium_with_fallback(_pw, kwargs)
     _browser_used = proxy is not None
     _browser_proxy_key = proxy_key
     _browser_using_warp = using_warp
@@ -812,6 +915,17 @@ def _sandbox_hint(cache: str) -> str:
     )
 
 
+def _mismatch_hint(cache: str) -> str:
+    """Actionable hint when *cache* exists outside /home but holds an older build."""
+    return (
+        f"      {cache} exists and is readable, but holds an older Chromium revision\n"
+        f"      than the installed Playwright package expects.\n"
+        f"      Update Chromium to match Playwright, then restart the service:\n"
+        f"        sudo bash deploy/install-browser.sh   (or: bot browser)\n"
+        f"        sudo systemctl restart telegram-forwarder"
+    )
+
+
 def _log_launch_failure(err: Exception) -> None:
     """One clear log line per failure mode, with the fix where we know it."""
     global _HINT_LOGGED
@@ -825,11 +939,20 @@ def _log_launch_failure(err: Exception) -> None:
                 os.path.dirname(os.path.dirname(os.path.dirname(wanted)))
                 if wanted else os.path.expanduser("~/.cache/ms-playwright")
             )
+            use_sandbox_hint = _home_masked() and (
+                cache.startswith(("/home/", "/root")) or not os.path.isdir(cache)
+            )
+            if use_sandbox_hint:
+                hint = _sandbox_hint(cache)
+            elif os.path.isdir(cache) and _has_browser(cache):
+                hint = _mismatch_hint(cache)
+            else:
+                hint = _install_hint()
             print(f"[HLS] Browser engine: Chromium is not downloaded for this user "
                   f"(cache: {cache}).\n"
                   f"      playwright wants: {wanted or '(not named in the error)'}\n"
                   f"{_describe_cache(wanted)}\n"
-                  f"{_sandbox_hint(cache) if _home_masked() else _install_hint()}")
+                  f"{hint}")
         return
     if "shared librar" in message.lower() or "libnss" in message.lower():
         print("[HLS] Browser engine: Chromium cannot start - missing system "
@@ -904,11 +1027,11 @@ async def resolve_stream_with_browser(
                 def _on_request(request) -> None:
                     nonlocal requests_seen, last_request_at, fallback_req, fallback_url, fallback_seen_at
                     requests_seen += 1
-                    last_request_at = time.time()
                     try:
                         req_url = request.url
-                        if _is_ad_manifest(req_url):
+                        if _is_blocked_url(req_url) or _is_ad_manifest(req_url):
                             return
+                        last_request_at = time.time()
                         cand_abs = urljoin(page_url, req_url)
                         if _looks_like_manifest(req_url) and (
                             fallback_req is None
@@ -964,11 +1087,13 @@ async def resolve_stream_with_browser(
                 await page.add_init_script(_build_tap_js(major))
 
                 loaded = False
+                loaded_at = time.time()
                 try:
                     await page.goto(
                         page_url, wait_until="domcontentloaded", timeout=timeout * 1000,
                     )
                     loaded = True
+                    loaded_at = time.time()
                 except Exception as e:
                     if using_warp:
                         err_low = str(e).lower()
@@ -992,6 +1117,7 @@ async def resolve_stream_with_browser(
                 url = ""
                 source = ""
                 winning_req = None
+                headers: Dict[str, str] = {}
                 effective_page_url = page.url or page_url
                 if not effective_page_url.startswith(("http://", "https://")):
                     effective_page_url = page_url
@@ -999,6 +1125,7 @@ async def resolve_stream_with_browser(
                 quiet = max(5, min(15, timeout // 4))
                 deadline = loop.time() + timeout
                 tried_click = False
+                last_tap_check = 0.0
 
                 while True:
                     remaining = deadline - loop.time()
@@ -1030,6 +1157,35 @@ async def resolve_stream_with_browser(
                         source = "network"
                         break
 
+                    now = time.time()
+                    if (
+                        loaded
+                        and fallback_req is None
+                        and (now - loaded_at) >= 4.5
+                        and (now - last_tap_check) >= 1.5
+                    ):
+                        last_tap_check = now
+                        tapped_url, frame_url = await _read_tap(page)
+                        if tapped_url:
+                            base_for_tap = (
+                                frame_url
+                                if frame_url and frame_url.startswith(("http://", "https://"))
+                                else effective_page_url
+                            )
+                            tapped_abs = urljoin(base_for_tap, tapped_url)
+                            if (
+                                tapped_abs.lower().startswith(("http://", "https://"))
+                                and (_looks_like_manifest(tapped_abs) or ".m3u8" in tapped_abs.lower())
+                                and not _is_ad_manifest(tapped_abs)
+                                and tapped_abs not in failed_urls
+                            ):
+                                url = tapped_abs
+                                source = "player-config"
+                                effective_page_url = base_for_tap
+                                headers = default_headers(url, referer=effective_page_url)
+                                headers["User-Agent"] = ua
+                                break
+
                     if (loaded and requests_seen
                             and (time.time() - last_request_at) >= quiet):
                         break
@@ -1045,7 +1201,6 @@ async def resolve_stream_with_browser(
                     winning_req = fallback_req
                     source = "network"
 
-                headers: Dict[str, str] = {}
                 if url and winning_req is not None:
                     try:
                         frame_url = winning_req.frame.url if winning_req.frame else ""

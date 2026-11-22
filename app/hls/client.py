@@ -954,6 +954,7 @@ class HlsClient:
         url: str,
         *,
         headers: Optional[Dict[str, Optional[str]]] = None,
+        max_bytes: int = 8 * 1024 * 1024,
     ) -> Tuple[str, str]:
         """Fetch a playlist document and return ``(text, final_url)``."""
         session = await self._get_session()
@@ -967,9 +968,42 @@ class HlsClient:
                 ssl=False,
             ) as resp:
                 self._raise_for_status(resp, url)
-                body = await resp.read()
+                ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                if ctype and "mpegurl" not in ctype and ctype.startswith(("video/", "audio/", "image/")):
+                    raise ValueError(f"Non-playlist Content-Type ({ctype}) for {redact_url(url)}")
+                cl = resp.content_length
+                if cl is not None and cl > max_bytes:
+                    raise ValueError(
+                        f"Playlist response too large ({cl} > {max_bytes} bytes) for {redact_url(url)}"
+                    )
+                is_octet_stream = (ctype == "application/octet-stream")
+                checked_octet = False
+                body = bytearray()
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    if not chunk:
+                        continue
+                    body.extend(chunk)
+                    if len(body) > max_bytes:
+                        raise ValueError(
+                            f"Playlist response exceeded {max_bytes} bytes for {redact_url(url)}"
+                        )
+                    if is_octet_stream and not checked_octet:
+                        head = bytes(body).lstrip(b"\xef\xbb\xbf \t\r\n")
+                        if not head:
+                            if len(body) >= 64:
+                                raise ValueError(f"Non-playlist Content-Type ({ctype}) for {redact_url(url)}")
+                            continue
+                        if len(head) < 7 and b"#EXTM3U".startswith(head.upper()):
+                            continue
+                        if head[:7].upper() != b"#EXTM3U":
+                            raise ValueError(f"Non-playlist Content-Type ({ctype}) for {redact_url(url)}")
+                        checked_octet = True
+                if is_octet_stream and not checked_octet:
+                    head = bytes(body).lstrip(b"\xef\xbb\xbf \t\r\n")
+                    if head[:7].upper() != b"#EXTM3U":
+                        raise ValueError(f"Non-playlist Content-Type ({ctype}) for {redact_url(url)}")
                 final_url = str(resp.url or url)
-                return decode_text(body, resp.get_encoding()), final_url
+                return decode_text(bytes(body), resp.charset), final_url
         except (HlsHttpError, HlsProxyError, WarpProxyError):
             raise
         except Exception as exc:
@@ -981,12 +1015,13 @@ class HlsClient:
         url: str,
         *,
         headers: Optional[Dict[str, Optional[str]]] = None,
+        max_bytes: int = 8 * 1024 * 1024,
     ) -> str:
         """Fetch a playlist document and return it as text.
 
         Decoding is deliberately lenient (see :func:`decode_text`).
         """
-        text, _ = await self.fetch_text_with_url(url, headers=headers)
+        text, _ = await self.fetch_text_with_url(url, headers=headers, max_bytes=max_bytes)
         return text
 
     async def _read_segment_response(
@@ -1197,7 +1232,7 @@ class HlsClient:
                     if len(body) >= max_bytes:
                         break
                 final_url = str(resp.url or url)
-                return decode_text(bytes(body), resp.get_encoding()), final_url
+                return decode_text(bytes(body), resp.charset), final_url
         except (HlsHttpError, HlsProxyError, WarpProxyError):
             raise
         except Exception as exc:
