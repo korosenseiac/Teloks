@@ -182,6 +182,8 @@ def _start_job_from_caption_state(
                 url=state.get("url"),
                 page_url=state.get("page_url"),
                 force_direct=state.get("force_direct"),
+                headers=state.get("headers"),
+                cookies=state.get("cookies"),
                 slot_sid=slot_sid,
             )
         )
@@ -1683,8 +1685,8 @@ async def torrent_thumbnail_interceptor(client: Client, message: Message):
     caption = message.caption or ""
     if caption and any(
         pattern.search(caption) for pattern in (
-            MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN, DIRECT_LINK_PATTERN,
-            TERABOX_LINK_PATTERN, MEDIAFIRE_LINK_PATTERN,
+            MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN, HLS_LINK_PATTERN,
+            DIRECT_LINK_PATTERN, TERABOX_LINK_PATTERN, MEDIAFIRE_LINK_PATTERN,
         )
     ):
         return
@@ -1773,6 +1775,10 @@ async def hls_link_message_handler(client: Client, message: Message):
         # logging the original traceback.
         print(f"[HLS] Handler failed: {type(e).__name__}: {e}")
         traceback.print_exc()
+        try:
+            await message.reply_text("❌ Ralat memproses pautan HLS.")
+        except Exception:
+            pass
     message.stop_propagation()
 
 

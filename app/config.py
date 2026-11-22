@@ -97,8 +97,12 @@ HLS_MAX_HEIGHT = int(os.getenv("HLS_MAX_HEIGHT", "0"))
 HLS_MAX_DURATION = int(os.getenv("HLS_MAX_DURATION", "0"))
 
 # Parallel segment downloads and per-segment retries.
-HLS_SEGMENT_WORKERS = int(os.getenv("HLS_SEGMENT_WORKERS", "4"))
-HLS_SEGMENT_RETRIES = int(os.getenv("HLS_SEGMENT_RETRIES", "3"))
+HLS_SEGMENT_WORKERS = int(os.getenv("HLS_SEGMENT_WORKERS", "16"))
+HLS_SEGMENT_RETRIES = int(os.getenv("HLS_SEGMENT_RETRIES", "5"))
+
+# Network timeouts (seconds) for HLS playlists, connection setup, and segments.
+HLS_CONNECT_TIMEOUT = int(os.getenv("HLS_CONNECT_TIMEOUT", "15"))
+HLS_SEGMENT_TIMEOUT = int(os.getenv("HLS_SEGMENT_TIMEOUT", "120"))
 
 # Hard timeout (seconds) for one ffmpeg download/remux before it is killed.
 HLS_TIMEOUT = int(os.getenv("HLS_TIMEOUT", "1800"))
@@ -115,6 +119,10 @@ HLS_TEMP_DIR = os.getenv("HLS_TEMP_DIR", "")
 # the configured SOCKS5 proxy is blocked by (or cannot reach) the HLS CDN.
 HLS_DISABLE_PROXY = os.getenv("HLS_DISABLE_PROXY", "false").lower() in ("1", "true", "yes", "on")
 
+# When proxy.txt is unreachable or fails proxy connect/handshake, retry directly
+# so a dead/blocked proxy does not stall or break HLS downloads.
+HLS_PROXY_FALLBACK_DIRECT = os.getenv("HLS_PROXY_FALLBACK_DIRECT", "true").lower() in ("1", "true", "yes", "on")
+
 # Page → manifest extraction. Some CDNs only accept the playlist URL *they*
 # minted for the client that loaded the page (the token embeds that client's
 # IP/ASN), so a playlist URL copied out of a browser gets 403 from this server
@@ -129,7 +137,7 @@ HLS_PAGE_MAX_BYTES = int(os.getenv("HLS_PAGE_MAX_BYTES", str(4 * 1024 * 1024)))
 
 # How many candidate manifest URLs one page may offer. Each candidate is
 # verified with a real request before it is used, so this also caps that work.
-HLS_PAGE_MAX_CANDIDATES = int(os.getenv("HLS_PAGE_MAX_CANDIDATES", "3"))
+HLS_PAGE_MAX_CANDIDATES = int(os.getenv("HLS_PAGE_MAX_CANDIDATES", "5"))
 
 # Follow ONE embed/iframe hop when the submitted page has no manifest of its own
 # (players are often hidden behind /embed/…).
