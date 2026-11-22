@@ -3,10 +3,16 @@ import random
 import math
 import traceback
 from io import BytesIO
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from pyrogram import Client, StopPropagation, filters
 from pyrogram.errors import FloodWait
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges
+from pyrogram.types import (
+    BotCommand,
+    ChatPrivileges,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from pyrogram.raw.functions.messages import SendMedia
 from pyrogram.raw.functions.upload import SaveFilePart
 from pyrogram.raw.types import (
@@ -21,7 +27,16 @@ from pyrogram.raw.types import (
     InputPeerChannel,
     InputFile
 )
-from app.config import API_ID, API_HASH, BOT_TOKEN, BACKUP_GROUP_ID, HLS_ENABLED
+from app.config import API_ID, API_HASH, BOT_TOKEN, BACKUP_GROUP_ID, HLS_ENABLED, OWNER_ID
+from app.warp import (
+    AFFECTED_FEATURES as WARP_AFFECTED_FEATURES,
+    WarpActionResult,
+    WarpStatus,
+    disable_proxy,
+    enable_proxy,
+    get_warp_status,
+    install_warp,
+)
 from app.database.db import add_user, save_user_session, log_forward, get_user_session, save_backup_group_cache, get_backup_group_cache, get_user_profile
 from app.bot.session_manager import manager
 from app.bot import process_registry
@@ -32,6 +47,7 @@ from app.bot.states import user_profile_states, ProfileStep, CaptionStep
 from app.utils.message import safe_edit, clear_reply_markup
 from app.terabox.handler import terabox_link_handler, handle_tb_folder_callback, TERABOX_LINK_PATTERN
 from app.mediafire.handler import mediafire_link_handler, MEDIAFIRE_LINK_PATTERN
+from app.torrent import sync_aria2_proxy
 from app.torrent.handler import (
     torrent_link_handler, torrent_file_handler, process_torrent_download,
     extract_user_thumbnail,
@@ -544,7 +560,8 @@ async def start_handler(client: Client, message: Message):
             "Copy dan paste mesej link dari channel/group. Contohnya:\n"
             "`https://t.me/c/1234567890/123` (private)\n"
             "`https://t.me/contoh/14720` (public)\n\n"
-            "Nanti bot akan forward contentnya."
+            "Nanti bot akan forward contentnya.\n\n"
+            "📋 Taip /commands atau /help untuk panduan lengkap semua arahan."
         )
     else:
         welcome_text = (
@@ -552,7 +569,8 @@ async def start_handler(client: Client, message: Message):
             "Bot ni boleh forward restricted content dari private channels/group untuk korang.\n\n"
             "**Untuk mula:**\n"
             "Korang perlu login dengan akaun Telegram dalam bot ni.\n\n"
-            "👇 **Tekan butang kat bawah untuk login:**"
+            "👇 **Tekan butang kat bawah untuk login:**\n"
+            "📋 Atau taip /commands untuk senarai penuh arahan."
         )
     
     await message.reply_text(
@@ -608,6 +626,744 @@ async def cancel_handler(client: Client, message: Message):
 
     # Otherwise, try to cancel login flow
     await cancel_login(client, message)
+
+
+# ---------------------------------------------------------------------------
+# Telegram message helpers, owner auth, command guide & WARP proxy controls
+# ---------------------------------------------------------------------------
+
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
+# Loop-independent guard preventing concurrent WARP installations from Telegram
+_warp_install_in_progress = False
+
+
+def split_telegram_message(
+    text: str,
+    max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH,
+) -> List[str]:
+    """Split *text* into Telegram-safe chunks each ``<= max_length`` characters."""
+    if max_length < 1:
+        raise ValueError("max_length must be >= 1")
+    if not text:
+        return [""]
+    if len(text) <= max_length:
+        return [text]
+
+    chunks: List[str] = []
+    remaining = text
+    while len(remaining) > max_length:
+        window = remaining[:max_length]
+        split_at = window.rfind("\n\n")
+        if split_at <= 0:
+            split_at = window.rfind("\n")
+        if split_at <= 0:
+            split_at = window.rfind(" ")
+        if split_at <= 0:
+            split_at = max_length
+
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:max_length]
+            split_at = max_length
+
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip("\n ")
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def truncate_telegram_text(
+    text: str,
+    max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH,
+) -> str:
+    """Truncate *text* cleanly so edited messages never exceed Telegram's limit."""
+    if len(text) <= max_length:
+        return text
+    suffix = "\n… (truncated)"
+    if max_length <= len(suffix):
+        return text[:max_length]
+    return text[: max_length - len(suffix)].rstrip() + suffix
+
+
+def _safe_inline_code(text: Any) -> str:
+    """Sanitize backticks so dynamic strings never break inline Markdown code spans."""
+    return str(text).replace("`", "'")
+
+
+async def send_long_message(
+    message: Message,
+    text: str,
+    max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH,
+    **kwargs,
+) -> List[Message]:
+    """Reply with *text*, safely splitting into multiple messages if > 4096 chars."""
+    chunks = split_telegram_message(text, max_length=max_length)
+    reply_markup = kwargs.pop("reply_markup", None)
+    sent: List[Message] = []
+    last_idx = len(chunks) - 1
+    for idx, chunk in enumerate(chunks):
+        chunk_kwargs = dict(kwargs)
+        if reply_markup is not None and idx == last_idx:
+            chunk_kwargs["reply_markup"] = reply_markup
+        sent.append(await message.reply_text(chunk, **chunk_kwargs))
+    return sent
+
+
+def is_owner_user(user_id: Optional[int]) -> bool:
+    """Fail-closed owner authorization check backed by ``OWNER_ID``."""
+    return bool(OWNER_ID and OWNER_ID > 0 and user_id is not None and user_id == OWNER_ID)
+
+
+def _owner_denied_text() -> str:
+    if not OWNER_ID or OWNER_ID <= 0:
+        return (
+            "⛔ **Akses ditolak.**\n\n"
+            "`OWNER_ID` belum dikonfigurasi dalam fail `.env`.\n"
+            "Sila tetapkan `OWNER_ID` kepada Telegram User ID pemilik bot "
+            "dan mulakan semula bot untuk menggunakan arahan WARP."
+        )
+    return "⛔ **Akses ditolak.** Arahan ini hanya untuk pemilik bot (Owner only)."
+
+
+async def _require_owner_message(message: Message) -> bool:
+    user = getattr(message, "from_user", None)
+    user_id = getattr(user, "id", None) if user is not None else None
+    if is_owner_user(user_id):
+        return True
+    await message.reply_text(_owner_denied_text())
+    return False
+
+
+async def _require_owner_callback(callback_query) -> bool:
+    user = getattr(callback_query, "from_user", None)
+    user_id = getattr(user, "id", None) if user is not None else None
+    if is_owner_user(user_id):
+        return True
+    if not OWNER_ID or OWNER_ID <= 0:
+        alert = "⛔ OWNER_ID belum ditetapkan dalam .env."
+    else:
+        alert = "⛔ Akses ditolak. Hanya pemilik bot dibenarkan."
+    await callback_query.answer(alert, show_alert=True)
+    return False
+
+
+def _get_command_args(message: Message) -> List[str]:
+    """Extract command arguments after the slash command token."""
+    cmd = getattr(message, "command", None)
+    if isinstance(cmd, (list, tuple)) and len(cmd) > 1:
+        return [str(part) for part in cmd[1:]]
+    text = (getattr(message, "text", None) or "").strip()
+    if not text:
+        return []
+    parts = text.split()
+    return parts[1:] if len(parts) > 1 else []
+
+
+# Native Telegram BotCommand list (must stay aligned with registered filters.command)
+BOT_COMMANDS: List[BotCommand] = [
+    BotCommand("start", "Start bot & open main menu"),
+    BotCommand("login", "Login Telegram account for private forwarding"),
+    BotCommand("cancel", "Cancel active downloads or login flow"),
+    BotCommand("commands", "Show complete guide of all bot commands"),
+    BotCommand("guide", "Show complete bot command guide"),
+    BotCommand("help", "Show bot command guide & usage"),
+    BotCommand("warp", "WARP proxy status & subcommands (Owner)"),
+    BotCommand("warp_install", "Install WARP wireproxy on VPS (Owner)"),
+    BotCommand("warp_on", "Enable WARP proxy for downloads (Owner)"),
+    BotCommand("proxy_on", "Alias for /warp_on (Owner)"),
+    BotCommand("warp_off", "Disable WARP proxy routing (Owner)"),
+    BotCommand("proxy_off", "Alias for /warp_off (Owner)"),
+    BotCommand("warp_status", "Check WARP wireproxy & IP status (Owner)"),
+    BotCommand("checkgroup", "Verify & cache backup group (Backup Group)"),
+    BotCommand("promote", "Promote user to admin (Backup Group)"),
+]
+
+
+async def register_bot_commands(client: Client) -> bool:
+    """Register Telegram's native BotCommand menu (best-effort)."""
+    setter = getattr(client, "set_bot_commands", None)
+    if setter is None:
+        return False
+    try:
+        await setter(BOT_COMMANDS)
+        print(f"✅ Registered {len(BOT_COMMANDS)} Telegram bot commands.")
+        return True
+    except Exception as e:
+        print(f"⚠️ Failed to register Telegram bot commands: {e}")
+        return False
+
+
+def build_command_guide() -> str:
+    """Build the full, categorized reference guide of every command in this bot."""
+    return (
+        "📖 **Panduan Lengkap Arahan Bot (Command Guide)**\n\n"
+        "**🔹 Umum & Akaun**\n"
+        "• `/start` — Mulakan bot, semak status login/profile & buka menu utama\n"
+        "• `/login` — Log masuk akaun Telegram anda (API ID, API Hash, telefon & OTP) untuk forward kandungan private\n"
+        "• `/cancel` — Batalkan semua muat turun/muat naik aktif, prompt caption tertunda, atau proses login\n"
+        "• `/commands` — Paparkan panduan lengkap semua arahan bot ini\n"
+        "• `/guide` — Alias bagi `/commands`\n"
+        "• `/help` — Alias bagi `/commands`\n\n"
+        "**🛡️ WARP Wireproxy (Owner Only)**\n"
+        "_Mengalihkan trafik muat turun **Direct**, **Torrent**, dan **MediaFire** melalui Cloudflare WARP wireproxy di VPS._\n"
+        "• `/warp` — Paparkan status WARP; menyokong sub-arahan:\n"
+        "  `/warp status` | `/warp install` | `/warp on` | `/warp off`\n"
+        "• `/warp_install` — Pasang WARP wireproxy di VPS dengan progres langsung (tambah `force` untuk pasang semula)\n"
+        "• `/warp_on` — Aktifkan routing WARP proxy (kekal selepas restart)\n"
+        "• `/proxy_on` — Alias bagi `/warp_on`\n"
+        "• `/warp_off` — Nyahaktifkan routing WARP proxy & kembali ke sambungan biasa\n"
+        "• `/proxy_off` — Alias bagi `/warp_off`\n"
+        "• `/warp_status` — Semak pemasangan, servis wireproxy, port tempatan (SOCKS5/HTTP) & IP/trace Cloudflare WARP\n\n"
+        "**👥 Admin Backup Group (Backup Group Only)**\n"
+        "• `/checkgroup` — Semak info debug & simpan cache peer Backup Group ke pangkalan data\n"
+        "• `/promote` — Lantik ahli sebagai admin penuh dalam Backup Group (reply mesej, `/promote @username`, atau `/promote <user_id>`)\n\n"
+        "**🎬 Modifier Muat Turun (Hantar Bersama Link / Caption)**\n"
+        "• `/skip` — Tambah `/skip` bersama link (Telegram, Direct, MediaFire, TeraBox, Magnet/URL Torrent) atau caption fail `.torrent` untuk muat turun **video sahaja**\n\n"
+        "**📥 Link & Fail Disokong (Private Chat)**\n"
+        "• **Telegram** — Link mesej private (`t.me/c/...`) & public (`t.me/username/...`), sehingga 50 link/mesej + ekstrak arkib `.zip`/`.rar`\n"
+        "• **Direct Link** — Pautan muat turun terus HTTP/HTTPS _(guna WARP jika ON)_\n"
+        "• **MediaFire** — Pautan fail MediaFire + ekstrak `.zip`/`.rar` _(guna WARP jika ON)_\n"
+        "• **Torrent** — Link `magnet:`, URL `.torrent`, atau fail `.torrent` _(guna WARP jika ON; boleh hantar gambar semasa prompt caption sebagai thumbnail khas untuk torrent 1 video)_\n"
+        "• **TeraBox** — Pautan kongsi fail & folder TeraBox\n"
+        "• **HLS / Video Page** — Pautan strim `.m3u8` / `.m3u` & halaman video disokong (ditukar ke MP4)"
+    )
+
+
+@app.on_message(filters.command(["commands", "guide", "help"]))
+async def commands_guide_handler(client: Client, message: Message):
+    """Send a readable guide listing all commands supported by the bot."""
+    await send_long_message(message, build_command_guide())
+
+
+def get_warp_keyboard(status: Optional[WarpStatus]) -> InlineKeyboardMarkup:
+    """Build quick inline action buttons for WARP wireproxy management."""
+    if status is None:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="warp_refresh")],
+        ])
+
+    if not status.installed and not status.ports_listening:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Install WARP", callback_data="warp_install")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="warp_refresh")],
+        ])
+
+    toggle_btn = (
+        InlineKeyboardButton("🔴 Turn OFF", callback_data="warp_off")
+        if status.proxy_enabled
+        else InlineKeyboardButton("🟢 Turn ON", callback_data="warp_on")
+    )
+    return InlineKeyboardMarkup([
+        [toggle_btn, InlineKeyboardButton("🔄 Refresh", callback_data="warp_refresh")],
+        [InlineKeyboardButton("⚙️ Reinstall", callback_data="warp_reinstall")],
+    ])
+
+
+def _format_trace_lines(
+    warp_on: Optional[bool],
+    warp_state: str,
+    exit_ip: Optional[str],
+    location: Optional[str],
+    colo: Optional[str],
+) -> List[str]:
+    lines: List[str] = []
+    if warp_on is True:
+        lines.append(f"• **Cloudflare WARP:** ✅ `warp={warp_state}`")
+    elif warp_on is False:
+        lines.append(f"• **Cloudflare WARP:** ⚠️ `warp={warp_state}`")
+    else:
+        lines.append("• **Cloudflare WARP:** ⚪ Tidak disemak / tidak aktif")
+
+    if exit_ip:
+        meta = [part for part in (location, colo) if part]
+        suffix = f" ({' • '.join(meta)})" if meta else ""
+        lines.append(f"• **Exit IP:** `{exit_ip}`{suffix}")
+    else:
+        lines.append("• **Exit IP:** `N/A`")
+    return lines
+
+
+def format_warp_status_message(status: WarpStatus) -> str:
+    """Render a comprehensive Markdown summary for ``WarpStatus``."""
+    routing_str = "🟢 **ON**" if status.proxy_enabled else "🔴 **OFF**"
+    features = ", ".join(status.affected_features or WARP_AFFECTED_FEATURES)
+
+    if status.installed:
+        install_str = "✅ Dipasang"
+    elif status.wireproxy_binary or status.config_exists:
+        install_str = "⚠️ Tidak lengkap (sila jalankan `/warp_install`)"
+    else:
+        install_str = "❌ Belum dipasang"
+
+    mode_label = f" (`{status.service_manager}`)" if status.service_manager else ""
+    service_str = f"🟢 Aktif{mode_label}" if status.service_active else f"🔴 Tidak aktif{mode_label}"
+    socks_state = "🟢 Listening" if status.socks5_listening else "🔴 Closed"
+    http_state = "🟢 Listening" if status.http_listening else "🔴 Closed"
+
+    lines = [
+        "🛡️ **Status WARP Wireproxy**",
+        "",
+        f"• **Routing Proxy:** {routing_str}",
+        f"• **Ciri Terlibat:** {features}",
+        f"• **Pemasangan:** {install_str}",
+        f"• **Servis Wireproxy:** {service_str}",
+        f"• **SOCKS5:** `{status.socks5_url}` ({socks_state})",
+        f"• **HTTP:** `{status.http_url}` ({http_state})",
+    ]
+    lines.extend(
+        _format_trace_lines(
+            status.warp_on,
+            status.warp_state,
+            status.exit_ip,
+            status.location,
+            status.colo,
+        )
+    )
+    if status.platform:
+        lines.append(f"• **Platform:** `{status.platform}`")
+
+    if status.detail:
+        lines.extend(["", f"ℹ️ {status.detail}"])
+    if status.error and status.error != status.detail:
+        lines.append(f"⚠️ **Ralat:** `{_safe_inline_code(status.error)}`")
+
+    lines.extend([
+        "",
+        "**Arahan Pantas:**",
+        "• `/warp_install` — Pasang / pasang semula WARP di VPS",
+        "• `/warp_on` — Aktifkan proxy WARP",
+        "• `/warp_off` — Nyahaktifkan proxy WARP",
+        "• `/warp_status` — Semak status terkini",
+    ])
+    return truncate_telegram_text("\n".join(lines))
+
+
+def format_warp_install_result(result: WarpActionResult) -> str:
+    """Render the final Telegram summary after a WARP wireproxy install attempt."""
+    status = result.status
+    trace = result.trace
+
+    if result.ok:
+        lines = ["✅ **WARP Wireproxy Berjaya Dipasang!**", ""]
+    else:
+        lines = ["❌ **Pemasangan WARP Wireproxy Gagal**", ""]
+
+    if status is not None:
+        install_str = "✅ Dipasang" if status.installed else "❌ Belum dipasang"
+        mode_label = f" (`{status.service_manager}`)" if status.service_manager else ""
+        service_str = f"🟢 Aktif{mode_label}" if status.service_active else f"🔴 Tidak aktif{mode_label}"
+        routing_str = "🟢 ON" if status.proxy_enabled else "🔴 OFF"
+        socks_state = "🟢 Listening" if status.socks5_listening else "🔴 Closed"
+        http_state = "🟢 Listening" if status.http_listening else "🔴 Closed"
+        lines.extend([
+            f"• **Pemasangan:** {install_str}",
+            f"• **Servis:** {service_str}",
+            f"• **Routing Proxy:** {routing_str}",
+            f"• **SOCKS5:** `{status.socks5_url or result.socks5_url}` ({socks_state})",
+            f"• **HTTP:** `{status.http_url or result.http_url}` ({http_state})",
+        ])
+    else:
+        if result.socks5_url:
+            lines.append(f"• **SOCKS5:** `{result.socks5_url}`")
+        if result.http_url:
+            lines.append(f"• **HTTP:** `{result.http_url}`")
+
+    if trace is not None:
+        lines.extend(
+            _format_trace_lines(
+                trace.warp_on if trace.ok else False,
+                trace.warp_state,
+                trace.exit_ip,
+                trace.location,
+                trace.colo,
+            )
+        )
+    elif status is not None and (status.warp_on is not None or status.exit_ip):
+        lines.extend(
+            _format_trace_lines(
+                status.warp_on,
+                status.warp_state,
+                status.exit_ip,
+                status.location,
+                status.colo,
+            )
+        )
+
+    if result.ok:
+        features = ", ".join(
+            (status.affected_features if status is not None else WARP_AFFECTED_FEATURES)
+        )
+        routing_on = bool(result.enabled if result.enabled is not None else (status.proxy_enabled if status else False))
+        lines.append("")
+        if routing_on:
+            lines.append(f"🟢 Routing WARP proxy sudah **ON** untuk **{features}**.")
+        else:
+            lines.append(
+                f"💡 Gunakan `/warp_on` (atau butang **🟢 Turn ON** di bawah) "
+                f"untuk aktifkan routing WARP bagi **{features}**."
+            )
+    else:
+        err_text = result.error or result.message or "Unknown installation error."
+        lines.extend(["", f"⚠️ **Butiran Ralat:**\n`{_safe_inline_code(err_text)}`"])
+
+    return truncate_telegram_text("\n".join(lines))
+
+
+def format_warp_toggle_result(result: WarpActionResult, turning_on: bool) -> str:
+    """Render confirmation or error message after toggling WARP proxy ON/OFF."""
+    status = result.status
+    features = ", ".join(
+        (status.affected_features if status is not None else WARP_AFFECTED_FEATURES)
+    )
+
+    if result.ok and turning_on:
+        lines = [
+            "🟢 **WARP Proxy: ON**",
+            "",
+            f"• **Ciri Terlibat:** {features}",
+            f"• **SOCKS5:** `{result.socks5_url or (status.socks5_url if status else '')}`",
+            f"• **HTTP:** `{result.http_url or (status.http_url if status else '')}`",
+        ]
+        if status is not None:
+            mode_label = f" (`{status.service_manager}`)" if status.service_manager else ""
+            svc = f"🟢 Aktif{mode_label}" if status.service_active else f"🔴 Tidak aktif{mode_label}"
+            lines.append(f"• **Servis Wireproxy:** {svc}")
+        if result.message:
+            lines.extend(["", f"ℹ️ {result.message}"])
+        lines.append("\n💡 Guna `/warp_status` untuk semak IP/trace Cloudflare atau `/warp_off` untuk matikan.")
+        return truncate_telegram_text("\n".join(lines))
+
+    if result.ok and not turning_on:
+        lines = [
+            "🔴 **WARP Proxy: OFF**",
+            "",
+            f"• **Ciri Terlibat:** {features} kini menggunakan sambungan biasa (default).",
+        ]
+        if status is not None:
+            install_str = "✅ Dipasang" if status.installed else "❌ Belum dipasang"
+            lines.append(f"• **Pemasangan Wireproxy:** {install_str}")
+        if result.message:
+            lines.extend(["", f"ℹ️ {result.message}"])
+        lines.append("\n💡 Guna `/warp_on` untuk aktifkan semula bila-bila masa.")
+        return truncate_telegram_text("\n".join(lines))
+
+    action_label = "mengaktifkan" if turning_on else "menyahaktifkan"
+    err_text = result.error or result.message or "Operasi gagal."
+    lines = [
+        f"❌ **Gagal {action_label} WARP Proxy**",
+        "",
+        f"⚠️ {err_text}",
+        "",
+        "💡 Semak dengan `/warp_status` atau pasang terlebih dahulu dengan `/warp_install`.",
+    ]
+    return truncate_telegram_text("\n".join(lines))
+
+
+async def _sync_torrent_proxy_best_effort(proxy_url: Optional[str]) -> None:
+    """Keep any running aria2c daemon synced immediately on WARP ON/OFF toggle."""
+    try:
+        await sync_aria2_proxy(proxy_url)
+    except Exception as exc:
+        print(f"[WARP] Failed to sync aria2 proxy ({proxy_url!r}): {exc}")
+
+
+async def _run_warp_install_flow(
+    status_msg: Message,
+    force: bool = False,
+    *,
+    _lock_held: bool = False,
+) -> None:
+    """Execute ``install_warp`` with live Telegram status edits and concurrency guard."""
+    global _warp_install_in_progress
+    if not _lock_held:
+        if _warp_install_in_progress:
+            await safe_edit(
+                status_msg,
+                "⏳ **Pemasangan WARP wireproxy sedang berjalan.**\n\nSila tunggu sehingga pemasangan sedia ada selesai.",
+            )
+            return
+        _warp_install_in_progress = True
+
+    progress_lines: List[str] = []
+
+    async def on_progress(step_text: str) -> None:
+        cleaned = (step_text or "").strip()
+        if not cleaned:
+            return
+        if not progress_lines or progress_lines[-1] != cleaned:
+            progress_lines.append(cleaned)
+        visible = progress_lines[-12:]
+        body = "\n".join(f"• {line}" for line in visible)
+        title = (
+            "⚙️ **Memasang Semula WARP Wireproxy di VPS...**"
+            if force
+            else "⚙️ **Memasang WARP Wireproxy di VPS...**"
+        )
+        await safe_edit(
+            status_msg,
+            truncate_telegram_text(f"{title}\n\n{body}\n\n🔄 _Sedang memproses..._"),
+        )
+
+    try:
+        try:
+            result = await install_warp(on_progress=on_progress, force=force)
+        except Exception as exc:
+            err_msg = _safe_inline_code(str(exc) or type(exc).__name__)
+            await safe_edit(
+                status_msg,
+                truncate_telegram_text(
+                    f"❌ **Pemasangan WARP Wireproxy Gagal**\n\n⚠️ `{err_msg}`"
+                ),
+            )
+            return
+
+        await safe_edit(
+            status_msg,
+            format_warp_install_result(result),
+            reply_markup=get_warp_keyboard(result.status),
+        )
+    finally:
+        if not _lock_held:
+            _warp_install_in_progress = False
+
+
+async def _handle_warp_install(message: Message, force: bool = False) -> None:
+    global _warp_install_in_progress
+    if _warp_install_in_progress:
+        await message.reply_text(
+            "⏳ **Pemasangan WARP wireproxy sedang berjalan.**\n\nSila tunggu sehingga selesai."
+        )
+        return
+    # Claim guard synchronously before the first await so concurrent triggers cannot race
+    _warp_install_in_progress = True
+    try:
+        initial_title = (
+            "⚙️ **Memasang Semula WARP Wireproxy di VPS...**"
+            if force
+            else "⚙️ **Memasang WARP Wireproxy di VPS...**"
+        )
+        status_msg = await message.reply_text(f"{initial_title}\n\n🔄 Memulakan pemasangan...")
+        await _run_warp_install_flow(status_msg, force=force, _lock_held=True)
+    finally:
+        _warp_install_in_progress = False
+
+
+async def _handle_warp_on(message: Message) -> None:
+    status_msg = await message.reply_text("🔄 **Mengaktifkan WARP proxy...**")
+    try:
+        result = await enable_proxy()
+    except Exception as exc:
+        err_msg = _safe_inline_code(str(exc) or type(exc).__name__)
+        await safe_edit(
+            status_msg,
+            truncate_telegram_text(f"❌ **Gagal mengaktifkan WARP Proxy**\n\n⚠️ `{err_msg}`"),
+        )
+        return
+    if result.ok:
+        http_url = result.http_url or (result.status.http_url if result.status else None)
+        await _sync_torrent_proxy_best_effort(http_url)
+    await safe_edit(
+        status_msg,
+        format_warp_toggle_result(result, turning_on=True),
+        reply_markup=get_warp_keyboard(result.status),
+    )
+
+
+async def _handle_warp_off(message: Message) -> None:
+    status_msg = await message.reply_text("🔄 **Menyahaktifkan WARP proxy...**")
+    try:
+        result = await disable_proxy()
+    except Exception as exc:
+        err_msg = _safe_inline_code(str(exc) or type(exc).__name__)
+        await safe_edit(
+            status_msg,
+            truncate_telegram_text(f"❌ **Gagal menyahaktifkan WARP Proxy**\n\n⚠️ `{err_msg}`"),
+        )
+        return
+    if result.ok:
+        await _sync_torrent_proxy_best_effort(None)
+    await safe_edit(
+        status_msg,
+        format_warp_toggle_result(result, turning_on=False),
+        reply_markup=get_warp_keyboard(result.status),
+    )
+
+
+async def _handle_warp_status(message: Message) -> None:
+    status_msg = await message.reply_text("🔄 **Memeriksa status WARP wireproxy...**")
+    try:
+        status = await get_warp_status(check_trace=True)
+    except Exception as exc:
+        err_msg = _safe_inline_code(str(exc) or type(exc).__name__)
+        await safe_edit(
+            status_msg,
+            truncate_telegram_text(f"❌ **Gagal memeriksa status WARP**\n\n⚠️ `{err_msg}`"),
+        )
+        return
+    await safe_edit(
+        status_msg,
+        format_warp_status_message(status),
+        reply_markup=get_warp_keyboard(status),
+    )
+
+
+@app.on_message(filters.command("warp"))
+async def warp_command_handler(client: Client, message: Message):
+    """Unified WARP command: /warp [status|install|reinstall|on|off]."""
+    if not await _require_owner_message(message):
+        return
+
+    args = [arg.lower() for arg in _get_command_args(message)]
+    subcmd = args[0] if args else "status"
+
+    if subcmd in ("status", "info"):
+        await _handle_warp_status(message)
+    elif subcmd in ("install", "reinstall"):
+        force = subcmd == "reinstall" or any(
+            a in ("force", "--force", "-f", "reinstall") for a in args[1:]
+        )
+        await _handle_warp_install(message, force=force)
+    elif subcmd in ("on", "enable", "start"):
+        await _handle_warp_on(message)
+    elif subcmd in ("off", "disable", "stop"):
+        await _handle_warp_off(message)
+    else:
+        await message.reply_text(
+            "🛡️ **Penggunaan Arahan `/warp` (Owner Only)**\n\n"
+            "• `/warp` atau `/warp status` — Semak status WARP wireproxy & IP\n"
+            "• `/warp install` (atau `/warp install force`) — Pasang WARP wireproxy di VPS\n"
+            "• `/warp on` — Aktifkan WARP proxy (Direct, Torrent, MediaFire)\n"
+            "• `/warp off` — Nyahaktifkan WARP proxy\n\n"
+            "Alias pintas: `/warp_status`, `/warp_install`, `/warp_on`, `/proxy_on`, `/warp_off`, `/proxy_off`"
+        )
+
+
+@app.on_message(filters.command("warp_install"))
+async def warp_install_handler(client: Client, message: Message):
+    """Install (or reinstall with ``force``) WARP wireproxy on the VPS (Owner only)."""
+    if not await _require_owner_message(message):
+        return
+    args = [arg.lower() for arg in _get_command_args(message)]
+    force = any(a in ("force", "--force", "-f", "reinstall") for a in args)
+    await _handle_warp_install(message, force=force)
+
+
+@app.on_message(filters.command(["warp_on", "proxy_on"]))
+async def warp_on_handler(client: Client, message: Message):
+    """Turn WARP proxy routing ON for Direct, Torrent, and MediaFire (Owner only)."""
+    if not await _require_owner_message(message):
+        return
+    await _handle_warp_on(message)
+
+
+@app.on_message(filters.command(["warp_off", "proxy_off"]))
+async def warp_off_handler(client: Client, message: Message):
+    """Turn WARP proxy routing OFF (Owner only)."""
+    if not await _require_owner_message(message):
+        return
+    await _handle_warp_off(message)
+
+
+@app.on_message(filters.command("warp_status"))
+async def warp_status_handler(client: Client, message: Message):
+    """Show WARP wireproxy install state, service health, routing toggle & trace (Owner only)."""
+    if not await _require_owner_message(message):
+        return
+    await _handle_warp_status(message)
+
+
+@app.on_callback_query(filters.regex(r"^warp_"))
+async def warp_callback_handler(client: Client, callback_query):
+    """Handle inline quick-action buttons on WARP status messages (Owner only)."""
+    global _warp_install_in_progress
+    if not await _require_owner_callback(callback_query):
+        return
+
+    action = callback_query.data
+    msg = getattr(callback_query, "message", None)
+    if msg is None:
+        await callback_query.answer("⚠️ Mesej asal tidak dijumpai.", show_alert=True)
+        return
+
+    if action == "warp_refresh":
+        await callback_query.answer("🔄 Menyemak status...")
+        try:
+            status = await get_warp_status(check_trace=True)
+            await safe_edit(
+                msg,
+                format_warp_status_message(status),
+                reply_markup=get_warp_keyboard(status),
+            )
+        except Exception as exc:
+            err_msg = _safe_inline_code(str(exc) or type(exc).__name__)
+            await safe_edit(
+                msg,
+                truncate_telegram_text(f"❌ **Gagal memeriksa status WARP**\n\n⚠️ `{err_msg}`"),
+            )
+
+    elif action == "warp_on":
+        await callback_query.answer("🟢 Mengaktifkan WARP proxy...")
+        try:
+            result = await enable_proxy()
+            if result.ok:
+                http_url = result.http_url or (result.status.http_url if result.status else None)
+                await _sync_torrent_proxy_best_effort(http_url)
+            await safe_edit(
+                msg,
+                format_warp_toggle_result(result, turning_on=True),
+                reply_markup=get_warp_keyboard(result.status),
+            )
+        except Exception as exc:
+            err_msg = _safe_inline_code(str(exc) or type(exc).__name__)
+            await safe_edit(
+                msg,
+                truncate_telegram_text(f"❌ **Gagal mengaktifkan WARP Proxy**\n\n⚠️ `{err_msg}`"),
+            )
+
+    elif action == "warp_off":
+        await callback_query.answer("🔴 Menyahaktifkan WARP proxy...")
+        try:
+            result = await disable_proxy()
+            if result.ok:
+                await _sync_torrent_proxy_best_effort(None)
+            await safe_edit(
+                msg,
+                format_warp_toggle_result(result, turning_on=False),
+                reply_markup=get_warp_keyboard(result.status),
+            )
+        except Exception as exc:
+            err_msg = _safe_inline_code(str(exc) or type(exc).__name__)
+            await safe_edit(
+                msg,
+                truncate_telegram_text(f"❌ **Gagal menyahaktifkan WARP Proxy**\n\n⚠️ `{err_msg}`"),
+            )
+
+    elif action in ("warp_install", "warp_reinstall"):
+        if _warp_install_in_progress:
+            await callback_query.answer(
+                "⏳ Pemasangan WARP sedang berjalan. Sila tunggu.", show_alert=True
+            )
+            return
+        # Claim guard synchronously before the first await so double-clicks cannot race or clobber msg
+        _warp_install_in_progress = True
+        try:
+            force = action == "warp_reinstall"
+            await callback_query.answer("⚙️ Memulakan pemasangan WARP...")
+            initial_title = (
+                "⚙️ **Memasang Semula WARP Wireproxy di VPS...**"
+                if force
+                else "⚙️ **Memasang WARP Wireproxy di VPS...**"
+            )
+            await safe_edit(msg, f"{initial_title}\n\n🔄 Memulakan pemasangan...")
+            await _run_warp_install_flow(msg, force=force, _lock_held=True)
+        finally:
+            _warp_install_in_progress = False
+
+    else:
+        await callback_query.answer("Tindakan tidak dikenali.", show_alert=True)
 
 
 @app.on_callback_query(filters.regex(r"^job_cancel_"))

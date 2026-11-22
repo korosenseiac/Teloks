@@ -75,6 +75,7 @@ from app.utils.caption import (
     set_caption_state,
 )
 from app.utils.video_compressor import convert_mkv_to_mp4, is_convertible
+from app.warp import WarpProxyError
 
 # ---------------------------------------------------------------------------
 # Pattern matching for direct links
@@ -400,6 +401,10 @@ async def _download_video_to_temp(
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         writer_task.cancel()
 
+                if isinstance(e, WarpProxyError):
+                    print(f"[DirectLink] WARP proxy error during temp video download: {e}")
+                    raise e
+
                 import aiohttp
                 if isinstance(e, (aiohttp.ClientError, ValueError)):
                     print(f"[DirectLink] Temp video download dropped (offset {offset}): {e}. Retries left: {retries - 1}")
@@ -631,6 +636,8 @@ async def _upload_file_to_backup(
                 if cached is user_client:
                     await manager.invalidate(uid)
                     break
+        raise
+    except WarpProxyError:
         raise
     except Exception as e:
         print(f"[DirectLink] Upload error: {e}")
@@ -1012,12 +1019,13 @@ async def _handle_archive(
         )
         dl_tracker.start()
 
-        archive_path = await _download_archive_to_temp(
-            direct_client, url, filename, file_size, temp_dir,
-            tracker=dl_tracker,
-        )
-
-        await dl_tracker.stop()
+        try:
+            archive_path = await _download_archive_to_temp(
+                direct_client, url, filename, file_size, temp_dir,
+                tracker=dl_tracker,
+            )
+        finally:
+            await dl_tracker.stop()
 
         # Check for cancellation after download
         if is_cancelled(user_id):
@@ -1474,6 +1482,9 @@ async def process_direct_download(
         await safe_edit(status_msg, "🔍 Mengekstrak metadata URL...")
         try:
             metadata = await direct_client.resolve(url)
+        except WarpProxyError as e:
+            await safe_edit(status_msg, f"❌ {e}")
+            return
         except Exception as e:
             await safe_edit(status_msg, f"❌ Tidak dapat mengakses URL: {e}")
             return
@@ -1743,6 +1754,8 @@ async def process_direct_download(
                     # Upload from temp file — download is already fully counted,
                     # so don't pass on_download_chunk to FileStreamer.
                     streamer = FileStreamer(temp_video_path, file_name)
+            except WarpProxyError:
+                raise
             except Exception as e:
                 print(f"[DirectLink] Video processing error: {e}")
                 await tracker.stop(f"❌ Ralat pemprosesan video: {e}")
@@ -1763,16 +1776,17 @@ async def process_direct_download(
         video_caption = generate_video_caption(file_name, exclude_words) if (enable_caption and is_video) else None
 
         # Upload to backup group with metadata and thumbnail
-        msg_id, is_sent_to_bot = await _upload_file_to_backup(
-            bot, user_client, backup_peer, streamer, file_name, file_size, 
-            tracker=tracker,
-            thumb_raw=thumb_raw,
-            video_meta=video_meta,
-            caption=video_caption,
-        )
-
-        if hasattr(streamer, "close"):
-            await streamer.close()
+        try:
+            msg_id, is_sent_to_bot = await _upload_file_to_backup(
+                bot, user_client, backup_peer, streamer, file_name, file_size, 
+                tracker=tracker,
+                thumb_raw=thumb_raw,
+                video_meta=video_meta,
+                caption=video_caption,
+            )
+        finally:
+            if hasattr(streamer, "close"):
+                await streamer.close()
 
         # Clean up temp video file if created
         if temp_video_path and os.path.exists(temp_video_path):
@@ -1825,6 +1839,15 @@ async def process_direct_download(
             await tracker.stop("❌ Sesi anda telah tamat. Sila /start dan login semula.")
         else:
             await safe_edit(status_msg, "❌ Sesi anda telah tamat. Sila /start dan login semula.")
+    except WarpProxyError as e:
+        print(f"[DirectLink] WARP proxy error for user {user_id}: {e}")
+        if tracker:
+            await tracker.stop(f"❌ {e}")
+        else:
+            try:
+                await safe_edit(status_msg, f"❌ {e}")
+            except Exception:
+                pass
     except Exception as e:
         print(f"[DirectLink] Handler error: {e}")
         import traceback

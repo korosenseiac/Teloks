@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 from typing import Callable, Optional, TYPE_CHECKING
 
+from app.warp import WarpProxyError
+
 if TYPE_CHECKING:
     from app.direct.client import DirectLinkClient
 
@@ -57,6 +59,7 @@ class DirectLinkStreamer:
         self.download_task: Optional[asyncio.Task] = None
         self.is_downloading: bool = True
         self.chunk_size: int = self.CHUNK_SIZE
+        self.error: Optional[BaseException] = None
 
     # ------------------------------------------------------------------ start
 
@@ -71,38 +74,49 @@ class DirectLinkStreamer:
         Handles network reconnects internally via start_offset."""
         retries = 3
         offset = 0
+        cancelled = False
 
-        while retries > 0 and self.is_downloading:
-            try:
-                async for chunk in self.client.download_stream(
-                    self.url, chunk_size=self.CHUNK_SIZE, start_offset=offset
-                ):
-                    await self.queue.put(chunk)
-                    offset += len(chunk)
-                    if self.on_download_chunk:
-                        self.on_download_chunk(len(chunk))
-                
-                # If we get here, the stream finished successfully
-                break
+        try:
+            while retries > 0 and self.is_downloading:
+                try:
+                    async for chunk in self.client.download_stream(
+                        self.url, chunk_size=self.CHUNK_SIZE, start_offset=offset
+                    ):
+                        await self.queue.put(chunk)
+                        offset += len(chunk)
+                        if self.on_download_chunk:
+                            self.on_download_chunk(len(chunk))
 
-            except Exception as e:
-                import aiohttp
-                if isinstance(e, (aiohttp.ClientError, ValueError)):
-                    print(f"[DirectLink] Download stream dropped (offset {offset}): {e}. Retries left: {retries - 1}")
-                    retries -= 1
-                    if retries > 0:
-                        await asyncio.sleep(2)  # wait before retry
-                        continue
-                print(f"[DirectLink] Unrecoverable download error: {e}")
-                break
-        
-        self.is_downloading = False
-        await self.queue.put(None)  # EOF sentinel
+                    # If we get here, the stream finished successfully
+                    break
+
+                except WarpProxyError as e:
+                    print(f"[DirectLink] WARP proxy error during download (offset {offset}): {e}")
+                    self.error = e
+                    break
+                except Exception as e:
+                    import aiohttp
+                    if isinstance(e, (aiohttp.ClientError, ValueError)):
+                        print(f"[DirectLink] Download stream dropped (offset {offset}): {e}. Retries left: {retries - 1}")
+                        retries -= 1
+                        if retries > 0:
+                            await asyncio.sleep(2)  # wait before retry
+                            continue
+                    print(f"[DirectLink] Unrecoverable download error: {e}")
+                    break
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            self.is_downloading = False
+            if not cancelled:
+                await self.queue.put(None)  # EOF sentinel
 
     # ------------------------------------------------------------------- close
 
     async def close(self) -> None:
         """Cancel the background reader task if it exists."""
+        self.is_downloading = False
         if self.download_task is not None and not self.download_task.done():
             self.download_task.cancel()
             try:
@@ -133,10 +147,14 @@ class DirectLinkStreamer:
             await self.start_download()
 
         if self.queue.empty() and not self.is_downloading:
+            if self.error is not None:
+                raise self.error
             return b""
 
         chunk = await self.queue.get()
         if chunk is None:
+            if self.error is not None:
+                raise self.error
             return b""
 
         self.current_offset += len(chunk)

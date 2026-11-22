@@ -179,3 +179,30 @@ HLS_BROWSER_BLOCK_ADS = os.getenv("HLS_BROWSER_BLOCK_ADS", "true").lower() in ("
 # limits in deploy/install.sh (MemoryMax / CPUQuota) and CONVERT_CONCURRENCY.
 MAX_CONCURRENT_PROCESSES = int(os.getenv("MAX_CONCURRENT_PROCESSES", "2"))
 
+# ---------------------------------------------------------------------------
+# Cloudflare WARP (wireproxy) — optional local SOCKS5 + HTTP proxy
+# ---------------------------------------------------------------------------
+# Loopback host only — non-loopback values are rejected/clamped to 127.0.0.1
+# so unauthenticated local proxy ports are never exposed to the network.
+WARP_BIND_HOST = os.getenv("WARP_BIND_HOST", "127.0.0.1").strip() or "127.0.0.1"
+WARP_SOCKS5_PORT = int(os.getenv("WARP_SOCKS5_PORT", "40000"))
+WARP_HTTP_PORT = int(os.getenv("WARP_HTTP_PORT", "40001"))
+
+# Directory for wireproxy binary, wgcf credentials, wireproxy.conf, pid, logs,
+# and local fallback state. Defaults to <project_root>/warp so it remains
+# writable inside deploy/install.sh's hardened systemd sandbox
+# (ProtectSystem=strict, ProtectHome=true, ReadWritePaths=$BOT_DIR).
+WARP_DATA_DIR = os.getenv(
+    "WARP_DATA_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "warp"),
+)
+WARP_SERVICE_NAME = os.getenv("WARP_SERVICE_NAME", "warp-wireproxy").strip() or "warp-wireproxy"
+WARP_MTU = int(os.getenv("WARP_MTU", "1280"))
+WARP_KEEPALIVE = int(os.getenv("WARP_KEEPALIVE", "25"))
+WARP_ENDPOINT = (
+    os.getenv("WARP_ENDPOINT", "engage.cloudflareclient.com:2408").strip()
+    or "engage.cloudflareclient.com:2408"
+)
+WARP_TRACE_TIMEOUT = int(os.getenv("WARP_TRACE_TIMEOUT", "12"))
+
+

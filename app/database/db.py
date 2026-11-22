@@ -55,6 +55,29 @@ async def get_backup_group_cache():
     """Get the cached backup group info from database."""
     return await settings_collection.find_one({"_id": "backup_group_cache"})
 
+WARP_SETTINGS_DOC_ID = "warp_proxy_settings"
+
+async def save_warp_proxy_state(enabled: bool, meta: dict | None = None):
+    """Persist the WARP wireproxy ON/OFF toggle in MongoDB settings."""
+    payload = {
+        "enabled": bool(enabled),
+        "updated_at": datetime.datetime.now(datetime.timezone.utc),
+    }
+    if meta:
+        for key, value in meta.items():
+            if key not in ("_id", "enabled", "updated_at"):
+                payload[key] = value
+
+    await settings_collection.update_one(
+        {"_id": WARP_SETTINGS_DOC_ID},
+        {"$set": payload},
+        upsert=True,
+    )
+
+async def get_warp_proxy_state():
+    """Return the persisted WARP wireproxy settings document, or None."""
+    return await settings_collection.find_one({"_id": WARP_SETTINGS_DOC_ID})
+
 async def save_user_session(user_id, session_string, api_id, api_hash):
     """Save the user's custom session for accessing their private chats."""
     await sessions_collection.update_one(

@@ -65,8 +65,19 @@ from app.utils.media import (
     ext as _ext, classify as _classify, mime as _mime,
     SKIP_PATTERN,
 )
-from app.torrent.client import Aria2Error
+from app.torrent.client import (
+    Aria2Error,
+    download_torrent_file_via_warp,
+    extract_info_hash_from_magnet,
+    is_aria2_proxy_error,
+)
 from app.torrent.streamer import TorrentFileStreamer
+from app.warp import (
+    WarpProxyError,
+    check_proxy_reachable,
+    ensure_proxy_ready,
+    format_warp_proxy_error,
+)
 from app.terabox.progress import ProgressTracker
 from app.bot.session_manager import manager
 from app.utils.caption import (
@@ -1288,6 +1299,12 @@ async def process_torrent_download(
                 job_download=job_download,
                 status_markup=process_cancel_keyboard(slot.sid),
             )
+    except WarpProxyError as e:
+        print(f"[Torrent] WARP proxy error: {e}")
+        try:
+            await safe_edit(status_msg, f"❌ {e}")
+        except Exception:
+            pass
     except Aria2Error as e:
         print(f"[Torrent] Aria2 error: {e}")
         try:
@@ -1315,14 +1332,16 @@ async def process_torrent_download(
         # Stop THIS job's aria2 downloads first (cancelled / errored / finished)
         # so a re-add of the same torrent never hits "already registered" and
         # nothing keeps writing, then reclaim the disk. A second torrent of the
-        # same user is untouched.
-        try:
-            aria2 = await get_aria2_client()
-            await aria2.cleanup_download(
-                job_download["gids"], job_download["info_hash"]
-            )
-        except Exception as e:
-            print(f"[Torrent] aria2 cleanup failed for user {user_id}: {e}")
+        # same user is untouched. Skip spawning aria2c if this job failed before
+        # submitting any download (e.g. WARP proxy unreachable).
+        if job_download["gids"] or job_download["info_hash"]:
+            try:
+                aria2 = await get_aria2_client()
+                await aria2.cleanup_download(
+                    job_download["gids"], job_download["info_hash"]
+                )
+            except Exception as e:
+                print(f"[Torrent] aria2 cleanup failed for user {user_id}: {e}")
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
@@ -1373,8 +1392,37 @@ async def _process_torrent(
     download_dir = os.path.join(temp_dir, "files")
     os.makedirs(download_dir, exist_ok=True)
 
-    # 1. Start aria2c client
+    # 0. Resolve WARP proxy state & verify reachability before launching aria2c.
+    # aria2c natively supports HTTP proxies only (wireproxy [http] listener via
+    # all-proxy + proxy-method=tunnel); remote .torrent URL fetches additionally
+    # route through wireproxy's SOCKS5 listener (rdns=True) when WARP is ON.
+    proxy_cfg = await ensure_proxy_ready(
+        require_http=True,
+        require_socks5=(link_type == "torrent_url"),
+        auto_start=True,
+        feature="Torrent",
+    )
+    http_proxy_url = proxy_cfg.http_url if proxy_cfg else None
+
+    effective_link = link_or_path
+    effective_type = link_type
+
+    if link_type == "torrent_url" and proxy_cfg is not None:
+        await safe_edit(status_msg, "🧲 Memuat turun fail .torrent melalui WARP Proxy…")
+        remote_torrent_path = os.path.join(temp_dir, "remote.torrent")
+        effective_type, effective_link = await download_torrent_file_via_warp(
+            link_or_path,
+            remote_torrent_path,
+            socks5_url=proxy_cfg.socks5_url,
+        )
+
+    if is_cancelled(user_id):
+        await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
+        return
+
+    # 1. Start aria2c client and sync proxy settings (apply when ON, clear when OFF)
     aria2 = await get_aria2_client()
+    await aria2.set_proxy(http_proxy_url)
 
     def _register_job(gid: Optional[str] = None, info_hash: Optional[str] = None) -> None:
         """Track this job's GIDs/infoHash for its own cleanup."""
@@ -1386,27 +1434,32 @@ async def _process_torrent(
     # Register the job's aria2 downloads so the caller's finally block can fully
     # purge them even if a cancellation/error interrupts us before
     # wait_for_download gets a chance to clean up.
-    if link_type == "magnet":
+    if effective_type == "magnet":
         # Register the infoHash from the magnet URI right away, so cleanup works
         # even if we are cancelled before aria2 exposes the infoHash itself.
-        from app.torrent.client import extract_info_hash_from_magnet
-        _register_job(info_hash=extract_info_hash_from_magnet(link_or_path))
+        _register_job(info_hash=extract_info_hash_from_magnet(effective_link))
 
-    # 2. Submit download
-    if link_type == "magnet":
-        gid = await aria2.add_magnet(link_or_path, download_dir)
-    elif link_type == "torrent_url":
-        gid = await aria2.add_torrent_url(link_or_path, download_dir)
-    elif link_type == "torrent_file":
-        gid = await aria2.add_torrent(link_or_path, download_dir)
+    # 2. Submit download (explicitly passing proxy_url so stale settings never leak)
+    if effective_type == "magnet":
+        gid = await aria2.add_magnet(effective_link, download_dir, proxy_url=http_proxy_url)
+    elif effective_type == "torrent_url":
+        gid = await aria2.add_torrent_url(effective_link, download_dir, proxy_url=http_proxy_url)
+    elif effective_type == "torrent_file":
+        gid = await aria2.add_torrent(effective_link, download_dir, proxy_url=http_proxy_url)
     else:
-        raise ValueError(f"Unknown link type: {link_type}")
+        raise ValueError(f"Unknown link type: {effective_type}")
     _register_job(gid=gid)
 
-    print(f"[Torrent] Download started: gid={gid} type={link_type}")
+    proxy_log = f"warp={http_proxy_url}" if http_proxy_url else "warp=off"
+    print(f"[Torrent] Download started: gid={gid} type={effective_type} ({proxy_log})")
 
     # 3. Wait for metadata (for magnet links, aria2 first fetches metadata)
-    await safe_edit(status_msg, "🔍 Mendapatkan maklumat torrent…")
+    status_label = (
+        "🔍 Mendapatkan maklumat torrent (WARP Proxy)…"
+        if http_proxy_url
+        else "🔍 Mendapatkan maklumat torrent…"
+    )
+    await safe_edit(status_msg, status_label)
 
     # Give aria2 a moment to resolve metadata
     await asyncio.sleep(2)
@@ -1461,6 +1514,13 @@ async def _process_torrent(
                 download_tracker.add_downloaded(delta)
 
     download_tracker.start()
+    tracker_stopped = False
+
+    async def _stop_tracker() -> None:
+        nonlocal tracker_stopped
+        if not tracker_stopped:
+            tracker_stopped = True
+            await download_tracker.stop()
 
     try:
         # 5. Wait for download to complete
@@ -1473,14 +1533,23 @@ async def _process_torrent(
             total_timeout=TORRENT_TOTAL_TIMEOUT,
         )
     except Aria2Error as e:
-        await download_tracker.stop()
+        await _stop_tracker()
         if "cancelled" in str(e).lower():
             await safe_edit(status_msg, "🚫 **Proses dibatalkan!**\n\n💾 Folder sementara sedang dibersihkan...")
-        else:
-            raise
-        return
-
-    await download_tracker.stop()
+            return
+        if http_proxy_url and getattr(e, "code", None) != 12 and "error 12" not in str(e).lower():
+            proxy_failed = is_aria2_proxy_error(e, http_proxy_url)
+            if not proxy_failed:
+                proxy_failed = not await check_proxy_reachable(
+                    require_http=True,
+                    require_socks5=False,
+                    timeout=1.5,
+                )
+            if proxy_failed:
+                raise WarpProxyError(format_warp_proxy_error(e, feature="Torrent")) from e
+        raise
+    finally:
+        await _stop_tracker()
 
     # Check total size against limit
     total_size = int(final_status.get("totalLength", 0))

@@ -13,6 +13,14 @@ from urllib.parse import urlparse, unquote
 
 import aiohttp
 
+from app.warp import (
+    WarpProxyError,
+    create_aiohttp_connector,
+    ensure_proxy_ready,
+    format_warp_proxy_error,
+    is_warp_proxy_error,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -45,41 +53,110 @@ class DirectLinkClient:
 
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
+        self._session_proxy_key: Optional[tuple] = None
+        self._using_warp: bool = False
+
+    @property
+    def using_warp(self) -> bool:
+        """Whether the active HTTP session is routed through WARP wireproxy."""
+        return self._using_warp
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
+        warp_cfg = await ensure_proxy_ready(
+            require_http=False,
+            require_socks5=True,
+            feature="Direct",
+        )
+
+        if warp_cfg is not None:
+            desired_key = ("warp", warp_cfg.socks5_url)
+            proxy_url = None
+        else:
             proxy_url = self._get_proxy_url()
-            if proxy_url:
-                try:
+            desired_key = ("proxy_txt", proxy_url) if proxy_url else ("direct", None)
+
+        if self._session is not None and not self._session.closed:
+            if self._session_proxy_key == desired_key:
+                return self._session
+            await self.close()
+
+        if warp_cfg is not None:
+            try:
+                connector = create_aiohttp_connector(
+                    limit_per_host=10,
+                    limit=100,
+                )
+                if connector is None:
                     from aiohttp_socks import ProxyConnector
                     connector = ProxyConnector.from_url(
-                        proxy_url,
-                        limit_per_host=10,  # Increased from 5 for better throughput
-                        limit=100,  # Total connection limit
-                    )
-                except ImportError:
-                    print("[DirectLink] 'aiohttp_socks' not installed. Ignoring SOCKS5 proxy.")
-                    connector = aiohttp.TCPConnector(
+                        warp_cfg.socks5_url,
+                        rdns=True,
                         limit_per_host=10,
                         limit=100,
                     )
-            else:
+            except WarpProxyError:
+                raise
+            except Exception as exc:
+                raise WarpProxyError(
+                    format_warp_proxy_error(exc, feature="Direct")
+                ) from exc
+
+            try:
+                self._session = aiohttp.ClientSession(
+                    headers={"User-Agent": _USER_AGENT},
+                    connector=connector,
+                    read_bufsize=2 * 1024 * 1024,  # 2MB read buffer for better throughput
+                    trust_env=False,
+                )
+            except Exception:
+                await connector.close()
+                raise
+            self._using_warp = True
+            self._session_proxy_key = desired_key
+            return self._session
+
+        # WARP proxy is OFF — preserve existing proxy.txt / direct behavior
+        if proxy_url:
+            try:
+                from aiohttp_socks import ProxyConnector
+                connector = ProxyConnector.from_url(
+                    proxy_url,
+                    limit_per_host=10,  # Increased from 5 for better throughput
+                    limit=100,  # Total connection limit
+                )
+            except ImportError:
+                print("[DirectLink] 'aiohttp_socks' not installed. Ignoring SOCKS5 proxy.")
                 connector = aiohttp.TCPConnector(
                     limit_per_host=10,
                     limit=100,
                 )
+        else:
+            connector = aiohttp.TCPConnector(
+                limit_per_host=10,
+                limit=100,
+            )
 
+        try:
             self._session = aiohttp.ClientSession(
                 headers={"User-Agent": _USER_AGENT},
                 connector=connector,
                 read_bufsize=2 * 1024 * 1024,  # 2MB read buffer for better throughput
             )
+        except Exception:
+            await connector.close()
+            raise
+        self._using_warp = False
+        self._session_proxy_key = desired_key
         return self._session
 
     async def close(self) -> None:
-        """Close the session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
+        """Close the session and its connector cleanly."""
+        session = self._session
+        self._session = None
+        self._session_proxy_key = None
+        self._using_warp = False
+        if session is not None and not session.closed:
+            await session.close()
 
     def _get_proxy_url(self) -> Optional[str]:
         """Read proxy.txt from project root and construct proxy URL."""
@@ -150,16 +227,16 @@ class DirectLinkClient:
         ValueError  if the URL is invalid or inaccessible.
         aiohttp.ClientError  if the HTTP request fails.
         """
-        session = await self._get_session()
-
-        # Validate URL format
+        # Validate URL format before opening any network session
         parsed = urlparse(url)
         if not parsed.scheme or parsed.scheme not in ("http", "https"):
             raise ValueError(f"Invalid URL scheme: {parsed.scheme}")
         if not parsed.netloc:
             raise ValueError(f"Invalid URL: no hostname")
 
-        # GET with redirects to find final URL and metadata
+        session = await self._get_session()
+
+        # HEAD with redirects to find final URL and metadata
         try:
             async with session.head(
                 url,
@@ -194,8 +271,16 @@ class DirectLinkClient:
                     "size": file_size,
                 }
 
-        except aiohttp.ClientError as e:
-            raise ValueError(f"Failed to resolve URL: {e}")
+        except WarpProxyError:
+            raise
+        except Exception as e:
+            if self._using_warp and is_warp_proxy_error(e):
+                raise WarpProxyError(
+                    format_warp_proxy_error(e, feature="Direct")
+                ) from e
+            if isinstance(e, aiohttp.ClientError):
+                raise ValueError(f"Failed to resolve URL: {e}") from e
+            raise
 
     # --------------------------------------------------------- stream download
 
@@ -222,6 +307,7 @@ class DirectLinkClient:
         Raises
         ------
         aiohttp.ClientError  if the HTTP request fails.
+        WarpProxyError  if WARP proxy is ON and wireproxy fails.
         """
         session = await self._get_session()
 
@@ -229,20 +315,29 @@ class DirectLinkClient:
         if start_offset > 0:
             headers["Range"] = f"bytes={start_offset}-"
 
-        async with session.get(
-            url,
-            headers=headers,
-            timeout=_STREAM_TIMEOUT,
-            allow_redirects=True,
-            ssl=False,
-        ) as resp:
-            if resp.status >= 400:
-                raise ValueError(f"HTTP {resp.status} for {url}")
+        try:
+            async with session.get(
+                url,
+                headers=headers,
+                timeout=_STREAM_TIMEOUT,
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                if resp.status >= 400:
+                    raise ValueError(f"HTTP {resp.status} for {url}")
 
-            # Stream data in chunks
-            async for chunk in resp.content.iter_chunked(chunk_size):
-                if chunk:
-                    yield chunk
+                # Stream data in chunks
+                async for chunk in resp.content.iter_chunked(chunk_size):
+                    if chunk:
+                        yield chunk
+        except WarpProxyError:
+            raise
+        except Exception as e:
+            if self._using_warp and is_warp_proxy_error(e):
+                raise WarpProxyError(
+                    format_warp_proxy_error(e, feature="Direct")
+                ) from e
+            raise
 
     # --------------------------------------------------------- helpers
 

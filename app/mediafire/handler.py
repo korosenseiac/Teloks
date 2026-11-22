@@ -61,6 +61,7 @@ from app.mediafire.client import MediaFireClient
 from app.mediafire.streamer import MediaFireStreamer, FileStreamer
 from app.mediafire.archive import extract_media_from_archive, iter_extract_media, count_media_in_archive
 from app.terabox.progress import ProgressTracker
+from app.warp import WarpProxyError
 
 # ---------------------------------------------------------------------------
 # Link pattern — single-file links only
@@ -310,6 +311,8 @@ async def _upload_file_to_backup(
             print(f"[MediaFire] Fallback search failed: {fb_err}")
 
         return None
+    except WarpProxyError:
+        raise
     except Exception as e:
         print(f"[MediaFire] _upload_file_to_backup error ({file_name}): {e}")
         import traceback
@@ -645,6 +648,9 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
         # 1. Resolve the direct download URL
         try:
             info = await mf_client.resolve(url)
+        except WarpProxyError as e:
+            await safe_edit(status_msg, f"❌ {e}")
+            return
         except ValueError as e:
             await safe_edit(status_msg, f"❌ {e}")
             return
@@ -725,6 +731,12 @@ async def mediafire_link_handler(bot: Client, message: Message) -> None:
 
     except asyncio.CancelledError:
         print(f"[MediaFire] Handler cancelled for user {user_id}")
+    except WarpProxyError as e:
+        print(f"[MediaFire] WARP proxy error for user {user_id}: {e}")
+        try:
+            await safe_edit(status_msg, f"❌ {e}")
+        except Exception:
+            pass
     except Exception as e:
         print(f"[MediaFire] Handler error: {e}")
         import traceback
@@ -785,9 +797,12 @@ async def _handle_direct_media(
             on_download_chunk=tracker.add_downloaded,
         )
 
-        bmid = await _upload_file_to_backup(
-            bot, backup_peer, streamer, filename, file_size, tracker=tracker,
-        )
+        try:
+            bmid = await _upload_file_to_backup(
+                bot, backup_peer, streamer, filename, file_size, tracker=tracker,
+            )
+        finally:
+            await streamer.close()
 
         await tracker.stop()
 
@@ -862,12 +877,13 @@ async def _handle_archive(
         )
         dl_tracker.start()
 
-        archive_path = await _download_archive_to_temp(
-            mf_client, direct_url, filename, file_size, temp_dir,
-            tracker=dl_tracker,
-        )
-
-        await dl_tracker.stop()
+        try:
+            archive_path = await _download_archive_to_temp(
+                mf_client, direct_url, filename, file_size, temp_dir,
+                tracker=dl_tracker,
+            )
+        finally:
+            await dl_tracker.stop()
 
         # Check for cancellation after download
         from app.bot.main import is_cancelled

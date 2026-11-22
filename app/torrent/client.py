@@ -28,6 +28,7 @@ import signal
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
@@ -38,6 +39,14 @@ from app.config import (
     TORRENT_LISTEN_PORT,
     TORRENT_DISABLE_IPV6,
     TORRENT_TRACKERS,
+)
+from app.warp import (
+    WarpProxyError,
+    check_proxy_reachable,
+    create_aiohttp_connector,
+    format_warp_proxy_error,
+    get_active_socks5_url,
+    is_warp_proxy_error,
 )
 
 
@@ -118,6 +127,179 @@ def extract_info_hash_from_magnet(uri: str) -> Optional[str]:
     return None
 
 
+_UNSET: Any = object()
+
+_TORRENT_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/x-bittorrent, application/octet-stream, */*;q=0.8",
+}
+
+
+def build_aria2_proxy_options(proxy_url: Optional[str]) -> Dict[str, str]:
+    """Build aria2 RPC proxy option dict for ON (HTTP proxy) or OFF (cleared).
+
+    Note: ``aria2c`` natively supports HTTP proxies only (no SOCKS5), and
+    ``wireproxy``'s ``[http]`` listener tunnels via HTTP ``CONNECT``. Setting
+    ``proxy-method="tunnel"`` alongside ``all-proxy`` ensures both HTTP and
+    HTTPS trackers/downloads use HTTP CONNECT through wireproxy. When OFF, all
+    proxy keys are explicitly cleared to ``""`` and ``proxy-method`` is reset
+    to ``"get"`` so no stale proxy state can persist across toggles.
+    """
+    normalized = (proxy_url or "").strip()
+    if normalized:
+        parsed = urlparse(normalized)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            raise ValueError(
+                f"aria2c only supports HTTP/HTTPS proxy URLs, got: {normalized!r}"
+            )
+        return {
+            "all-proxy": normalized,
+            "http-proxy": "",
+            "https-proxy": "",
+            "ftp-proxy": "",
+            "proxy-method": "tunnel",
+        }
+    return {
+        "all-proxy": "",
+        "http-proxy": "",
+        "https-proxy": "",
+        "ftp-proxy": "",
+        "proxy-method": "get",
+    }
+
+
+def is_aria2_proxy_error(err: BaseException, proxy_url: Optional[str] = None) -> bool:
+    """Return True if *err* indicates a proxy connection failure in aria2c."""
+    if is_warp_proxy_error(err):
+        return True
+
+    msg = str(err).lower()
+    if "proxy" in msg:
+        return True
+
+    if proxy_url:
+        parsed = urlparse(proxy_url)
+        if parsed.hostname and parsed.port:
+            endpoint = f"{parsed.hostname.lower()}:{parsed.port}"
+            if endpoint in msg:
+                return True
+
+    return False
+
+
+async def download_torrent_file_via_warp(
+    url: str,
+    dest_path: str,
+    *,
+    socks5_url: Optional[str] = None,
+    timeout: float = 30.0,
+    max_bytes: int = 25 * 1024 * 1024,
+    max_redirects: int = 10,
+) -> Tuple[str, str]:
+    """Fetch a remote ``.torrent`` URL over the WARP SOCKS5 proxy.
+
+    Returns ``("torrent_file", dest_path)`` when a valid bencoded ``.torrent``
+    file was written to *dest_path*, or ``("magnet", magnet_uri)`` if the URL
+    redirects to a ``magnet:`` URI.
+
+    Raises
+    ------
+    WarpProxyError
+        If the local WARP wireproxy is unavailable or fails during connection.
+    Aria2Error
+        If the remote server returns an HTTP error or invalid ``.torrent`` body.
+    """
+    current_url = (url or "").strip()
+    parsed_init = urlparse(current_url)
+    if parsed_init.scheme.lower() not in ("http", "https") or not parsed_init.hostname:
+        raise Aria2Error("URL fail .torrent tidak sah.")
+
+    active_socks5 = get_active_socks5_url()
+    connector = None
+    if socks5_url is None or socks5_url == active_socks5:
+        connector = create_aiohttp_connector()
+    if connector is None:
+        if socks5_url:
+            from aiohttp_socks import ProxyConnector
+
+            connector = ProxyConnector.from_url(socks5_url, rdns=True)
+        else:
+            raise WarpProxyError(format_warp_proxy_error(feature="Torrent"))
+
+    try:
+        session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            trust_env=False,
+            headers=_TORRENT_FETCH_HEADERS,
+        )
+    except Exception:
+        await connector.close()
+        raise
+
+    try:
+        async with session:
+            for _ in range(max_redirects + 1):
+                async with session.get(current_url, allow_redirects=False) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        location = (resp.headers.get("Location") or "").strip()
+                        if not location:
+                            raise Aria2Error(
+                                f"Redirect tidak sah (HTTP {resp.status}) semasa memuat turun fail .torrent."
+                            )
+                        if location.lower().startswith("magnet:"):
+                            return ("magnet", location)
+                        next_url = urljoin(current_url, location)
+                        parsed_next = urlparse(next_url)
+                        if parsed_next.scheme.lower() not in ("http", "https") or not parsed_next.hostname:
+                            raise Aria2Error("Redirect URL tidak sah untuk fail .torrent.")
+                        current_url = next_url
+                        continue
+
+                    if resp.status >= 400:
+                        raise Aria2Error(f"Gagal memuat turun fail .torrent (HTTP {resp.status}).")
+
+                    content_len = resp.headers.get("Content-Length")
+                    if content_len:
+                        try:
+                            if int(content_len) > max_bytes:
+                                raise Aria2Error("Fail .torrent terlalu besar.")
+                        except ValueError:
+                            pass
+
+                    buf = bytearray()
+                    async for chunk in resp.content.iter_chunked(65536):
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            raise Aria2Error("Fail .torrent terlalu besar.")
+
+                    if not buf:
+                        raise Aria2Error("Fail .torrent kosong atau tidak sah.")
+                    if buf[:1] != b"d":
+                        raise Aria2Error("URL tidak memulangkan fail .torrent yang sah.")
+
+                    parent_dir = os.path.dirname(os.path.abspath(dest_path))
+                    if parent_dir:
+                        os.makedirs(parent_dir, exist_ok=True)
+                    with open(dest_path, "wb") as fh:
+                        fh.write(buf)
+                    return ("torrent_file", dest_path)
+
+            raise Aria2Error("Terlalu banyak redirect semasa memuat turun fail .torrent.")
+    except (WarpProxyError, Aria2Error, asyncio.CancelledError):
+        raise
+    except Exception as exc:
+        if is_warp_proxy_error(exc):
+            raise WarpProxyError(format_warp_proxy_error(exc, feature="Torrent")) from exc
+        if isinstance(exc, (ConnectionRefusedError, asyncio.TimeoutError)):
+            if not await check_proxy_reachable(require_http=False, require_socks5=True, timeout=1.5):
+                raise WarpProxyError(format_warp_proxy_error(exc, feature="Torrent")) from exc
+        raise Aria2Error(f"Gagal memuat turun fail .torrent melalui WARP: {exc}") from exc
+
+
 class Aria2Client:
     """Async wrapper around the aria2c JSON-RPC interface."""
 
@@ -128,9 +310,24 @@ class Aria2Client:
         self._process: Optional[asyncio.subprocess.Process] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._req_id: int = 0
+        self._active_proxy_url: Optional[str] = None
+        self._proxy_lock: Optional[asyncio.Lock] = None
+        self._proxy_lock_loop: Optional[asyncio.AbstractEventLoop] = None
         # Per-user registry of GIDs/infoHashes added for them, so a cancellation
         # at ANY point in the handler can still fully clean aria2's memory.
         self._user_downloads: Dict[int, Dict[str, Any]] = {}
+
+    def _get_proxy_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self._proxy_lock is None or self._proxy_lock_loop is not loop:
+            self._proxy_lock = asyncio.Lock()
+            self._proxy_lock_loop = loop
+        return self._proxy_lock
+
+    @property
+    def active_proxy_url(self) -> Optional[str]:
+        """Return the last HTTP proxy URL applied to aria2c, or ``None`` if direct."""
+        return self._active_proxy_url
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -211,7 +408,8 @@ class Aria2Client:
         )
 
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
+            timeout=aiohttp.ClientTimeout(total=30),
+            trust_env=False,
         )
 
         # Wait for aria2c to become ready (up to 10 seconds)
@@ -228,6 +426,7 @@ class Aria2Client:
             except Exception:
                 pass
 
+        await self.shutdown()
         raise RuntimeError("aria2c failed to start within 10 seconds")
 
     async def shutdown(self) -> None:
@@ -246,14 +445,34 @@ class Aria2Client:
                     self._process.kill()
                 except Exception:
                     pass
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=2)
+                except Exception:
+                    pass
+        self._process = None
 
         if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
+        self._active_proxy_url = None
 
     async def ping(self) -> bool:
         """Return True if aria2c answers RPC."""
         result = await self._rpc("aria2.getVersion")
         return "version" in result
+
+    async def get_global_options(self) -> Dict[str, Any]:
+        """Return aria2c's current global options via JSON-RPC."""
+        result = await self._rpc("aria2.getGlobalOption")
+        return result if isinstance(result, dict) else {}
+
+    async def set_proxy(self, proxy_url: Optional[str]) -> None:
+        """Apply or cleanly clear HTTP proxy settings on the running aria2c daemon."""
+        normalized = (proxy_url or "").strip() or None
+        opts = build_aria2_proxy_options(normalized)
+        async with self._get_proxy_lock():
+            await self._rpc("aria2.changeGlobalOption", [opts])
+            self._active_proxy_url = normalized
 
     # ------------------------------------------------------------------
     # RPC transport
@@ -341,24 +560,49 @@ class Aria2Client:
                 return await self._rpc("aria2.addTorrent", [torrent_b64, [], opts])
             raise
 
-    async def add_magnet(self, magnet_uri: str, download_dir: str) -> str:
+    def _download_opts(self, download_dir: str, proxy_url: Any = _UNSET) -> Dict[str, Any]:
+        """Build per-download aria2 options with explicit proxy state."""
+        effective_proxy = self._active_proxy_url if proxy_url is _UNSET else proxy_url
+        opts: Dict[str, Any] = {"dir": download_dir, "seed-time": "0"}
+        opts.update(build_aria2_proxy_options(effective_proxy))
+        return opts
+
+    async def add_magnet(
+        self,
+        magnet_uri: str,
+        download_dir: str,
+        *,
+        proxy_url: Any = _UNSET,
+    ) -> str:
         """Add a magnet URI. Returns the GID."""
-        opts = {"dir": download_dir, "seed-time": "0"}
+        opts = self._download_opts(download_dir, proxy_url=proxy_url)
         result = await self._add_uri_with_retry([magnet_uri], opts)
         return result  # GID string
 
-    async def add_torrent(self, torrent_path: str, download_dir: str) -> str:
+    async def add_torrent(
+        self,
+        torrent_path: str,
+        download_dir: str,
+        *,
+        proxy_url: Any = _UNSET,
+    ) -> str:
         """Add a local .torrent file. Returns the GID."""
         import base64
         with open(torrent_path, "rb") as f:
             torrent_b64 = base64.b64encode(f.read()).decode("ascii")
-        opts = {"dir": download_dir, "seed-time": "0"}
+        opts = self._download_opts(download_dir, proxy_url=proxy_url)
         result = await self._add_torrent_with_retry(torrent_b64, opts)
         return result
 
-    async def add_torrent_url(self, url: str, download_dir: str) -> str:
+    async def add_torrent_url(
+        self,
+        url: str,
+        download_dir: str,
+        *,
+        proxy_url: Any = _UNSET,
+    ) -> str:
         """Add an HTTP URL to a .torrent file. Returns the GID."""
-        opts = {"dir": download_dir, "seed-time": "0"}
+        opts = self._download_opts(download_dir, proxy_url=proxy_url)
         result = await self._add_uri_with_retry([url], opts)
         return result
 

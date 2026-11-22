@@ -15,6 +15,14 @@ from typing import AsyncGenerator, Dict, Optional
 
 import aiohttp
 
+from app.warp import (
+    WarpProxyError,
+    create_aiohttp_connector,
+    ensure_proxy_ready,
+    format_warp_proxy_error,
+    is_warp_proxy_error,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -53,17 +61,76 @@ class MediaFireClient:
 
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
+        self._session_proxy_key: Optional[tuple] = None
+        self._using_warp: bool = False
+
+    @property
+    def using_warp(self) -> bool:
+        """Whether the active HTTP session is routed through WARP wireproxy."""
+        return self._using_warp
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers={"User-Agent": _USER_AGENT},
-            )
+        warp_cfg = await ensure_proxy_ready(
+            require_http=False,
+            require_socks5=True,
+            feature="MediaFire",
+        )
+
+        if warp_cfg is not None:
+            desired_key = ("warp", warp_cfg.socks5_url)
+        else:
+            desired_key = ("direct", None)
+
+        if self._session is not None and not self._session.closed:
+            if self._session_proxy_key == desired_key:
+                return self._session
+            await self.close()
+
+        if warp_cfg is not None:
+            try:
+                connector = create_aiohttp_connector()
+                if connector is None:
+                    from aiohttp_socks import ProxyConnector
+                    connector = ProxyConnector.from_url(
+                        warp_cfg.socks5_url,
+                        rdns=True,
+                    )
+            except WarpProxyError:
+                raise
+            except Exception as exc:
+                raise WarpProxyError(
+                    format_warp_proxy_error(exc, feature="MediaFire")
+                ) from exc
+
+            try:
+                self._session = aiohttp.ClientSession(
+                    headers={"User-Agent": _USER_AGENT},
+                    connector=connector,
+                    trust_env=False,
+                )
+            except Exception:
+                await connector.close()
+                raise
+            self._using_warp = True
+            self._session_proxy_key = desired_key
+            return self._session
+
+        # WARP proxy is OFF — preserve existing direct connection behavior
+        self._session = aiohttp.ClientSession(
+            headers={"User-Agent": _USER_AGENT},
+        )
+        self._using_warp = False
+        self._session_proxy_key = desired_key
         return self._session
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
+        """Close the session and its connector cleanly."""
+        session = self._session
+        self._session = None
+        self._session_proxy_key = None
+        self._using_warp = False
+        if session is not None and not session.closed:
+            await session.close()
 
     # ---------------------------------------------------------------- resolve
 
@@ -85,12 +152,21 @@ class MediaFireClient:
         session = await self._get_session()
 
         # 1. Fetch the MediaFire page
-        async with session.get(url, timeout=_TIMEOUT, allow_redirects=True) as resp:
-            if resp.status != 200:
-                raise ValueError(
-                    f"MediaFire page returned HTTP {resp.status}"
-                )
-            html = await resp.text()
+        try:
+            async with session.get(url, timeout=_TIMEOUT, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    raise ValueError(
+                        f"MediaFire page returned HTTP {resp.status}"
+                    )
+                html = await resp.text()
+        except WarpProxyError:
+            raise
+        except Exception as e:
+            if self._using_warp and is_warp_proxy_error(e):
+                raise WarpProxyError(
+                    format_warp_proxy_error(e, feature="MediaFire")
+                ) from e
+            raise
 
         # 2. Extract direct download URL
         direct_url = self._extract_direct_url(html)
@@ -139,7 +215,13 @@ class MediaFireClient:
                                 size = int(cr.split("/")[-1])
                             except (ValueError, IndexError):
                                 pass
+        except WarpProxyError:
+            raise
         except Exception as e:
+            if self._using_warp and is_warp_proxy_error(e):
+                raise WarpProxyError(
+                    format_warp_proxy_error(e, feature="MediaFire")
+                ) from e
             print(f"[MediaFire] HEAD/size check error: {e}")
 
         return {
@@ -163,14 +245,23 @@ class MediaFireClient:
         or garbage-collected.
         """
         session = await self._get_session()
-        async with session.get(
-            direct_url, timeout=_STREAM_TIMEOUT, allow_redirects=True
-        ) as resp:
-            if resp.status not in (200, 206):
-                raise ValueError(f"MediaFire download returned HTTP {resp.status}")
-            async for chunk in resp.content.iter_chunked(chunk_size):
-                if chunk:
-                    yield chunk
+        try:
+            async with session.get(
+                direct_url, timeout=_STREAM_TIMEOUT, allow_redirects=True
+            ) as resp:
+                if resp.status not in (200, 206):
+                    raise ValueError(f"MediaFire download returned HTTP {resp.status}")
+                async for chunk in resp.content.iter_chunked(chunk_size):
+                    if chunk:
+                        yield chunk
+        except WarpProxyError:
+            raise
+        except Exception as e:
+            if self._using_warp and is_warp_proxy_error(e):
+                raise WarpProxyError(
+                    format_warp_proxy_error(e, feature="MediaFire")
+                ) from e
+            raise
 
     # -------------------------------------------------------- private helpers
 

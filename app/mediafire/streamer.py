@@ -17,6 +17,8 @@ import asyncio
 import os
 from typing import Callable, Optional, TYPE_CHECKING
 
+from app.warp import WarpProxyError
+
 if TYPE_CHECKING:
     from app.mediafire.client import MediaFireClient
 
@@ -65,6 +67,7 @@ class MediaFireStreamer:
         self.download_task: Optional[asyncio.Task] = None
         self.is_downloading: bool = True
         self.chunk_size: int = self.CHUNK_SIZE
+        self.error: Optional[BaseException] = None
 
     # ------------------------------------------------------------------ start
 
@@ -75,6 +78,7 @@ class MediaFireStreamer:
     # ---------------------------------------------------------------- download
 
     async def _downloader(self) -> None:
+        cancelled = False
         try:
             async for chunk in self.client.download_stream(
                 self.direct_url, chunk_size=self.CHUNK_SIZE
@@ -82,11 +86,33 @@ class MediaFireStreamer:
                 await self.queue.put(chunk)
                 if self.on_download_chunk:
                     self.on_download_chunk(len(chunk))
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except WarpProxyError as e:
+            print(f"[MediaFireStreamer] WARP proxy error: {e}")
+            self.error = e
         except Exception as e:
             print(f"[MediaFireStreamer] Download error: {e}")
         finally:
             self.is_downloading = False
-            await self.queue.put(None)  # EOF sentinel
+            if not cancelled:
+                await self.queue.put(None)  # EOF sentinel
+
+    # ------------------------------------------------------------------- close
+
+    async def close(self) -> None:
+        """Cancel the background downloader task if it exists."""
+        self.is_downloading = False
+        if self.download_task is not None and not self.download_task.done():
+            self.download_task.cancel()
+            try:
+                await self.download_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"[MediaFireStreamer] close error: {e}")
+        self.download_task = None
 
     # ------------------------------------------------------------------- read
 
@@ -95,10 +121,14 @@ class MediaFireStreamer:
             await self.start_download()
 
         if self.queue.empty() and not self.is_downloading:
+            if self.error is not None:
+                raise self.error
             return b""
 
         chunk = await self.queue.get()
         if chunk is None:
+            if self.error is not None:
+                raise self.error
             return b""
 
         self.current_offset += len(chunk)
