@@ -1222,5 +1222,947 @@ class TestHlsWarpIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("/warp_off" in str(call.args[1]) for call in mock_edit.call_args_list if len(call.args) >= 2))
 
 
+class TestHls403FixesAndStealth(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.work = tempfile.mkdtemp(prefix="hls_403_test_")
+        self._orig_disable_proxy = _client_mod.HLS_DISABLE_PROXY
+        _client_mod.HLS_DISABLE_PROXY = True
+
+    async def asyncTearDown(self):
+        _client_mod.HLS_DISABLE_PROXY = self._orig_disable_proxy
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    async def _start_server(self, app: web.Application):
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        return runner, f"http://127.0.0.1:{port}"
+
+    async def test_header_absence_preserved_extract_to_downloader(self):
+        # 1. Unit checks for _merge_request_context and _normalize_headers
+        direct_hdrs, _ = handler_mod._merge_request_context(
+            "https://cdn.example.com/hls/index.m3u8", None, None, None,
+        )
+        self.assertNotIn("Origin", direct_hdrs)
+        self.assertEqual(direct_hdrs.get("Referer"), "https://cdn.example.com/")
+
+        page_hdrs, _ = handler_mod._merge_request_context(
+            "https://cdn.example.com/hls/index.m3u8", "https://site.example/watch/1", None, None,
+        )
+        self.assertEqual(page_hdrs.get("Referer"), "https://site.example/watch/1")
+        self.assertEqual(page_hdrs.get("Origin"), "https://site.example")
+
+        cap_hdrs, _ = handler_mod._merge_request_context(
+            "https://cdn.example.com/hls/index.m3u8",
+            "https://site.example/watch/1",
+            {
+                "user-agent": "CustomUA/1.0",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "cross-site",
+                "sec-ch-ua": '"Chromium";v="153"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            },
+            None,
+        )
+        self.assertNotIn("Origin", cap_hdrs)
+        self.assertNotIn("Referer", cap_hdrs)
+        self.assertEqual(cap_hdrs.get("Sec-Fetch-Dest"), "empty")
+        self.assertEqual(cap_hdrs.get("Sec-Ch-Ua"), '"Chromium";v="153"')
+        norm_cap = dl_mod._normalize_headers("https://cdn.example.com/hls/index.m3u8", cap_hdrs)
+        self.assertNotIn("Origin", norm_cap)
+        self.assertNotIn("Referer", norm_cap)
+
+        if not _ffmpeg_ok():
+            return
+
+        # 2. End-to-end Attempt 3 (Origin omitted, Referer kept) and Attempt 5 (both omitted)
+        ts_bytes = _make_ts_fixture(self.work, duration=1.5)
+        seen_download_hdrs: list[dict[str, str]] = []
+
+        async def page_no_origin(request: web.Request):
+            return web.Response(
+                text='<html><body><source src="/cdn3/master.m3u8"></body></html>',
+                content_type="text/html",
+            )
+
+        async def master_no_origin(request: web.Request):
+            if "Origin" in request.headers:
+                return web.Response(status=403, text="origin forbidden")
+            if not request.headers.get("Referer", "").endswith("/page3"):
+                return web.Response(status=403, text="referer required")
+            seen_download_hdrs.append(dict(request.headers))
+            return web.Response(
+                text="#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nindex.m3u8\n",
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def media_no_origin(request: web.Request):
+            if "Origin" in request.headers or not request.headers.get("Referer", "").endswith("/page3"):
+                return web.Response(status=403)
+            seen_download_hdrs.append(dict(request.headers))
+            return web.Response(
+                text="#EXTM3U\n#EXTINF:1.5,\nseg0.ts\n#EXT-X-ENDLIST\n",
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def seg_no_origin(request: web.Request):
+            if "Origin" in request.headers or not request.headers.get("Referer", "").endswith("/page3"):
+                return web.Response(status=403)
+            seen_download_hdrs.append(dict(request.headers))
+            return web.Response(body=ts_bytes, content_type="video/mp2t")
+
+        async def page_clean(request: web.Request):
+            return web.Response(
+                text='<html><body><source src="/cdn5/index.m3u8"></body></html>',
+                content_type="text/html",
+            )
+
+        async def media_clean(request: web.Request):
+            if "Origin" in request.headers or "Referer" in request.headers:
+                return web.Response(status=403, text="ref/origin forbidden")
+            return web.Response(
+                text="#EXTM3U\n#EXTINF:1.5,\nseg0.ts\n#EXT-X-ENDLIST\n",
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def seg_clean(request: web.Request):
+            if "Origin" in request.headers or "Referer" in request.headers:
+                return web.Response(status=403)
+            return web.Response(body=ts_bytes, content_type="video/mp2t")
+
+        app = web.Application()
+        app.router.add_get("/page3", page_no_origin)
+        app.router.add_get("/cdn3/master.m3u8", master_no_origin)
+        app.router.add_get("/cdn3/index.m3u8", media_no_origin)
+        app.router.add_get("/cdn3/seg0.ts", seg_no_origin)
+        app.router.add_get("/page5", page_clean)
+        app.router.add_get("/cdn5/index.m3u8", media_clean)
+        app.router.add_get("/cdn5/seg0.ts", seg_clean)
+
+        runner, base = await self._start_server(app)
+        try:
+            client = _client_mod.HlsClient(proxy_url=None)
+            try:
+                scan3 = await extract_mod.resolve_stream_from_page(client, f"{base}/page3")
+                self.assertEqual(scan3.reason, "ok")
+                self.assertNotIn("Origin", scan3.headers)
+                self.assertEqual(scan3.headers.get("Referer"), f"{base}/page3")
+
+                merged3, cookies3 = handler_mod._merge_request_context(
+                    scan3.url, scan3.page_url, scan3.headers, scan3.cookies,
+                )
+                self.assertNotIn("Origin", merged3)
+                self.assertEqual(merged3.get("Referer"), f"{base}/page3")
+
+                seen_download_hdrs.clear()
+                res3 = await download_hls_to_mp4(
+                    scan3.url, "attempt3.m3u8", headers=merged3, cookies=cookies3,
+                    out_dir=self.work, proxy_url=None,
+                )
+                self.assertTrue(res3.converted, res3.detail)
+                self.assertTrue(seen_download_hdrs)
+                self.assertTrue(all("Origin" not in h for h in seen_download_hdrs))
+
+                scan5 = await extract_mod.resolve_stream_from_page(client, f"{base}/page5")
+                self.assertEqual(scan5.reason, "ok")
+                self.assertNotIn("Origin", scan5.headers)
+                self.assertNotIn("Referer", scan5.headers)
+
+                merged5, cookies5 = handler_mod._merge_request_context(
+                    scan5.url, scan5.page_url, scan5.headers, scan5.cookies,
+                )
+                self.assertNotIn("Origin", merged5)
+                self.assertNotIn("Referer", merged5)
+
+                res5 = await download_hls_to_mp4(
+                    scan5.url, "attempt5.m3u8", headers=merged5, cookies=cookies5,
+                    out_dir=self.work, proxy_url=None,
+                )
+                self.assertTrue(res5.converted, res5.detail)
+            finally:
+                await client.close()
+        finally:
+            await runner.cleanup()
+
+    async def test_downloader_403_query_inheritance_and_header_fallback(self):
+        # 1. Helper unit checks
+        self.assertEqual(
+            dl_mod._inherit_query("https://cdn/hls/index.m3u8#frag", "https://cdn/hls/master.m3u8?t=sec123"),
+            "https://cdn/hls/index.m3u8?t=sec123#frag",
+        )
+        self.assertIsNone(dl_mod._inherit_query("https://cdn/hls/index.m3u8?x=1", "https://cdn/hls/master.m3u8?t=sec"))
+        self.assertIsNone(dl_mod._inherit_query("https://cdn/hls/index.m3u8", "https://cdn/hls/master.m3u8"))
+
+        profiles = dl_mod._header_fallback_profiles(
+            {"Referer": "https://site.example/e/1", "Origin": "https://site.example"},
+            "https://cdn.example/hls/index.m3u8",
+        )
+        self.assertEqual(profiles[-1], {"Referer": None, "Origin": None})
+        self.assertIn({"Origin": None}, profiles)
+        self.assertEqual(len(profiles), len({(p.get("Referer", "__KEEP__"), p.get("Origin", "__KEEP__")) for p in profiles}))
+
+        if not _ffmpeg_ok():
+            return
+
+        # 2. Local server: master ?t=secret123 -> relative index-v1-a1.m3u8 requiring query + no Origin -> segments
+        ts_bytes = _make_ts_fixture(self.work, duration=1.5)
+        seg_calls: list[tuple[str, str]] = []
+
+        async def master(request: web.Request):
+            if request.query.get("t") != "secret123":
+                return web.Response(status=403)
+            return web.Response(
+                text="#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=900000\nindex-v1-a1.m3u8\n",
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def variant(request: web.Request):
+            if request.query.get("t") != "secret123" or "Origin" in request.headers:
+                return web.Response(status=403, text="need token and no origin")
+            return web.Response(
+                text=(
+                    "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n"
+                    "#EXTINF:0.5,\nseg0.ts\n#EXTINF:0.5,\nseg1.ts\n"
+                    "#EXTINF:0.5,\nseg2.ts\n#EXTINF:0.5,\nseg3.ts\n#EXT-X-ENDLIST\n"
+                ),
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def seg(request: web.Request):
+            name = request.match_info["name"]
+            tok = request.query.get("t", "")
+            seg_calls.append((name, tok))
+            if tok != "secret123" or "Origin" in request.headers:
+                return web.Response(status=403)
+            return web.Response(body=ts_bytes, content_type="video/mp2t")
+
+        async def direct_strict_m3u8(request: web.Request):
+            if "Origin" in request.headers or "Referer" in request.headers:
+                return web.Response(status=403, text="clean headers only")
+            return web.Response(
+                text="#EXTM3U\n#EXTINF:1.5,\ndirect_seg.ts\n#EXT-X-ENDLIST\n",
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def direct_strict_seg(request: web.Request):
+            if "Origin" in request.headers or "Referer" in request.headers:
+                return web.Response(status=403)
+            return web.Response(body=ts_bytes, content_type="video/mp2t")
+
+        app = web.Application()
+        app.router.add_get("/master.m3u8", master)
+        app.router.add_get("/index-v1-a1.m3u8", variant)
+        app.router.add_get("/{name:seg\\d+\\.ts}", seg)
+        app.router.add_get("/direct_strict.m3u8", direct_strict_m3u8)
+        app.router.add_get("/direct_seg.ts", direct_strict_seg)
+
+        runner, base = await self._start_server(app)
+        try:
+            with patch.object(_cfg, "HLS_SEGMENT_RETRIES", 1, create=True), \
+                 patch.object(_cfg, "HLS_SEGMENT_WORKERS", 2, create=True):
+                res_var = await download_hls_to_mp4(
+                    f"{base}/master.m3u8?t=secret123",
+                    "inherited.m3u8",
+                    headers={
+                        "User-Agent": "TestUA/1.0",
+                        "Referer": "https://embed.example/e/1",
+                        "Origin": "https://embed.example",
+                    },
+                    out_dir=self.work,
+                    proxy_url=None,
+                )
+            self.assertTrue(res_var.converted, res_var.detail)
+            # Only 1-2 initial concurrent workers could hit 403 before shared auth_state promotes inherit_query.
+            failed_seg_probes = [c for c in seg_calls if c[1] != "secret123"]
+            self.assertLessEqual(len(failed_seg_probes), 2, seg_calls)
+
+            res_direct = await download_hls_to_mp4(
+                f"{base}/direct_strict.m3u8",
+                "direct_strict.m3u8",
+                headers=None,
+                out_dir=self.work,
+                proxy_url=None,
+            )
+            self.assertTrue(res_direct.converted, res_direct.detail)
+        finally:
+            await runner.cleanup()
+
+    async def test_browser_failed_urls_header_capture_and_stealth(self):
+        # 1. openfpcdn is unblocked
+        self.assertFalse(browser_mod._is_blocked_url("https://openfpcdn.io/botd/v1"))
+        self.assertTrue(browser_mod._is_blocked_url("https://pagead2.googlesyndication.com/ad.js"))
+
+        # 2. _extract_request_headers preserves Sec-Fetch-*, Sec-Ch-Ua*, Accept without fabricating omitted Origin/Referer
+        req_with_raw = MagicMock()
+        req_with_raw.all_headers = AsyncMock(return_value={
+            "user-agent": "Mozilla/5.0 Chrome/153.0.0.0 Safari/537.36",
+            "accept": "application/vnd.apple.mpegurl,*/*",
+            "accept-language": "en-US,en;q=0.8",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "cross-site",
+            "sec-ch-ua": '"Chromium";v="153"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "x-custom-token": "tok_ok",
+            "x-client-data": "drop_me",
+            "x-requested-with": "XMLHttpRequest",
+        })
+        hdrs = await browser_mod._extract_request_headers(req_with_raw, "https://site.example/watch")
+        self.assertEqual(hdrs.get("Accept"), "application/vnd.apple.mpegurl,*/*")
+        self.assertEqual(hdrs.get("Accept-Language"), "en-US,en;q=0.8")
+        self.assertEqual(hdrs.get("Sec-Fetch-Dest"), "empty")
+        self.assertEqual(hdrs.get("Sec-Fetch-Mode"), "cors")
+        self.assertEqual(hdrs.get("Sec-Fetch-Site"), "cross-site")
+        self.assertEqual(hdrs.get("Sec-Ch-Ua"), '"Chromium";v="153"')
+        self.assertEqual(hdrs.get("Sec-Ch-Ua-Mobile"), "?0")
+        self.assertEqual(hdrs.get("Sec-Ch-Ua-Platform"), '"Windows"')
+        self.assertEqual(hdrs.get("x-custom-token"), "tok_ok")
+        self.assertNotIn("x-client-data", hdrs)
+        self.assertNotIn("x-requested-with", hdrs)
+        self.assertNotIn("Referer", hdrs)
+        self.assertNotIn("Origin", hdrs)
+
+        req_empty = MagicMock()
+        req_empty.all_headers = AsyncMock(return_value={})
+        req_empty.headers = {}
+        hdrs_empty = await browser_mod._extract_request_headers(req_empty, "https://site.example/watch")
+        self.assertEqual(hdrs_empty.get("Referer"), "https://site.example/watch")
+        self.assertNotIn("Origin", hdrs_empty)
+
+        # 3. 403 failed manifest URL must NOT be returned as BrowserScan(reason="ok")
+        orig_pw = browser_mod._pw
+        orig_browser = browser_mod._browser
+        orig_active = browser_mod._active
+        orig_used = browser_mod._browser_used
+        orig_key = browser_mod._browser_proxy_key
+        orig_warp = browser_mod._browser_using_warp
+        try:
+            browser_mod._pw = None
+            browser_mod._browser = None
+            browser_mod._active = 0
+            browser_mod._browser_used = False
+            browser_mod._browser_proxy_key = None
+            browser_mod._browser_using_warp = False
+
+            class Fake403Page:
+                def __init__(self):
+                    self.url = "https://site.example/watch"
+                    self.frames = []
+                    self.main_frame = self
+                    self._handlers = {}
+
+                def set_default_timeout(self, ms):
+                    pass
+
+                def on(self, event, fn):
+                    self._handlers.setdefault(event, []).append(fn)
+
+                async def route(self, pattern, fn):
+                    pass
+
+                async def add_init_script(self, script):
+                    pass
+
+                async def evaluate(self, expr):
+                    return ""
+
+                async def goto(self, url, wait_until="domcontentloaded", timeout=5000):
+                    req = MagicMock()
+                    req.url = "https://cdn.example/blocked.m3u8"
+                    req.frame = self
+                    for fn in self._handlers.get("request", []):
+                        fn(req)
+                    resp = MagicMock()
+                    resp.url = "https://cdn.example/blocked.m3u8"
+                    resp.status = 403
+                    resp.headers = {"content-type": "text/html"}
+                    resp.request = req
+                    for fn in self._handlers.get("response", []):
+                        fn(resp)
+
+                async def close(self):
+                    pass
+
+            class Fake403Context:
+                async def new_page(self):
+                    return Fake403Page()
+
+                async def cookies(self, urls):
+                    return []
+
+                async def close(self):
+                    pass
+
+            class Fake403Browser:
+                version = "153.0.8010.12"
+
+                def is_connected(self):
+                    return True
+
+                async def new_context(self, **kwargs):
+                    self._ctx_kwargs = kwargs
+                    return Fake403Context()
+
+                async def close(self):
+                    pass
+
+            class Fake403Chromium:
+                async def launch(self, **kwargs):
+                    return Fake403Browser()
+
+            class Fake403PW:
+                chromium = Fake403Chromium()
+
+                async def stop(self):
+                    pass
+
+            class Fake403Starter:
+                async def start(self):
+                    return Fake403PW()
+
+            fake_pw_pkg = types.ModuleType("playwright")
+            fake_async_api = types.ModuleType("playwright.async_api")
+            fake_async_api.async_playwright = lambda: Fake403Starter()
+            fake_pw_pkg.async_api = fake_async_api
+
+            with patch.dict(sys.modules, {"playwright": fake_pw_pkg, "playwright.async_api": fake_async_api}), \
+                 patch.object(browser_mod, "browser_available", return_value=True), \
+                 patch.object(browser_mod, "ensure_proxy_ready", new=AsyncMock(return_value=None)), \
+                 patch.object(browser_mod, "_playwright_proxy", return_value=None):
+                scan_403 = await browser_mod.resolve_stream_with_browser(
+                    "https://site.example/watch", timeout=5,
+                )
+                await browser_mod.close_browser()
+            self.assertIsNone(scan_403.url)
+            self.assertEqual(scan_403.reason, "no-manifest")
+        finally:
+            browser_mod._pw = orig_pw
+            browser_mod._browser = orig_browser
+            browser_mod._active = orig_active
+            browser_mod._browser_used = orig_used
+            browser_mod._browser_proxy_key = orig_key
+            browser_mod._browser_using_warp = orig_warp
+
+        # 4. Live Chromium loopback header check (no HeadlessChrome & matching Chrome major version)
+        if browser_mod.browser_available():
+            captured_wire_headers: list[dict[str, str]] = []
+            captured_ua_data: list[str] = []
+            app = web.Application()
+
+            async def page_ep(request: web.Request):
+                captured_wire_headers.append(dict(request.headers))
+                return web.Response(
+                    text=(
+                        '<html><body><script>'
+                        '(async () => {'
+                        '  const d = navigator.userAgentData;'
+                        '  const payload = d ? JSON.stringify({brands: d.brands, platform: d.platform, mobile: d.mobile}) : "{}";'
+                        '  await fetch("/ua-check?d=" + encodeURIComponent(payload));'
+                        '  await fetch("/stream/master.m3u8");'
+                        '})();'
+                        '</script></body></html>'
+                    ),
+                    content_type="text/html",
+                )
+
+            async def ua_check_ep(request: web.Request):
+                captured_ua_data.append(request.query.get("d", ""))
+                return web.Response(text="ok")
+
+            async def m3u8_ep(request: web.Request):
+                captured_wire_headers.append(dict(request.headers))
+                return web.Response(
+                    text="#EXTM3U\n#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n",
+                    content_type="application/vnd.apple.mpegurl",
+                )
+
+            app.router.add_get("/watch", page_ep)
+            app.router.add_get("/ua-check", ua_check_ep)
+            app.router.add_get("/stream/master.m3u8", m3u8_ep)
+            runner, base = await self._start_server(app)
+            try:
+                with patch.object(browser_mod, "ensure_proxy_ready", new=AsyncMock(return_value=None)), \
+                     patch.object(browser_mod, "_playwright_proxy", return_value=None):
+                    scan_live = await browser_mod.resolve_stream_with_browser(
+                        f"{base}/watch", timeout=15,
+                    )
+                    expected_major = browser_mod._chromium_major_version(browser_mod._browser)
+                    await browser_mod.close_browser()
+                self.assertEqual(scan_live.reason, "ok")
+                self.assertGreaterEqual(len(captured_wire_headers), 2)
+                for wire in captured_wire_headers:
+                    sec_ua = wire.get("sec-ch-ua", "") or wire.get("Sec-CH-UA", "")
+                    ua = wire.get("User-Agent", "")
+                    self.assertNotIn("HeadlessChrome", sec_ua)
+                    self.assertIn(f"Chrome/{expected_major}.0.0.0", ua)
+                    self.assertIn(f'"{expected_major}"', sec_ua)
+                self.assertTrue(captured_ua_data)
+                ua_js = json.loads(captured_ua_data[0])
+                self.assertEqual(ua_js.get("platform"), "Windows")
+                self.assertFalse(ua_js.get("mobile"))
+                brands_str = json.dumps(ua_js.get("brands", []))
+                self.assertNotIn("HeadlessChrome", brands_str)
+                self.assertIn(expected_major, brands_str)
+            finally:
+                await runner.cleanup()
+
+    async def test_handler_reextract_on_403_hint_claim_and_error_ux(self):
+        from app.bot import main as bot_main
+
+        # 1. _format_hls_error backward compatibility + actionable 403 tips + token redaction
+        err_direct = handler_mod._format_hls_error(
+            R_DOWNLOAD_FAILED, "playlist: HTTP 403 for https://cdn.x/a.m3u8?t=topsecret",
+        )
+        self.assertIn("Gagal memuat turun segmen HLS", err_direct)
+        self.assertIn("HTTP 403", err_direct)
+        self.assertNotIn("topsecret", err_direct)
+        self.assertIn("halaman video", err_direct)
+        self.assertNotIn("/warp_off", err_direct)
+
+        err_page_warp = handler_mod._format_hls_error(
+            R_DOWNLOAD_FAILED,
+            "HTTP 403 for https://cdn.x/seg.ts?t=secret2",
+            from_page=True,
+            warp_active=True,
+        )
+        self.assertNotIn("secret2", err_page_warp)
+        self.assertIn("/warp_off", err_page_warp)
+
+        err_remux = handler_mod._format_hls_error(R_REMUX_FAILED, "moov error")
+        self.assertNotIn("/warp_off", err_remux)
+        self.assertNotIn("halaman video", err_remux)
+
+        # 2. page_hls_handler claims message (returns True) when HLS_PAGE_HINT is sent
+        msg = MagicMock()
+        msg.from_user = MagicMock(id=202, username="tester", is_premium=False)
+        msg.text = "https://player.example.com/v/abc"
+        msg.caption = None
+        msg.reply_text = AsyncMock()
+        msg.photo = None
+        msg.document = None
+
+        with patch.object(handler_mod, "HLS_ENABLED", True), \
+             patch.object(handler_mod, "HLS_PAGE_EXTRACT", True), \
+             patch.object(handler_mod, "HLS_PAGE_HINT", True), \
+             patch.object(handler_mod, "_ensure_user_ready", new=AsyncMock(return_value=202)), \
+             patch.object(handler_mod, "is_proxy_enabled_async", new=AsyncMock(return_value=True)), \
+             patch.object(
+                 handler_mod, "_resolve_page_manifest",
+                 new=AsyncMock(return_value=handler_mod._ResolvedPage(
+                     url="", page_url="https://player.example.com/v/abc", player_page=True,
+                 )),
+             ):
+            claimed = await handler_mod.page_hls_handler(MagicMock(), msg)
+        self.assertTrue(claimed)
+        msg.reply_text.assert_awaited_once()
+        hint_sent = msg.reply_text.call_args.args[0]
+        self.assertIn("403", hint_sent)
+        self.assertIn("/warp_off", hint_sent)
+
+        # 3. process_hls_download re-extracts once on 403 when page_url is set and succeeds on retry
+        status_msg = MagicMock()
+        status_msg.edit_text = AsyncMock()
+        status_msg.delete = AsyncMock()
+        status_msg.chat = MagicMock()
+        status_msg.chat.send_action = AsyncMock()
+        fake_slot = MagicMock(sid="sid_reextract")
+        out_mp4 = os.path.join(self.work, "fresh.mp4")
+        with open(out_mp4, "wb") as fh:
+            fh.write(b"\x00" * 4096)
+
+        dl_calls: list[dict] = []
+
+        async def fake_call_dl(url, file_name, **kw):
+            dl_calls.append({"url": url, "headers": kw["headers"], "cookies": kw["cookies"]})
+            if len(dl_calls) == 1:
+                return HlsResult(
+                    converted=False,
+                    reason=R_DOWNLOAD_FAILED,
+                    detail="playlist: HTTP 403 for https://cdn.x/old.m3u8?t=expired",
+                )
+            return HlsResult(
+                path=out_mp4,
+                name="watch.mp4",
+                size=4096,
+                converted=True,
+                engine="segments",
+                duration=2.0,
+            )
+
+        re_resolved = handler_mod._ResolvedPage(
+            url="https://cdn.x/fresh.m3u8?t=fresh99",
+            page_url="https://player.example.com/v/abc",
+            force_direct=False,
+            headers={"User-Agent": "FreshUA/1.0", "Referer": "https://player.example.com/v/abc"},
+            cookies={"session": "fresh_cookie"},
+        )
+
+        with patch.object(handler_mod.manager, "get_client", new=AsyncMock(return_value=MagicMock())), \
+             patch.object(bot_main, "begin_process", return_value=fake_slot), \
+             patch.object(bot_main, "release_process") as mock_release, \
+             patch.object(bot_main, "is_cancelled", return_value=False), \
+             patch.object(handler_mod, "_load_custom_thumb", new=AsyncMock(return_value=None)), \
+             patch.object(handler_mod, "_get_backup_group_peer", new=AsyncMock(return_value=MagicMock())), \
+             patch.object(handler_mod, "_call_download_hls", side_effect=fake_call_dl), \
+             patch.object(handler_mod, "_resolve_page_manifest", new=AsyncMock(return_value=re_resolved)) as mock_resolve, \
+             patch.object(handler_mod, "_get_video_metadata", new=AsyncMock(return_value={"duration": 2, "width": 160, "height": 120})), \
+             patch.object(handler_mod, "_generate_video_thumb", new=AsyncMock(return_value=None)), \
+             patch.object(handler_mod, "_upload_file_to_backup", new=AsyncMock(return_value=(99, False))), \
+             patch.object(handler_mod, "_send_to_user", new=AsyncMock(return_value=True)), \
+             patch.object(handler_mod, "log_forward", new=AsyncMock()), \
+             patch.object(handler_mod, "safe_edit", new=AsyncMock()), \
+             patch.object(handler_mod, "clear_reply_markup", new=AsyncMock()):
+            await handler_mod.process_hls_download(
+                MagicMock(),
+                202,
+                msg,
+                status_msg,
+                url="https://cdn.x/old.m3u8?t=expired",
+                page_url="https://player.example.com/v/abc",
+                slot_sid="sid_reextract",
+            )
+        mock_resolve.assert_awaited_once()
+        self.assertEqual(len(dl_calls), 2)
+        self.assertEqual(dl_calls[1]["url"], "https://cdn.x/fresh.m3u8?t=fresh99")
+        self.assertEqual(dl_calls[1]["cookies"], {"session": "fresh_cookie"})
+        mock_release.assert_called_once_with(fake_slot)
+
+        # 4. process_hls_download stops after ONE re-extract if the retry also 403s
+        always_403 = HlsResult(
+            converted=False,
+            reason=R_DOWNLOAD_FAILED,
+            detail="playlist: HTTP 403 for https://cdn.x/still_blocked.m3u8?t=secret",
+        )
+        with patch.object(handler_mod.manager, "get_client", new=AsyncMock(return_value=MagicMock())), \
+             patch.object(bot_main, "begin_process", return_value=fake_slot), \
+             patch.object(bot_main, "release_process"), \
+             patch.object(bot_main, "is_cancelled", return_value=False), \
+             patch.object(handler_mod, "_load_custom_thumb", new=AsyncMock(return_value=None)), \
+             patch.object(handler_mod, "_get_backup_group_peer", new=AsyncMock(return_value=MagicMock())), \
+             patch.object(handler_mod, "_call_download_hls", new=AsyncMock(return_value=always_403)) as mock_dl_403, \
+             patch.object(handler_mod, "_resolve_page_manifest", new=AsyncMock(return_value=re_resolved)) as mock_res_once, \
+             patch.object(handler_mod, "is_proxy_enabled_async", new=AsyncMock(return_value=True)), \
+             patch.object(handler_mod, "safe_edit", new=AsyncMock()) as mock_edit_403, \
+             patch.object(handler_mod, "clear_reply_markup", new=AsyncMock()):
+            await handler_mod.process_hls_download(
+                MagicMock(),
+                202,
+                msg,
+                status_msg,
+                url="https://cdn.x/old.m3u8?t=expired",
+                page_url="https://player.example.com/v/abc",
+                slot_sid="sid_reextract",
+            )
+        mock_res_once.assert_awaited_once()
+        self.assertEqual(mock_dl_403.await_count, 2)
+        final_err_texts = [str(c.args[1]) for c in mock_edit_403.call_args_list if len(c.args) >= 2]
+        self.assertTrue(any("HTTP 403" in t and "/warp_off" in t for t in final_err_texts), final_err_texts)
+
+    async def test_engine_b_socks5_guard_and_client_reliability(self):
+        # 1. Healthy SOCKS5 proxy + HTTP 403 in _prepare must NOT leak VPS IP via direct Engine B ffmpeg
+        fake_socks_client = MagicMock()
+        fake_socks_client.proxy_url = "socks5://u:p@1.2.3.4:1080"
+        fake_socks_client.using_warp = False
+        fake_socks_client.headers = {"User-Agent": "TestUA"}
+        fake_socks_client.close = AsyncMock()
+
+        with patch.object(dl_mod, "_ffmpeg_available", return_value=True), \
+             patch.object(dl_mod, "HLS_ENGINE", "auto"), \
+             patch.object(_cfg, "HLS_PROXY_FALLBACK_DIRECT", True, create=True), \
+             patch.object(dl_mod, "_make_client", return_value=fake_socks_client), \
+             patch.object(dl_mod, "_prepare", new=AsyncMock(side_effect=_client_mod.HlsHttpError(403, "https://cdn.example.com/m.m3u8"))), \
+             patch.object(dl_mod, "_run_ffmpeg_detailed", new=AsyncMock()) as mock_ffmpeg:
+            res_socks = await download_hls_to_mp4(
+                "https://cdn.example.com/m.m3u8", "socks.m3u8", out_dir=self.work,
+            )
+        mock_ffmpeg.assert_not_awaited()
+        self.assertFalse(res_socks.converted)
+        self.assertEqual(res_socks.reason, R_DOWNLOAD_FAILED)
+        self.assertTrue(res_socks.detail.startswith("playlist: HTTP 403"))
+
+        # 2. HlsClient fetch_text_with_url & fetch_page must NOT double-wrap HlsProxyError
+        inner_perr = _client_mod.HlsProxyError("socks5://1.2.3.4:1080", ProxyConnectionError(111, "down"))
+        client_wrap = _client_mod.HlsClient(proxy_url="socks5://1.2.3.4:1080")
+        client_wrap._proxy_url = "socks5://1.2.3.4:1080"
+        fake_sess = MagicMock()
+        fake_sess.closed = False
+        fake_sess.get.return_value = _AsyncCM(exc=inner_perr)
+        with patch.object(client_wrap, "_get_session", new=AsyncMock(return_value=fake_sess)):
+            with self.assertRaises(_client_mod.HlsProxyError) as ctx_t:
+                await client_wrap.fetch_text_with_url("https://cdn.example.com/a.m3u8")
+            self.assertIs(ctx_t.exception, inner_perr)
+            with self.assertRaises(_client_mod.HlsProxyError) as ctx_p:
+                await client_wrap.fetch_page("https://site.example.com/watch")
+            self.assertIs(ctx_p.exception, inner_perr)
+
+        # 3. HlsClient cookie domain/path scoping preserved across session switches
+        app = web.Application()
+
+        async def login_ep(request: web.Request):
+            resp = web.Response(text="ok")
+            resp.set_cookie("scoped_tok", "only_a_hls", path="/hls")
+            return resp
+
+        app.router.add_get("/hls/login", login_ep)
+        runner, base = await self._start_server(app)
+        try:
+            cookie_client = _client_mod.HlsClient(proxy_url=None)
+            try:
+                await cookie_client.fetch_text(f"{base}/hls/login")
+                cookie_client.update_cookies({"b_tok": "only_b"}, url="https://b.example.com/v/1")
+                await cookie_client.switch_to_direct()
+                # Reopen session under new proxy key
+                await cookie_client._get_session()
+                self.assertEqual(
+                    cookie_client.export_cookies(f"{base}/hls/seg0.ts").get("scoped_tok"),
+                    "only_a_hls",
+                )
+                self.assertIsNone(cookie_client.export_cookies(f"{base}/other/seg0.ts").get("scoped_tok"))
+                self.assertIsNone(cookie_client.export_cookies("https://b.example.com/hls/seg0.ts").get("scoped_tok"))
+                self.assertEqual(
+                    cookie_client.export_cookies("https://b.example.com/v/seg0.ts").get("b_tok"),
+                    "only_b",
+                )
+            finally:
+                await cookie_client.close()
+        finally:
+            await runner.cleanup()
+
+    async def test_concurrent_auth_fallback_retries_outside_lock(self):
+        initial_failures = 0
+        all_initial_failed = asyncio.Event()
+        probe_done = False
+        active_retries = 0
+        max_active_retries = 0
+        both_overlapping = asyncio.Event()
+
+        class FakeConcurrentClient:
+            def __init__(self):
+                self.headers = {
+                    "User-Agent": "TestUA/1.0",
+                    "Referer": "https://site.example/e/1",
+                    "Origin": "https://site.example",
+                }
+
+            def apply_header_overrides(self, overrides):
+                for k, v in (overrides or {}).items():
+                    low = k.lower()
+                    for existing in [ek for ek in self.headers if ek.lower() == low]:
+                        self.headers.pop(existing, None)
+                    if v is not None:
+                        self.headers[k] = v
+
+            async def download_bytes(self, url, byte_range=None, on_chunk=None, *, headers=None):
+                nonlocal initial_failures, probe_done, active_retries, max_active_retries
+                eff = dict(self.headers)
+                if headers:
+                    for k, v in headers.items():
+                        low = k.lower()
+                        for existing in [ek for ek in eff if ek.lower() == low]:
+                            eff.pop(existing, None)
+                        if v is not None:
+                            eff[k] = v
+
+                if "Origin" in eff:
+                    initial_failures += 1
+                    if initial_failures == 3:
+                        all_initial_failed.set()
+                    raise _client_mod.HlsHttpError(403, url)
+
+                if not probe_done:
+                    probe_done = True
+                    await asyncio.wait_for(all_initial_failed.wait(), timeout=2.0)
+                    return b"probe_ok"
+
+                active_retries += 1
+                max_active_retries = max(max_active_retries, active_retries)
+                if active_retries == 2:
+                    both_overlapping.set()
+                try:
+                    await asyncio.wait_for(both_overlapping.wait(), timeout=2.0)
+                finally:
+                    active_retries -= 1
+                return b"retry_ok"
+
+        client = FakeConcurrentClient()
+        auth_state = dl_mod._PlaylistAuthState(
+            client, parent_url="https://cdn.example/index.m3u8", base_headers=dict(client.headers),
+        )
+        with patch.object(_cfg, "HLS_SEGMENT_RETRIES", 1, create=True):
+            results = await asyncio.gather(
+                dl_mod._fetch_media_bytes_resilient(
+                    client, "https://cdn.example/seg0.ts", label="segment 0", auth_state=auth_state,
+                ),
+                dl_mod._fetch_media_bytes_resilient(
+                    client, "https://cdn.example/seg1.ts", label="segment 1", auth_state=auth_state,
+                ),
+                dl_mod._fetch_media_bytes_resilient(
+                    client, "https://cdn.example/seg2.ts", label="segment 2", auth_state=auth_state,
+                ),
+            )
+        self.assertEqual(sorted(results), [b"probe_ok", b"retry_ok", b"retry_ok"])
+        self.assertEqual(max_active_retries, 2)
+
+    async def test_browser_redirect_to_403_not_ok(self):
+        # 1. Mocked redirect chain: /master.m3u8 -> 302 -> /blocked.html (403, non-.m3u8 target)
+        orig_pw = browser_mod._pw
+        orig_browser = browser_mod._browser
+        orig_active = browser_mod._active
+        orig_used = browser_mod._browser_used
+        orig_key = browser_mod._browser_proxy_key
+        orig_warp = browser_mod._browser_using_warp
+        try:
+            browser_mod._pw = None
+            browser_mod._browser = None
+            browser_mod._active = 0
+            browser_mod._browser_used = False
+            browser_mod._browser_proxy_key = None
+            browser_mod._browser_using_warp = False
+
+            class FakeRedirPage:
+                def __init__(self):
+                    self.url = "https://site.example/watch"
+                    self.frames = []
+                    self.main_frame = self
+                    self._handlers = {}
+
+                def set_default_timeout(self, ms):
+                    pass
+
+                def on(self, event, fn):
+                    self._handlers.setdefault(event, []).append(fn)
+
+                async def route(self, pattern, fn):
+                    pass
+
+                async def add_init_script(self, script):
+                    pass
+
+                async def evaluate(self, expr):
+                    return ""
+
+                async def goto(self, url, wait_until="domcontentloaded", timeout=5000):
+                    req_init = MagicMock()
+                    req_init.url = "https://site.example/master.m3u8"
+                    req_init.frame = self
+                    req_init.redirected_from = None
+
+                    req_final = MagicMock()
+                    req_final.url = "https://cdn.example/blocked.html"
+                    req_final.frame = self
+                    req_final.redirected_from = req_init
+
+                    for fn in self._handlers.get("request", []):
+                        fn(req_init)
+                        fn(req_final)
+
+                    resp = MagicMock()
+                    resp.url = "https://cdn.example/blocked.html"
+                    resp.status = 403
+                    resp.headers = {"content-type": "text/html"}
+                    resp.request = req_final
+                    for fn in self._handlers.get("response", []):
+                        fn(resp)
+
+                async def close(self):
+                    pass
+
+            class FakeRedirContext:
+                async def new_page(self):
+                    return FakeRedirPage()
+
+                async def cookies(self, urls):
+                    return []
+
+                async def close(self):
+                    pass
+
+            class FakeRedirBrowser:
+                version = "153.0.8010.12"
+
+                def is_connected(self):
+                    return True
+
+                async def new_context(self, **kwargs):
+                    return FakeRedirContext()
+
+                async def close(self):
+                    pass
+
+            class FakeRedirChromium:
+                async def launch(self, **kwargs):
+                    return FakeRedirBrowser()
+
+            class FakeRedirPW:
+                chromium = FakeRedirChromium()
+
+                async def stop(self):
+                    pass
+
+            class FakeRedirStarter:
+                async def start(self):
+                    return FakeRedirPW()
+
+            fake_pw_pkg = types.ModuleType("playwright")
+            fake_async_api = types.ModuleType("playwright.async_api")
+            fake_async_api.async_playwright = lambda: FakeRedirStarter()
+            fake_pw_pkg.async_api = fake_async_api
+
+            with patch.dict(sys.modules, {"playwright": fake_pw_pkg, "playwright.async_api": fake_async_api}), \
+                 patch.object(browser_mod, "browser_available", return_value=True), \
+                 patch.object(browser_mod, "ensure_proxy_ready", new=AsyncMock(return_value=None)), \
+                 patch.object(browser_mod, "_playwright_proxy", return_value=None):
+                scan_redir = await browser_mod.resolve_stream_with_browser(
+                    "https://site.example/watch", timeout=5,
+                )
+                await browser_mod.close_browser()
+            self.assertIsNone(scan_redir.url)
+            self.assertEqual(scan_redir.reason, "no-manifest")
+        finally:
+            browser_mod._pw = orig_pw
+            browser_mod._browser = orig_browser
+            browser_mod._active = orig_active
+            browser_mod._browser_used = orig_used
+            browser_mod._browser_proxy_key = orig_key
+            browser_mod._browser_using_warp = orig_warp
+
+        # 2. Real Playwright loopback 302 -> 403 verification
+        if browser_mod.browser_available():
+            app = web.Application()
+
+            async def watch_ep(request: web.Request):
+                return web.Response(
+                    text='<html><body><script>fetch("/start/master.m3u8");</script></body></html>',
+                    content_type="text/html",
+                )
+
+            async def redir_m3u8(request: web.Request):
+                raise web.HTTPFound("/edge/forbidden")
+
+            async def forbidden_ep(request: web.Request):
+                return web.Response(status=403, text="forbidden", content_type="text/html")
+
+            app.router.add_get("/watch", watch_ep)
+            app.router.add_get("/start/master.m3u8", redir_m3u8)
+            app.router.add_get("/edge/forbidden", forbidden_ep)
+            runner, base = await self._start_server(app)
+            try:
+                with patch.object(browser_mod, "ensure_proxy_ready", new=AsyncMock(return_value=None)), \
+                     patch.object(browser_mod, "_playwright_proxy", return_value=None):
+                    scan_live_redir = await browser_mod.resolve_stream_with_browser(
+                        f"{base}/watch", timeout=6,
+                    )
+                    await browser_mod.close_browser()
+                self.assertIsNone(scan_live_redir.url)
+                self.assertEqual(scan_live_redir.reason, "no-manifest")
+            finally:
+                await runner.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

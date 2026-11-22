@@ -12,6 +12,7 @@ The only HLS-specific part is the download+remux step, which lives in
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 import inspect
 import os
 import re
@@ -52,7 +53,7 @@ from app.direct.handler import (
 )
 from app.hls.browser import browser_available, resolve_stream_with_browser
 from app.hls.client import AUTO_PROXY, HlsClient, default_headers, read_proxy_url
-from app.hls.downloader import download_hls_to_mp4, reason_message
+from app.hls.downloader import R_DOWNLOAD_FAILED, download_hls_to_mp4, reason_message
 from app.hls.extract import resolve_stream_from_page
 from app.hls.playlist import HLS_LINK_PATTERN
 
@@ -133,6 +134,12 @@ _CANONICAL_HEADER_NAMES = {
     "accept": "Accept",
     "accept-language": "Accept-Language",
     "authorization": "Authorization",
+    "sec-fetch-dest": "Sec-Fetch-Dest",
+    "sec-fetch-mode": "Sec-Fetch-Mode",
+    "sec-fetch-site": "Sec-Fetch-Site",
+    "sec-ch-ua": "Sec-Ch-Ua",
+    "sec-ch-ua-mobile": "Sec-Ch-Ua-Mobile",
+    "sec-ch-ua-platform": "Sec-Ch-Ua-Platform",
 }
 
 _URL_QUERY_RE = re.compile(r"(https?://[^\s<>\"'?]+)\?[^\s<>\"']+")
@@ -186,19 +193,64 @@ def _sanitize_error_text(text: Any) -> str:
     return cleaned.strip()
 
 
-def _format_hls_error(reason: str, detail: str = "") -> str:
-    """Render a user-facing HLS failure message with sanitized detail."""
+_AUTH_HTTP_RE = re.compile(r"\bHTTP\s+(?:401|403)\b", re.IGNORECASE)
+
+
+async def _safe_is_warp_active() -> bool:
+    try:
+        return bool(await is_proxy_enabled_async())
+    except Exception:
+        return False
+
+
+def _is_auth_http_failure(result: Any) -> bool:
+    if getattr(result, "converted", False):
+        return False
+    if getattr(result, "reason", "") != R_DOWNLOAD_FAILED:
+        return False
+    detail = str(getattr(result, "detail", "") or "")
+    return bool(_AUTH_HTTP_RE.search(detail))
+
+
+def _format_hls_error(
+    reason: str,
+    detail: str = "",
+    *,
+    from_page: bool = False,
+    warp_active: bool = False,
+) -> str:
+    """Render a user-facing HLS failure message with sanitized detail and 401/403 hints."""
     clean_detail = _sanitize_error_text(detail)
     try:
         params = inspect.signature(reason_message).parameters
     except (TypeError, ValueError):
         params = {}
     if len(params) >= 2 or "detail" in params:
-        return _sanitize_error_text(reason_message(reason, clean_detail))
-    base = reason_message(reason)
-    if clean_detail and clean_detail not in base:
-        return f"{base}\nℹ️ `{clean_detail[:200]}`"
-    return base
+        msg = _sanitize_error_text(reason_message(reason, clean_detail))
+    else:
+        base = reason_message(reason)
+        if clean_detail and clean_detail not in base:
+            msg = f"{base}\nℹ️ `{clean_detail[:200]}`"
+        else:
+            msg = base
+
+    if reason == R_DOWNLOAD_FAILED and _AUTH_HTTP_RE.search(clean_detail):
+        tips = []
+        if from_page:
+            tips.append(
+                "💡 Pelayan strim menyekat permintaan (HTTP 401/403) walaupun selepas mengambil semula halaman."
+            )
+        else:
+            tips.append(
+                "💡 Pautan `.m3u8` mungkin mempunyai token tamat tempoh atau terikat pada IP pelayar anda — "
+                "cuba hantar pautan halaman video/embed asal dan bukannya URL `.m3u8` terus."
+            )
+        if warp_active:
+            tips.append(
+                "🛡️ WARP sedang aktif — jika CDN menyekat IP WARP, cuba `/warp_off` dan muat turun semula."
+            )
+        msg = f"{msg}\n\n" + "\n".join(tips)
+    return msg
 
 
 def _parse_cookie_header(raw_cookie: str) -> Dict[str, str]:
@@ -241,28 +293,20 @@ def _merge_request_context(
         merged[canonical] = str(value).strip()
         lower_to_key[low] = canonical
 
-    for k, v in default_headers(url).items():
-        _put(k, v)
-
-    has_captured_origin = False
     if captured_headers:
+        for k, v in default_headers(url).items():
+            if k.lower() in ("user-agent", "accept", "accept-language"):
+                _put(k, v)
         for k, v in captured_headers.items():
             if not k or not v:
                 continue
-            if k.strip().lower() == "origin":
-                has_captured_origin = True
             _put(k, v)
-
-    if page_url and "Referer" not in merged:
-        _put("Referer", page_url)
-    elif page_url and not captured_headers:
-        _put("Referer", page_url)
-
-    # Keep Origin aligned with Referer when page_url overrode the stream origin.
-    if not has_captured_origin:
-        ref_origin = _origin_of(merged.get("Referer") or page_url or url)
-        if ref_origin:
-            _put("Origin", ref_origin)
+    elif page_url:
+        for k, v in default_headers(url, referer=page_url).items():
+            _put(k, v)
+    else:
+        for k, v in default_headers(url).items():
+            _put(k, v)
 
     if captured_cookies:
         for k, v in captured_cookies.items():
@@ -480,10 +524,24 @@ async def hls_link_handler(bot: Client, message: Message) -> None:
     await _begin_hls_job(bot, message, url)
 
 
+@dataclass
+class _ResolvedPage:
+    """Outcome of resolving a video page/embed URL into a manifest + request context."""
+    url: str = ""
+    page_url: str = ""
+    force_direct: bool = False
+    headers: Dict[str, str] = field(default_factory=dict)
+    cookies: Dict[str, str] = field(default_factory=dict)
+    player_page: bool = False
+    stage1_error: bool = False
+
+
 async def _browser_stage(
     message: Message,
     page_url: str,
     fallback_page: str,
+    *,
+    notify_status: bool = True,
 ) -> Tuple[str, str, bool, Dict[str, str], Dict[str, str]]:
     """Resolve the manifest by running the page in a headless browser.
 
@@ -501,11 +559,12 @@ async def _browser_stage(
         return "", fallback_page, False, {}, {}
 
     status_msg = None
-    try:
-        # This stage can take a while, so say something instead of staying quiet.
-        status_msg = await message.reply_text("🌐 Membuka halaman di pelayar…")
-    except Exception:
-        status_msg = None
+    if notify_status:
+        try:
+            # This stage can take a while, so say something instead of staying quiet.
+            status_msg = await message.reply_text("🌐 Membuka halaman di pelayar…")
+        except Exception:
+            status_msg = None
 
     try:
         scan = await resolve_stream_with_browser(page_url, timeout=HLS_BROWSER_TIMEOUT)
@@ -567,6 +626,88 @@ async def _scan_page_with_client(
         await client.close()
 
 
+async def _resolve_page_manifest(
+    message: Message,
+    page_url: str,
+    *,
+    notify_browser: bool = True,
+) -> _ResolvedPage:
+    """Resolve *page_url* to a verified manifest across Stage 1 (HTTP), Stage 2 (browser), Stage 3 (direct)."""
+    page_headers = default_headers(page_url)
+    page_headers["Referer"] = page_url
+    origin = _origin_of(page_url)
+    if origin:
+        page_headers["Origin"] = origin
+
+    try:
+        scan, scan_headers, scan_cookies = await _scan_page_with_client(
+            page_url, page_headers, proxy_url=AUTO_PROXY,
+        )
+    except (asyncio.CancelledError, WarpProxyError):
+        raise
+    except Exception as e:
+        print(f"[HLS] Page scan failed for {page_url.split('?', 1)[0]}: "
+              f"{type(e).__name__}: {e}")
+        return _ResolvedPage(page_url=page_url, stage1_error=True)
+
+    url = scan.url or ""
+    page_used = getattr(scan, "page_url", "") or page_url
+    force_direct = False
+    player_page = bool(getattr(scan, "player_page", False))
+
+    if url:
+        if not scan_headers:
+            scan_headers = dict(page_headers)
+            scan_headers["Referer"] = page_used
+            used_origin = _origin_of(page_used)
+            if used_origin:
+                scan_headers["Origin"] = used_origin
+    else:
+        detail = f" - {scan.detail}" if getattr(scan, "detail", "") else ""
+        print(f"[HLS] Page scan: no manifest in {page_url.split('?', 1)[0]} "
+              f"({scan.reason}, {scan.candidates} candidate(s){detail})")
+        if scan.reason != "not-a-page":
+            url, page_used, force_direct, scan_headers, scan_cookies = (
+                await _browser_stage(
+                    message, page_url, page_used, notify_status=notify_browser,
+                )
+            )
+            if (
+                not url
+                and scan.reason == "error"
+                and HLS_PROXY_FALLBACK_DIRECT
+                and read_proxy_url() is not None
+                and not await is_proxy_enabled_async()
+            ):
+                try:
+                    direct_scan, direct_hdrs, direct_cookies = (
+                        await _scan_page_with_client(
+                            page_url, page_headers, proxy_url=None,
+                        )
+                    )
+                    if direct_scan.url:
+                        url = direct_scan.url
+                        page_used = getattr(direct_scan, "page_url", "") or page_url
+                        force_direct = True
+                        scan_headers = direct_hdrs or dict(page_headers)
+                        scan_cookies = direct_cookies
+                        print("[HLS] Page scan succeeded directly after proxy error")
+                except (asyncio.CancelledError, WarpProxyError):
+                    raise
+                except Exception as e:
+                    print(f"[HLS] Direct page retry failed: {type(e).__name__}: {e}")
+
+    return _ResolvedPage(
+        url=url,
+        page_url=page_used,
+        force_direct=force_direct,
+        headers=dict(scan_headers or {}),
+        cookies=dict(scan_cookies or {}),
+        player_page=player_page,
+        stage1_error=False,
+    )
+
+
 async def page_hls_handler(bot: Client, message: Message) -> bool:
     """Start an HLS job from a *page* link, using the manifest it embeds.
 
@@ -599,18 +740,8 @@ async def page_hls_handler(bot: Client, message: Message) -> bool:
     if await _ensure_user_ready(message) is None:
         return True
 
-    # A browser sends the whole document URL as Referer (plus Origin), and
-    # anti-hotlink CDNs check both for the page fetch and candidate validation.
-    page_headers = default_headers(page_url)
-    page_headers["Referer"] = page_url
-    origin = _origin_of(page_url)
-    if origin:
-        page_headers["Origin"] = origin
-
     try:
-        scan, scan_headers, scan_cookies = await _scan_page_with_client(
-            page_url, page_headers, proxy_url=AUTO_PROXY,
-        )
+        resolved = await _resolve_page_manifest(message, page_url, notify_browser=True)
     except WarpProxyError as e:
         print(f"[HLS] WARP proxy error during page scan for {page_url.split('?', 1)[0]}: {e}")
         try:
@@ -618,89 +749,40 @@ async def page_hls_handler(bot: Client, message: Message) -> bool:
         except Exception:
             pass
         return True
-    except Exception as e:
-        print(f"[HLS] Page scan failed for {page_url.split('?', 1)[0]}: "
-              f"{type(e).__name__}: {e}")
+
+    if resolved.stage1_error:
         return False
 
-    url = scan.url or ""
-    page_used = scan.page_url or page_url
-    force_direct = False
-
-    if url:
-        if not scan_headers:
-            scan_headers = dict(page_headers)
-            scan_headers["Referer"] = page_used
-            used_origin = _origin_of(page_used)
-            if used_origin:
-                scan_headers["Origin"] = used_origin
-    else:
-        detail = f" - {scan.detail}" if scan.detail else ""
-        print(f"[HLS] Page scan: no manifest in {page_url.split('?', 1)[0]} "
-              f"({scan.reason}, {scan.candidates} candidate(s){detail})")
-        # Skip Chromium for binary/attachment responses (not-a-page); keep it
-        # for pages without static manifests and HTTP/bot-check errors.
-        if scan.reason != "not-a-page":
+    if not resolved.url:
+        if HLS_PAGE_HINT and resolved.player_page:
+            warp_active = await _safe_is_warp_active()
+            hint_text = (
+                "🔎 Halaman ini mengandungi pemain video tetapi pautan strimnya tidak "
+                "dapat dibaca secara automatik.\n\n"
+                "💡 Sila cuba hantar pautan halaman video/embed terus (`player`/`embed` URL).\n"
+                "⚠️ Elakkan menyalin URL `.m3u8` terus dari pelayar (DevTools) kerana "
+                "token biasanya terikat pada IP pelayar anda dan akan gagal dengan ralat HTTP 403."
+            )
+            if warp_active:
+                hint_text += (
+                    "\n🛡️ WARP sedang aktif — jika halaman/CDN menyekat WARP, cuba `/warp_off` dan hantar semula."
+                )
             try:
-                url, page_used, force_direct, scan_headers, scan_cookies = (
-                    await _browser_stage(message, page_url, page_used)
-                )
-            except WarpProxyError as e:
-                print(
-                    f"[HLS] WARP proxy error during browser stage for {page_url.split('?', 1)[0]}: {e}"
-                )
-                try:
-                    await message.reply_text(f"❌ {e}")
-                except Exception:
-                    pass
-                return True
-            # If the proxy fetch itself errored and browser stage didn't yield a
-            # manifest (e.g. Playwright missing or proxied), retry direct once.
-            if (
-                not url
-                and scan.reason == "error"
-                and HLS_PROXY_FALLBACK_DIRECT
-                and read_proxy_url() is not None
-                and not await is_proxy_enabled_async()
-            ):
-                try:
-                    direct_scan, direct_hdrs, direct_cookies = (
-                        await _scan_page_with_client(
-                            page_url, page_headers, proxy_url=None,
-                        )
-                    )
-                    if direct_scan.url:
-                        url = direct_scan.url
-                        page_used = direct_scan.page_url or page_url
-                        force_direct = True
-                        scan_headers = direct_hdrs or dict(page_headers)
-                        scan_cookies = direct_cookies
-                        print(f"[HLS] Page scan succeeded directly after proxy error")
-                except Exception as e:
-                    print(f"[HLS] Direct page retry failed: {type(e).__name__}: {e}")
-
-    if not url:
-        if HLS_PAGE_HINT and scan.player_page:
-            try:
-                await message.reply_text(
-                    "🔎 Halaman ini memainkan video tetapi pautan strimnya tidak "
-                    "boleh dibaca terus dari halaman.\n\n"
-                    "Sila hantar pautan `.m3u8` (buka video di pelayar → F12 → "
-                    "Network → tapis `m3u8` → salin pautan)."
-                )
+                await message.reply_text(hint_text)
             except Exception:
                 pass
+            return True
         return False
 
-    print(f"[HLS] Page scan: manifest found via {page_used.split('?', 1)[0]}")
+    print(f"[HLS] Page scan: manifest found via {resolved.page_url.split('?', 1)[0]}")
     return await _begin_hls_job(
         bot,
         message,
-        url,
-        page_url=page_used,
-        force_direct=force_direct,
-        headers=scan_headers,
-        cookies=scan_cookies,
+        resolved.url,
+        page_url=resolved.page_url,
+        force_direct=resolved.force_direct,
+        headers=resolved.headers,
+        cookies=resolved.cookies,
         _user_verified=True,
     )
 
@@ -876,11 +958,75 @@ async def process_hls_download(
         if is_cancelled(user_id):
             raise asyncio.CancelledError()
 
+        if not result.converted and page_url and _is_auth_http_failure(result):
+            if tracker is not None:
+                await tracker.stop()
+                tracker = None
+                holder["tracker"] = None
+            if work_dir and os.path.exists(work_dir):
+                shutil.rmtree(work_dir, ignore_errors=True)
+            work_dir = tempfile.mkdtemp(prefix="hls_job_")
+
+            await safe_edit(
+                status_msg,
+                "🔄 Token strim tamat tempoh — mengambil semula pautan strim…",
+                reply_markup=cancel_kb,
+            )
+            if is_cancelled(user_id):
+                raise asyncio.CancelledError()
+
+            resolved: Optional[_ResolvedPage] = None
+            try:
+                resolved = await _resolve_page_manifest(
+                    message, page_url, notify_browser=False,
+                )
+            except (asyncio.CancelledError, WarpProxyError):
+                raise
+            except Exception as re_exc:
+                print(
+                    f"[HLS] Re-extraction failed for {page_url.split('?', 1)[0]}: "
+                    f"{type(re_exc).__name__}: {re_exc}"
+                )
+
+            if is_cancelled(user_id):
+                raise asyncio.CancelledError()
+
+            if resolved is not None and not resolved.stage1_error and resolved.url:
+                url = resolved.url
+                page_url = resolved.page_url or page_url
+                force_direct = resolved.force_direct
+                page_stem = _name_from_page(page_url)
+                file_name = f"{page_stem}.m3u8" if page_stem else _name_from_url(url)
+                mp4_name = f"{os.path.splitext(file_name)[0]}.mp4"
+                req_headers, req_cookies = _merge_request_context(
+                    url, page_url, resolved.headers, resolved.cookies,
+                )
+                result = await _call_download_hls(
+                    url,
+                    file_name,
+                    headers=req_headers,
+                    cookies=req_cookies,
+                    status_cb=_status_cb,
+                    on_chunk=_on_chunk,
+                    on_meta=_on_meta,
+                    out_dir=work_dir,
+                    proxy_url=None if force_direct else AUTO_PROXY,
+                )
+                tracker = holder["tracker"]
+                if is_cancelled(user_id):
+                    raise asyncio.CancelledError()
+
         if not result.converted:
             err_detail = getattr(result, "detail", "") or ""
             print(f"[HLS] Download failed for user {user_id}: {result.reason} "
                   f"{_sanitize_error_text(err_detail)}".rstrip())
-            err_msg = _format_hls_error(result.reason, err_detail)
+            warp_active = await _safe_is_warp_active()
+            err_msg = _format_hls_error(
+                result.reason,
+                err_detail,
+                from_page=bool(page_url),
+                warp_active=warp_active,
+            )
             if tracker is not None:
                 await tracker.stop(err_msg)
             else:

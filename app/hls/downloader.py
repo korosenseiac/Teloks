@@ -48,6 +48,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import app.config as _cfg
 import app.hls.client as _client_mod
@@ -216,16 +217,149 @@ def _merge_cookie_header(headers: Dict[str, str], cookies: Dict[str, str]) -> No
 
 
 def _normalize_headers(url: str, headers: Optional[Dict[str, str]]) -> Dict[str, str]:
-    """Ensure browser-like defaults exist without clobbering caller headers."""
+    """Ensure baseline browser defaults exist without re-injecting omitted Referer/Origin."""
     defaults = default_headers(url)
     if not headers:
         return defaults
     merged = dict(headers)
     lower_keys = {k.lower() for k in merged}
-    for key, value in defaults.items():
-        if key.lower() not in lower_keys:
-            merged[key] = value
+    for key in ("User-Agent", "Accept", "Accept-Language"):
+        if key.lower() not in lower_keys and key in defaults:
+            merged[key] = defaults[key]
     return merged
+
+
+def _supports_kwarg(fn: Any, kw: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == kw:
+            return True
+    return False
+
+
+def _header_value_ci(headers: Optional[Dict[str, str]], name: str) -> str:
+    low = name.lower()
+    for k, v in (headers or {}).items():
+        if k and v is not None and k.lower() == low:
+            return str(v).strip()
+    return ""
+
+
+def _origin_of_url(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return ""
+
+
+def _inherit_query(child_url: str, parent_url: str) -> Optional[str]:
+    """Append *parent_url*'s query string to *child_url* if *child_url* has none."""
+    if not child_url or not parent_url:
+        return None
+    try:
+        parent_parts = urlsplit(parent_url)
+        child_parts = urlsplit(child_url)
+    except ValueError:
+        return None
+    if not parent_parts.query or child_parts.query:
+        return None
+    return urlunsplit((
+        child_parts.scheme,
+        child_parts.netloc,
+        child_parts.path,
+        parent_parts.query,
+        child_parts.fragment,
+    ))
+
+
+def _header_fallback_profiles(
+    current_headers: Dict[str, str],
+    target_url: str,
+) -> List[Dict[str, Optional[str]]]:
+    """Ordered, deduplicated Referer/Origin overrides to probe only on HTTP 401/403."""
+    cur_ref = _header_value_ci(current_headers, "Referer")
+    cur_orig = _header_value_ci(current_headers, "Origin")
+    ref_origin = _origin_of_url(cur_ref)
+    target_origin = _origin_of_url(target_url)
+
+    seen_pairs = {(cur_ref or None, cur_orig or None)}
+    profiles: List[Dict[str, Optional[str]]] = []
+
+    def _add(ref_val: Optional[str], orig_val: Optional[str], override: Dict[str, Optional[str]]) -> None:
+        pair = (ref_val or None, orig_val or None)
+        if pair in seen_pairs:
+            return
+        seen_pairs.add(pair)
+        profiles.append(override)
+
+    # 1) Origin-only Referer + Origin (Chrome strict-origin-when-cross-origin).
+    if cur_ref and ref_origin:
+        _add(f"{ref_origin}/", ref_origin, {"Referer": f"{ref_origin}/", "Origin": ref_origin})
+
+    # 2) Current Referer without Origin.
+    if cur_ref:
+        _add(cur_ref, None, {"Origin": None})
+
+    # 3) Origin-only Referer without Origin.
+    if cur_ref and ref_origin:
+        _add(f"{ref_origin}/", None, {"Referer": f"{ref_origin}/", "Origin": None})
+
+    # 4) Target/stream origin as Referer without Origin, then with Origin.
+    if target_origin:
+        _add(f"{target_origin}/", None, {"Referer": f"{target_origin}/", "Origin": None})
+        _add(f"{target_origin}/", target_origin, {"Referer": f"{target_origin}/", "Origin": target_origin})
+
+    # 5) Clean no-Referer, no-Origin.
+    _add(None, None, {"Referer": None, "Origin": None})
+    return profiles
+
+
+def _apply_header_dict_inplace(
+    target: Dict[str, str], overrides: Dict[str, Optional[str]]
+) -> None:
+    key_map = {k.lower(): k for k in list(target.keys()) if k}
+    for k, v in overrides.items():
+        if not k:
+            continue
+        low = k.lower()
+        if low in key_map:
+            target.pop(key_map.pop(low), None)
+        if v is not None:
+            target[k] = v
+            key_map[low] = k
+
+
+def _current_headers(client: Any, base_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    ch = getattr(client, "headers", None)
+    if isinstance(ch, dict) and ch:
+        return dict(ch)
+    return dict(base_headers or {})
+
+
+def _promote_header_overrides(
+    client: Any,
+    base_headers: Optional[Dict[str, str]],
+    overrides: Optional[Dict[str, Optional[str]]],
+) -> None:
+    if not overrides:
+        return
+    apply_fn = getattr(client, "apply_header_overrides", None)
+    if callable(apply_fn):
+        apply_fn(overrides)
+    else:
+        hdrs = getattr(client, "headers", None)
+        if isinstance(hdrs, dict):
+            _apply_header_dict_inplace(hdrs, overrides)
+    if isinstance(base_headers, dict):
+        _apply_header_dict_inplace(base_headers, overrides)
 
 
 def _make_client(
@@ -464,9 +598,14 @@ def _retry_delay(attempt: int, exc: BaseException) -> float:
     return min(0.35 * (2 ** (attempt - 1)), 6.0) + random.uniform(0.0, 0.25)
 
 
-async def _retry_call(op_name: str, fn: Callable[[], Any]) -> Any:
+async def _retry_call(
+    op_name: str,
+    fn: Callable[[], Any],
+    *,
+    max_attempts: Optional[int] = None,
+) -> Any:
     """Run an async fetch operation with smart status-aware backoff."""
-    attempts = _cfg_retries()
+    attempts = max(1, int(max_attempts)) if max_attempts is not None else _cfg_retries()
     last_exc: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         try:
@@ -484,17 +623,28 @@ async def _retry_call(op_name: str, fn: Callable[[], Any]) -> Any:
     raise last_exc
 
 
-async def _fetch_text_resilient(client: HlsClient, url: str) -> Tuple[str, str]:
+async def _fetch_text_resilient(
+    client: HlsClient,
+    url: str,
+    *,
+    headers: Optional[Dict[str, Optional[str]]] = None,
+    max_attempts: Optional[int] = None,
+) -> Tuple[str, str]:
     """Fetch playlist text + final post-redirect URL with retries."""
     fetch_with_url = getattr(client, "fetch_text_with_url", None)
 
     async def _do() -> Tuple[str, str]:
         if callable(fetch_with_url):
+            if headers is not None and _supports_kwarg(fetch_with_url, "headers"):
+                return await fetch_with_url(url, headers=headers)
             return await fetch_with_url(url)
-        text = await client.fetch_text(url)
+        if headers is not None and _supports_kwarg(client.fetch_text, "headers"):
+            text = await client.fetch_text(url, headers=headers)
+        else:
+            text = await client.fetch_text(url)
         return text, url
 
-    return await _retry_call("playlist", _do)
+    return await _retry_call("playlist", _do, max_attempts=max_attempts)
 
 
 async def _fetch_bytes_resilient(
@@ -504,17 +654,27 @@ async def _fetch_bytes_resilient(
     byte_range: Optional[Tuple[int, int]] = None,
     on_chunk: Optional[Callable[[int], None]] = None,
     label: str = "segment",
+    headers: Optional[Dict[str, Optional[str]]] = None,
+    max_attempts: Optional[int] = None,
 ) -> bytes:
     """Fetch binary bytes (segment, key, or init map) with retries & range guard."""
     download_bytes_fn = getattr(client, "download_bytes", None)
 
     async def _do() -> bytes:
         if callable(download_bytes_fn):
-            data = await download_bytes_fn(
-                url, byte_range=byte_range, on_chunk=on_chunk,
-            )
+            if headers is not None and _supports_kwarg(download_bytes_fn, "headers"):
+                data = await download_bytes_fn(
+                    url, byte_range=byte_range, on_chunk=on_chunk, headers=headers,
+                )
+            else:
+                data = await download_bytes_fn(
+                    url, byte_range=byte_range, on_chunk=on_chunk,
+                )
         else:
-            data = await client.fetch_bytes(url, byte_range=byte_range)
+            if headers is not None and _supports_kwarg(client.fetch_bytes, "headers"):
+                data = await client.fetch_bytes(url, byte_range=byte_range, headers=headers)
+            else:
+                data = await client.fetch_bytes(url, byte_range=byte_range)
             if byte_range is not None:
                 offset, length = byte_range
                 if len(data) > length:
@@ -534,7 +694,221 @@ async def _fetch_bytes_resilient(
             raise ValueError(f"Empty {label} response for {url}")
         return data
 
-    return await _retry_call(label, _do)
+    return await _retry_call(label, _do, max_attempts=max_attempts)
+
+
+class _PlaylistAuthState:
+    """Shared per-playlist 401/403 recovery state so workers don't stampede probes."""
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        parent_url: str = "",
+        base_headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        self.client = client
+        self.parent_url = parent_url
+        self.base_headers = base_headers
+        self.lock = asyncio.Lock()
+        self.generation: int = 0
+        self.inherit_query: bool = False
+        self.winning_overrides: Optional[Dict[str, Optional[str]]] = None
+        self.exhausted: bool = False
+
+
+def _client_supports_binary_headers(client: Any) -> bool:
+    download_bytes_fn = getattr(client, "download_bytes", None)
+    if callable(download_bytes_fn):
+        return _supports_kwarg(download_bytes_fn, "headers")
+    fetch_bytes_fn = getattr(client, "fetch_bytes", None)
+    if callable(fetch_bytes_fn):
+        return _supports_kwarg(fetch_bytes_fn, "headers")
+    return False
+
+
+def _client_supports_text_headers(client: Any) -> bool:
+    fetch_with_url = getattr(client, "fetch_text_with_url", None)
+    if callable(fetch_with_url):
+        return _supports_kwarg(fetch_with_url, "headers")
+    fetch_text_fn = getattr(client, "fetch_text", None)
+    if callable(fetch_text_fn):
+        return _supports_kwarg(fetch_text_fn, "headers")
+    return False
+
+
+async def _fetch_media_bytes_resilient(
+    client: HlsClient,
+    url: str,
+    *,
+    byte_range: Optional[Tuple[int, int]] = None,
+    on_chunk: Optional[Callable[[int], None]] = None,
+    label: str = "segment",
+    auth_state: Optional[_PlaylistAuthState] = None,
+    validator: Optional[Callable[[bytes], bool]] = None,
+) -> bytes:
+    """Fetch key/init/segment bytes with shared 401/403 query & header fallback."""
+    if auth_state is None:
+        return await _fetch_bytes_resilient(
+            client, url, byte_range=byte_range, on_chunk=on_chunk, label=label,
+        )
+
+    eff_url = (_inherit_query(url, auth_state.parent_url) or url) if auth_state.inherit_query else url
+    eff_headers = auth_state.winning_overrides
+    start_gen = auth_state.generation
+
+    try:
+        return await _fetch_bytes_resilient(
+            client, eff_url, byte_range=byte_range, on_chunk=on_chunk, label=label,
+            headers=eff_headers,
+        )
+    except (asyncio.CancelledError, WarpProxyError):
+        raise
+    except Exception as exc:
+        if _is_proxy_error(exc) or _extract_http_status(exc) not in (401, 403):
+            raise
+
+        retry_after_unlock = False
+        retry_url = url
+        retry_headers: Optional[Dict[str, Optional[str]]] = None
+
+        async with auth_state.lock:
+            if auth_state.generation != start_gen:
+                retry_after_unlock = True
+                retry_url = (
+                    (_inherit_query(url, auth_state.parent_url) or url)
+                    if auth_state.inherit_query else url
+                )
+                retry_headers = (
+                    dict(auth_state.winning_overrides)
+                    if auth_state.winning_overrides is not None else None
+                )
+            elif auth_state.exhausted:
+                raise
+            else:
+                inherited = (
+                    _inherit_query(url, auth_state.parent_url)
+                    if (auth_state.parent_url and not auth_state.inherit_query)
+                    else None
+                )
+                inherited_alive = inherited is not None
+
+                if inherited is not None:
+                    try:
+                        data = await _fetch_bytes_resilient(
+                            client, inherited, byte_range=byte_range, on_chunk=on_chunk,
+                            label=label, headers=auth_state.winning_overrides, max_attempts=1,
+                        )
+                        if validator is None or validator(data):
+                            auth_state.inherit_query = True
+                            auth_state.generation += 1
+                            return data
+                    except (asyncio.CancelledError, WarpProxyError):
+                        raise
+                    except Exception as inh_exc:
+                        if _is_proxy_error(inh_exc):
+                            raise
+                        if _extract_http_status(inh_exc) not in (401, 403):
+                            inherited_alive = False
+
+                if _client_supports_binary_headers(client):
+                    profiles = _header_fallback_profiles(
+                        _current_headers(client, auth_state.base_headers), url,
+                    )
+                    for profile in profiles:
+                        cand_urls = [url]
+                        if inherited_alive and inherited is not None:
+                            cand_urls.append(inherited)
+                        for idx_c, cand_url in enumerate(cand_urls):
+                            try:
+                                data = await _fetch_bytes_resilient(
+                                    client, cand_url, byte_range=byte_range, on_chunk=on_chunk,
+                                    label=label, headers=profile, max_attempts=1,
+                                )
+                                if validator is not None and not validator(data):
+                                    continue
+                                _promote_header_overrides(client, auth_state.base_headers, profile)
+                                auth_state.winning_overrides = dict(profile)
+                                if idx_c == 1:
+                                    auth_state.inherit_query = True
+                                auth_state.generation += 1
+                                return data
+                            except (asyncio.CancelledError, WarpProxyError):
+                                raise
+                            except Exception as p_exc:
+                                if _is_proxy_error(p_exc):
+                                    raise
+                                if idx_c == 1 and _extract_http_status(p_exc) not in (401, 403):
+                                    inherited_alive = False
+                                continue
+
+                auth_state.exhausted = True
+                raise
+
+        if retry_after_unlock:
+            return await _fetch_bytes_resilient(
+                client, retry_url, byte_range=byte_range, on_chunk=on_chunk, label=label,
+                headers=retry_headers,
+            )
+
+
+async def _fetch_playlist_with_fallback(
+    client: HlsClient,
+    url: str,
+    *,
+    parent_url: str = "",
+    base_headers: Optional[Dict[str, str]] = None,
+) -> Tuple[str, str]:
+    """Fetch a playlist, falling back on 401/403 to query inheritance and header profiles."""
+    try:
+        return await _fetch_text_resilient(client, url)
+    except (asyncio.CancelledError, WarpProxyError):
+        raise
+    except Exception as exc:
+        if _is_proxy_error(exc) or _extract_http_status(exc) not in (401, 403):
+            raise
+
+        inherited = _inherit_query(url, parent_url) if parent_url else None
+        inherited_alive = inherited is not None
+
+        if inherited is not None:
+            try:
+                text, final_url = await _fetch_text_resilient(client, inherited, max_attempts=1)
+                if is_hls_playlist(text):
+                    return text, final_url
+            except (asyncio.CancelledError, WarpProxyError):
+                raise
+            except Exception as inh_exc:
+                if _is_proxy_error(inh_exc):
+                    raise
+                if _extract_http_status(inh_exc) not in (401, 403):
+                    inherited_alive = False
+
+        if _client_supports_text_headers(client):
+            profiles = _header_fallback_profiles(_current_headers(client, base_headers), url)
+            for profile in profiles:
+                cand_urls = [url]
+                if inherited_alive and inherited is not None:
+                    cand_urls.append(inherited)
+                for idx_c, cand_url in enumerate(cand_urls):
+                    try:
+                        text, final_url = await _fetch_text_resilient(
+                            client, cand_url, headers=profile, max_attempts=1,
+                        )
+                        if not is_hls_playlist(text):
+                            continue
+                        _promote_header_overrides(client, base_headers, profile)
+                        return text, final_url
+                    except (asyncio.CancelledError, WarpProxyError):
+                        raise
+                    except Exception as p_exc:
+                        if _is_proxy_error(p_exc):
+                            raise
+                        if idx_c == 1 and _extract_http_status(p_exc) not in (401, 403):
+                            inherited_alive = False
+                        continue
+
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1185,6 +1559,9 @@ async def _fetch_keys_and_inits(
     *,
     sem: asyncio.Semaphore,
     on_chunk=None,
+    parent_url: str = "",
+    base_headers: Optional[Dict[str, str]] = None,
+    auth_state: Optional[_PlaylistAuthState] = None,
 ) -> Tuple[Dict[str, bytes], Dict[Tuple[str, Optional[Tuple[int, int]]], bytes]]:
     """Fetch all distinct AES-128 keys and #EXT-X-MAP init sections concurrently."""
     for key in pl.keys:
@@ -1192,6 +1569,11 @@ async def _fetch_keys_and_inits(
             raise _HlsError(R_DRM, f"Unsupported encryption method: {key.method}")
         if key.is_aes128 and not key.url:
             raise ValueError("AES-128 key missing URI")
+
+    if auth_state is None:
+        auth_state = _PlaylistAuthState(
+            client, parent_url=parent_url, base_headers=base_headers,
+        )
 
     unique_key_urls: List[str] = []
     for key in pl.keys:
@@ -1210,15 +1592,19 @@ async def _fetch_keys_and_inits(
 
     async def _get_key(url: str) -> None:
         async with sem:
-            data = await _fetch_bytes_resilient(client, url, label="AES-128 key")
+            data = await _fetch_media_bytes_resilient(
+                client, url, label="AES-128 key",
+                auth_state=auth_state, validator=lambda d: len(d) == 16,
+            )
             raw_keys[url] = _validate_aes_key(data, url)
 
     async def _get_init(spec: Tuple[str, Optional[Tuple[int, int]]]) -> None:
         init_url, init_range = spec
         async with sem:
-            data = await _fetch_bytes_resilient(
+            data = await _fetch_media_bytes_resilient(
                 client, init_url, byte_range=init_range,
                 on_chunk=on_chunk, label="init segment",
+                auth_state=auth_state, validator=lambda d: not _is_probably_error_page(d),
             )
             if _is_probably_error_page(data):
                 raise ValueError(f"Init segment returned HTML/error page for {init_url}")
@@ -1250,6 +1636,8 @@ async def _localize_playlist(
     on_chunk=None,
     *,
     sem: Optional[asyncio.Semaphore] = None,
+    parent_url: str = "",
+    base_headers: Optional[Dict[str, str]] = None,
 ) -> str:
     """Download every segment/key/init of *pl* into *work_dir*.
 
@@ -1270,8 +1658,13 @@ async def _localize_playlist(
     if sem is None:
         sem = asyncio.Semaphore(worker_count)
 
+    auth_state = _PlaylistAuthState(
+        client, parent_url=parent_url, base_headers=base_headers,
+    )
+
     raw_keys, raw_inits = await _fetch_keys_and_inits(
         client, pl, sem=sem, on_chunk=on_chunk,
+        parent_url=parent_url, base_headers=base_headers, auth_state=auth_state,
     )
 
     aes_backend = _detect_aes_backend() if pl.is_encrypted else None
@@ -1330,9 +1723,14 @@ async def _localize_playlist(
                     async with sem:
                         if first_error is not None:
                             return
-                        raw = await _fetch_bytes_resilient(
+                        raw = await _fetch_media_bytes_resilient(
                             client, seg.url, byte_range=seg.byte_range,
                             on_chunk=on_chunk, label=f"segment {idx}",
+                            auth_state=auth_state,
+                            validator=(
+                                (lambda d: not _is_probably_error_page(d))
+                                if not pl.is_encrypted else None
+                            ),
                         )
                     if aes_backend is not None and pl.keys[seg.key_index].is_aes128:
                         data, _ = await loop.run_in_executor(
@@ -1439,9 +1837,14 @@ async def _localize_playlist(
                 async with sem:
                     if first_error is not None:
                         return
-                    raw = await _fetch_bytes_resilient(
+                    raw = await _fetch_media_bytes_resilient(
                         client, seg.url, byte_range=seg.byte_range,
                         on_chunk=on_chunk, label=f"segment {idx}",
+                        auth_state=auth_state,
+                        validator=(
+                            (lambda d: not _is_probably_error_page(d))
+                            if not pl.is_encrypted else None
+                        ),
                     )
                 if can_python_decrypt:
                     if aes_backend is not None and pl.keys[seg.key_index].is_aes128:
@@ -1493,6 +1896,8 @@ async def _engine_segments(
     temp_dir: str,
     limit_seconds: int,
     on_chunk=None,
+    *,
+    base_headers: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Engine A: download video (and audio concurrently) and return ffmpeg inputs."""
     video_pl = _truncate(prep.video_pl, limit_seconds)
@@ -1511,6 +1916,7 @@ async def _engine_segments(
     if audio_pl is None:
         video_input = await _localize_playlist(
             client, video_pl, video_dir, on_chunk=on_chunk, sem=shared_sem,
+            parent_url=prep.video_url, base_headers=base_headers,
         )
         return [video_input]
 
@@ -1520,6 +1926,7 @@ async def _engine_segments(
         try:
             return await _localize_playlist(
                 client, audio_pl, audio_dir, on_chunk=on_chunk, sem=shared_sem,
+                parent_url=prep.audio_url, base_headers=base_headers,
             )
         except (asyncio.CancelledError, WarpProxyError):
             raise
@@ -1528,7 +1935,10 @@ async def _engine_segments(
             return None
 
     video_task = asyncio.create_task(
-        _localize_playlist(client, video_pl, video_dir, on_chunk=on_chunk, sem=shared_sem)
+        _localize_playlist(
+            client, video_pl, video_dir, on_chunk=on_chunk, sem=shared_sem,
+            parent_url=prep.video_url, base_headers=base_headers,
+        )
     )
     audio_task = asyncio.create_task(_download_audio_safe())
 
@@ -1578,12 +1988,18 @@ def reason_message(reason: str, detail: str = "") -> str:
 
 
 async def _prepare(
-    client: HlsClient, url: str, max_height: int,
+    client: HlsClient,
+    url: str,
+    max_height: int,
+    *,
+    base_headers: Optional[Dict[str, str]] = None,
 ) -> _Prepared:
     """Resolve a master/media playlist (with variant fallback & redirect base URL)."""
     prep = _Prepared(video_url=url)
 
-    text, current_url = await _fetch_text_resilient(client, url)
+    text, current_url = await _fetch_playlist_with_fallback(
+        client, url, base_headers=base_headers,
+    )
     prep.video_url = current_url
 
     if not is_hls_playlist(text):
@@ -1596,6 +2012,7 @@ async def _prepare(
     media_text = text
     media_url = current_url
     audios = []
+    audios_base_url = current_url
     chosen_audio_group = ""
 
     for _hop in range(2):
@@ -1604,6 +2021,7 @@ async def _prepare(
         variants, hop_audios = parse_master(media_text, media_url)
         if hop_audios:
             audios = hop_audios
+            audios_base_url = media_url
         ordered = rank_variants(variants, max_height)
         if not ordered:
             break
@@ -1612,10 +2030,14 @@ async def _prepare(
         picked = False
         for variant in ordered:
             try:
-                v_text, v_final_url = await _fetch_text_resilient(client, variant.url)
+                v_text, v_final_url = await _fetch_playlist_with_fallback(
+                    client, variant.url, parent_url=media_url, base_headers=base_headers,
+                )
             except (asyncio.CancelledError, WarpProxyError):
                 raise
             except Exception as exc:
+                if _is_proxy_error(exc):
+                    raise
                 last_exc = exc
                 _log(f"[HLS] Variant failed ({_sanitize_detail(variant.url)}): {_sanitize_detail(str(exc))}")
                 continue
@@ -1657,7 +2079,9 @@ async def _prepare(
         return prep
 
     try:
-        audio_text, audio_final_url = await _fetch_text_resilient(client, prep.audio_url)
+        audio_text, audio_final_url = await _fetch_playlist_with_fallback(
+            client, prep.audio_url, parent_url=audios_base_url, base_headers=base_headers,
+        )
         prep.audio_url = audio_final_url
         if is_drm(audio_text):
             raise _HlsError(R_DRM, "audio playlist uses DRM")
@@ -1667,6 +2091,8 @@ async def _prepare(
     except (_HlsError, WarpProxyError):
         raise
     except Exception as e:
+        if _is_proxy_error(e):
+            raise
         _log(f"[HLS] Could not read audio playlist {_sanitize_detail(prep.audio_url)}: {_sanitize_detail(str(e))}")
         prep.audio_url = ""
 
@@ -1731,7 +2157,7 @@ async def download_hls_to_mp4(
             await _notify(status_cb, "🔍 Membaca playlist HLS…")
             for proxy_try in (0, 1):
                 try:
-                    prep = await _prepare(client, url, height_cap)
+                    prep = await _prepare(client, url, height_cap, base_headers=base_headers)
                     prep_error = ""
                     prep_detail = ""
                     break
@@ -1741,7 +2167,10 @@ async def download_hls_to_mp4(
                         result.detail = _sanitize_detail(str(e))
                         return result
                     prep_error = e.reason or R_DOWNLOAD_FAILED
-                    prep_detail = _sanitize_detail(str(e))
+                    raw_msg = str(e)
+                    if not raw_msg.lower().startswith("playlist:"):
+                        raw_msg = f"playlist: {raw_msg}"
+                    prep_detail = _sanitize_detail(raw_msg)
                     _log(f"[HLS] Prepare failed: {prep_detail}")
                     break
                 except (asyncio.CancelledError, WarpProxyError):
@@ -1761,7 +2190,10 @@ async def download_hls_to_mp4(
                         await _switch_client_direct()
                         continue
                     prep_error = R_DOWNLOAD_FAILED
-                    prep_detail = _sanitize_detail(str(e))
+                    raw_msg = str(e)
+                    if not raw_msg.lower().startswith("playlist:"):
+                        raw_msg = f"playlist: {raw_msg}"
+                    prep_detail = _sanitize_detail(raw_msg)
                     _log(f"[HLS] Prepare failed: {prep_detail}")
                     break
 
@@ -1826,6 +2258,7 @@ async def download_hls_to_mp4(
                     await _notify(status_cb, "⬇️ Memuat turun segmen HLS…")
                     local_inputs = await _engine_segments(
                         client, prep, temp_dir, limit_seconds, on_chunk=on_chunk,
+                        base_headers=base_headers,
                     )
                     segments_downloaded = bool(local_inputs)
                     break
@@ -1890,7 +2323,6 @@ async def download_hls_to_mp4(
                 and (
                     getattr(client, "using_warp", False)
                     or not is_socks_proxy(client.proxy_url)
-                    or _cfg_proxy_fallback_direct()
                 )
             )
         )

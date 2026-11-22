@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -96,7 +97,7 @@ _BLOCKED_HOST_PARTS = (
     "doubleclick", "googlesyndication", "google-analytics", "googletagmanager",
     "adsbygoogle", "adservice", "popads", "popcash", "propellerads",
     "exoclick", "juicyads", "trafficjunky", "adsterra", "hilltopads",
-    "facebook.net", "criteo", "taboola", "outbrain", "openfpcdn",
+    "facebook.net", "criteo", "taboola", "outbrain",
 )
 
 _AD_PATH_MARKERS = ("/vast", "preroll", "/ads/", "adserver")
@@ -207,15 +208,100 @@ def _is_ad_manifest(url: str) -> bool:
     return any(marker in low for marker in _AD_PATH_MARKERS)
 
 
+def _chromium_major_version(browser: Any) -> str:
+    """Return Chromium's major version string (fallback ``"131"`` if unknown)."""
+    raw = getattr(browser, "version", "")
+    if isinstance(raw, str):
+        m = re.match(r"^\s*(\d+)(?:\.|$)", raw.strip())
+        if m:
+            return m.group(1)
+    return "131"
+
+
+def _build_browser_identity(browser: Any) -> Tuple[str, str, Dict[str, str]]:
+    """Build consistent UA + Client-Hint headers matching *browser*'s Chromium version."""
+    major = _chromium_major_version(browser)
+    if major == "131" and "Chrome/131." in DEFAULT_USER_AGENT:
+        ua = DEFAULT_USER_AGENT
+    else:
+        ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{major}.0.0.0 Safari/537.36"
+        )
+    sec_ch_ua = (
+        f'"Not:A-Brand";v="99", "Google Chrome";v="{major}", "Chromium";v="{major}"'
+    )
+    extra_headers = {
+        "Sec-CH-UA": sec_ch_ua,
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+    }
+    return major, ua, extra_headers
+
+
 #: Installed before any page script runs: records the first HLS URL the page
 #: *builds*, whether or not the request ever leaves the browser (autoplay
 #: blocked, player paused, request aborted by our own ad filter...).
-_TAP_JS = r"""
+_TAP_JS_TEMPLATE = r"""
 (() => {
   if (window.__hlsTapInstalled) return;
   window.__hlsTapInstalled = true;
   try {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  } catch (e) {}
+  try {
+    const major = __HLS_CHROMIUM_MAJOR__;
+    const full = major + '.0.0.0';
+    const brands = [
+      { brand: 'Not:A-Brand', version: '99' },
+      { brand: 'Google Chrome', version: major },
+      { brand: 'Chromium', version: major },
+    ];
+    const fullVersionList = [
+      { brand: 'Not:A-Brand', version: '99.0.0.0' },
+      { brand: 'Google Chrome', version: full },
+      { brand: 'Chromium', version: full },
+    ];
+    const uaData = {
+      brands,
+      mobile: false,
+      platform: 'Windows',
+      toJSON() {
+        return { brands: this.brands, mobile: this.mobile, platform: this.platform };
+      },
+      getHighEntropyValues(hints) {
+        const all = {
+          architecture: 'x86',
+          bitness: '64',
+          brands,
+          fullVersionList,
+          mobile: false,
+          model: '',
+          platform: 'Windows',
+          platformVersion: '10.0.0',
+          uaFullVersion: full,
+          wow64: false,
+        };
+        if (!Array.isArray(hints)) return Promise.resolve(all);
+        const out = { brands, mobile: false, platform: 'Windows' };
+        for (const h of hints) {
+          if (Object.prototype.hasOwnProperty.call(all, h)) out[h] = all[h];
+        }
+        return Promise.resolve(out);
+      },
+    };
+    try {
+      Object.defineProperty(Navigator.prototype, 'userAgentData', {
+        configurable: true,
+        get: () => uaData,
+      });
+    } catch (e) {
+      Object.defineProperty(navigator, 'userAgentData', {
+        configurable: true,
+        get: () => uaData,
+      });
+    }
   } catch (e) {}
   window.__hlsTapList = window.__hlsTapList || [];
   const isAd = (u) => {
@@ -304,6 +390,13 @@ _TAP_JS = r"""
   } catch (e) {}
 })();
 """
+
+
+def _build_tap_js(major: str = "131") -> str:
+    return _TAP_JS_TEMPLATE.replace("__HLS_CHROMIUM_MAJOR__", json.dumps(str(major or "131")))
+
+
+_TAP_JS = _build_tap_js("131")
 
 # ---------------------------------------------------------------------------
 # Browser lifecycle (one Chromium process, reused, auto-closed when idle)
@@ -573,7 +666,28 @@ async def _try_wake_player(page) -> None:
                 continue
 
 
-async def _extract_request_headers(req, effective_page_url: str) -> Dict[str, str]:
+_PRESERVED_HEADERS = {
+    "user-agent": "User-Agent",
+    "accept": "Accept",
+    "accept-language": "Accept-Language",
+    "referer": "Referer",
+    "origin": "Origin",
+    "authorization": "Authorization",
+    "sec-fetch-dest": "Sec-Fetch-Dest",
+    "sec-fetch-mode": "Sec-Fetch-Mode",
+    "sec-fetch-site": "Sec-Fetch-Site",
+    "sec-ch-ua": "Sec-Ch-Ua",
+    "sec-ch-ua-mobile": "Sec-Ch-Ua-Mobile",
+    "sec-ch-ua-platform": "Sec-Ch-Ua-Platform",
+}
+
+
+async def _extract_request_headers(
+    req,
+    effective_page_url: str,
+    *,
+    fallback_ua: str = DEFAULT_USER_AGENT,
+) -> Dict[str, str]:
     raw: Dict[str, str] = {}
     try:
         raw = await req.all_headers()
@@ -584,31 +698,27 @@ async def _extract_request_headers(req, effective_page_url: str) -> Dict[str, st
             raw = {}
 
     out: Dict[str, str] = {
-        "User-Agent": DEFAULT_USER_AGENT,
+        "User-Agent": fallback_ua or DEFAULT_USER_AGENT,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    for k, v in raw.items():
-        if not k or not v:
+    has_raw = False
+    for k, v in (raw or {}).items():
+        if not k or v is None:
             continue
-        low = k.lower()
-        if low == "user-agent":
-            out["User-Agent"] = v
-        elif low == "referer":
-            out["Referer"] = v
-        elif low == "origin":
-            out["Origin"] = v
-        elif low == "authorization":
-            out["Authorization"] = v
+        val = str(v).strip()
+        if not val:
+            continue
+        has_raw = True
+        low = k.strip().lower()
+        canonical = _PRESERVED_HEADERS.get(low)
+        if canonical:
+            out[canonical] = val
         elif low.startswith("x-") and low not in ("x-client-data", "x-requested-with"):
-            out[k] = v
+            out[k.strip()] = val
 
-    if "Referer" not in out and effective_page_url:
+    if not has_raw and effective_page_url:
         out["Referer"] = effective_page_url
-    if "Origin" not in out and out.get("Referer"):
-        parsed = urlparse(out["Referer"])
-        if parsed.scheme and parsed.netloc:
-            out["Origin"] = f"{parsed.scheme}://{parsed.netloc}"
     return out
 
 
@@ -780,8 +890,10 @@ async def resolve_stream_with_browser(
             failed_urls: set[str] = set()
 
             try:
+                major, ua, extra_hdrs = _build_browser_identity(browser)
                 context = await browser.new_context(
-                    user_agent=DEFAULT_USER_AGENT,
+                    user_agent=ua,
+                    extra_http_headers=extra_hdrs,
                     viewport={"width": 1280, "height": 720},
                     locale="en-US",
                     ignore_https_errors=True,
@@ -797,11 +909,14 @@ async def resolve_stream_with_browser(
                         req_url = request.url
                         if _is_ad_manifest(req_url):
                             return
+                        cand_abs = urljoin(page_url, req_url)
                         if _looks_like_manifest(req_url) and (
-                            fallback_req is None or fallback_req.url in failed_urls
+                            fallback_req is None
+                            or fallback_req.url in failed_urls
+                            or fallback_url in failed_urls
                         ):
                             fallback_req = request
-                            fallback_url = urljoin(page_url, req_url)
+                            fallback_url = cand_abs
                             fallback_seen_at = time.time()
                     except Exception:
                         pass
@@ -813,13 +928,32 @@ async def resolve_stream_with_browser(
                             return
                         ctype = (response.headers.get("content-type") or "").lower()
                         is_manifest = _looks_like_manifest(resp_url) or ("mpegurl" in ctype)
-                        if not is_manifest:
-                            return
                         if 200 <= response.status < 300:
-                            if not verified_hit.done():
+                            if is_manifest and not verified_hit.done():
                                 verified_hit.set_result((urljoin(page_url, resp_url), response.request))
                         elif response.status >= 400:
-                            failed_urls.add(resp_url)
+                            chain_urls: list[str] = []
+                            req = getattr(response, "request", None)
+                            seen_reqs: set[int] = set()
+                            for _ in range(10):
+                                if req is None or id(req) in seen_reqs:
+                                    break
+                                seen_reqs.add(id(req))
+                                r_url = getattr(req, "url", None)
+                                if isinstance(r_url, str) and r_url:
+                                    chain_urls.append(r_url)
+                                req = getattr(req, "redirected_from", None)
+                            chain_has_manifest = any(
+                                _looks_like_manifest(u) and not _is_ad_manifest(u)
+                                for u in chain_urls
+                            )
+                            if not is_manifest and not chain_has_manifest:
+                                return
+                            for u in [resp_url, *chain_urls]:
+                                if isinstance(u, str) and u:
+                                    failed_urls.add(u)
+                                    if page_url:
+                                        failed_urls.add(urljoin(page_url, u))
                     except Exception:
                         pass
 
@@ -827,7 +961,7 @@ async def resolve_stream_with_browser(
                 page.on("response", _on_response)
                 if HLS_BROWSER_BLOCK_ADS:
                     await page.route("**/*", _block_heavy)
-                await page.add_init_script(_TAP_JS)
+                await page.add_init_script(_build_tap_js(major))
 
                 loaded = False
                 try:
@@ -888,6 +1022,7 @@ async def resolve_stream_with_browser(
                     if (
                         fallback_req is not None
                         and fallback_req.url not in failed_urls
+                        and fallback_url not in failed_urls
                         and (time.time() - fallback_seen_at) >= 1.5
                     ):
                         url = fallback_url
@@ -899,7 +1034,13 @@ async def resolve_stream_with_browser(
                             and (time.time() - last_request_at) >= quiet):
                         break
 
-                if not url and fallback_req is not None and fallback_url:
+                if (
+                    not url
+                    and fallback_req is not None
+                    and fallback_url
+                    and fallback_req.url not in failed_urls
+                    and fallback_url not in failed_urls
+                ):
                     url = fallback_url
                     winning_req = fallback_req
                     source = "network"
@@ -912,7 +1053,9 @@ async def resolve_stream_with_browser(
                             effective_page_url = frame_url
                     except Exception:
                         pass
-                    headers = await _extract_request_headers(winning_req, effective_page_url)
+                    headers = await _extract_request_headers(
+                        winning_req, effective_page_url, fallback_ua=ua,
+                    )
 
                 if not url:
                     tapped_url, frame_url = await _read_tap(page)
@@ -923,11 +1066,15 @@ async def resolve_stream_with_browser(
                             else effective_page_url
                         )
                         tapped_url = urljoin(base_for_tap, tapped_url)
-                        if tapped_url.lower().startswith(("http://", "https://")):
+                        if (
+                            tapped_url.lower().startswith(("http://", "https://"))
+                            and tapped_url not in failed_urls
+                        ):
                             url = tapped_url
                             source = "player-config"
                             effective_page_url = base_for_tap
                             headers = default_headers(url, referer=effective_page_url)
+                            headers["User-Agent"] = ua
 
                 elapsed = time.time() - started
                 if url:
@@ -1002,8 +1149,9 @@ if __name__ == "__main__":
     _check("m3u/js/vtt are not", not _looks_like_manifest("https://cdn/x/a.js")
            and not _looks_like_manifest("https://cdn/x/master.m3u?t=1")
            and not _looks_like_manifest("https://cdn/x/seg.ts"))
-    _check("ad host blocked", _is_blocked_url("https://pagead2.googlesyndication.com/x.png")
-           and _is_blocked_url("https://openfpcdn.io/botd/v1"))
+    _check("ad host blocked & openfpcdn unblocked",
+           _is_blocked_url("https://pagead2.googlesyndication.com/x.png")
+           and not _is_blocked_url("https://openfpcdn.io/botd/v1"))
     _check("cdn host not blocked",
            not _is_blocked_url("https://ugc-cdn-caching-x.cloudwindow-route.com/a.m3u8"))
     _check("proxy config: none -> no proxy", _playwright_proxy() is None)
@@ -1094,8 +1242,12 @@ if __name__ == "__main__":
                    scan.url == f"{base}/cdn/real.m3u8?t=js", f"{scan.reason} {scan.url}")
             _check("source reported as network", scan.source == "network", scan.source)
             _check("page made requests", scan.requests > 0, str(scan.requests))
-            _check("matching UA & Referer captured",
-                   scan.headers.get("User-Agent") == DEFAULT_USER_AGENT
+            expected_major = _chromium_major_version(_browser)
+            sec_ch_ua = scan.headers.get("Sec-Ch-Ua", "")
+            _check("matching UA, Sec-Ch-Ua (no HeadlessChrome) & Referer captured",
+                   f"Chrome/{expected_major}.0.0.0" in scan.headers.get("User-Agent", "")
+                   and "HeadlessChrome" not in sec_ch_ua
+                   and f'"{expected_major}"' in sec_ch_ua
                    and scan.headers.get("Referer") == f"{base}/js-only",
                    str(scan.headers))
             _check("cookies captured from browser context",

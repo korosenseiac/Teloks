@@ -459,8 +459,10 @@ def _header_attempts(referer_url: str, candidate_url: str) -> List[Dict[str, Opt
     if cand_origin and cand_origin != ref_origin:
         attempts.append({"Referer": f"{cand_origin}/", "Origin": None})
 
-    if not attempts:
-        attempts.append({})
+    # 5) Clean fallback with neither Referer nor Origin for strict CDNs.
+    clean_attempt: Dict[str, Optional[str]] = {"Referer": None, "Origin": None}
+    if clean_attempt not in attempts:
+        attempts.append(clean_attempt)
     return attempts
 
 
@@ -478,7 +480,10 @@ def _build_winning_headers(
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    ref = used_attempt.get("Referer") or referer_url
+    if "Referer" in used_attempt:
+        ref = used_attempt["Referer"]
+    else:
+        ref = referer_url
     if ref:
         out["Referer"] = ref
     orig = used_attempt.get("Origin")

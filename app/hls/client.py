@@ -442,6 +442,7 @@ class HlsClient:
         raw_headers = dict(headers or {})
         self._pending_cookies: Dict[str, str] = {}
         self._pending_cookie_entries: List[Dict[str, Any]] = []
+        self._pending_morsels: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self.headers: Dict[str, str] = {}
 
         for k, v in raw_headers.items():
@@ -492,22 +493,113 @@ class HlsClient:
                     self._pending_cookie_entries.append(dict(item))
 
     def _apply_pending_cookies(self, jar: aiohttp.CookieJar) -> None:
+        if self._pending_morsels:
+            exp_fn = getattr(jar, "_expire_cookie", None)
+            for item in self._pending_morsels.values():
+                name = str(item.get("name") or "")
+                if not name:
+                    continue
+                morsel: http.cookies.Morsel = http.cookies.Morsel()
+                morsel.__setstate__({
+                    "key": name,
+                    "value": item.get("value", ""),
+                    "coded_value": item.get("coded_value", item.get("value", "")),
+                })
+                for attr, val in (item.get("attrs") or {}).items():
+                    morsel[attr] = val
+                path = str(item.get("path") or "/")
+                if path:
+                    morsel["path"] = path
+                domain = str(item.get("domain") or "")
+                host_only = bool(item.get("host_only"))
+                if domain and not host_only:
+                    morsel["domain"] = domain
+                else:
+                    morsel["domain"] = ""
+                resp_url = URL()
+                if domain:
+                    try:
+                        resp_url = URL.build(scheme="https", host=domain)
+                    except ValueError:
+                        resp_url = URL()
+                        morsel["domain"] = domain
+                jar.update_cookies({name: morsel}, response_url=resp_url)
+                if "expires_ts" in item and callable(exp_fn):
+                    try:
+                        exp_fn(float(item["expires_ts"]), domain, path.rstrip("/"), name)
+                    except Exception:
+                        pass
         if self._pending_cookies:
             jar.update_cookies(self._pending_cookies)
         if self._pending_cookie_entries:
-            sc = http.cookies.SimpleCookie()
             for item in self._pending_cookie_entries:
                 name = str(item.get("name") or "")
                 if not name:
                     continue
                 val = str(item.get("value") or "")
+                sc = http.cookies.SimpleCookie()
                 sc[name] = val
-                if item.get("domain"):
-                    sc[name]["domain"] = str(item["domain"])
-                if item.get("path"):
-                    sc[name]["path"] = str(item["path"])
-            if sc:
-                jar.update_cookies(sc)
+                domain = str(item.get("domain") or "")
+                path = str(item.get("path") or "")
+                host_only = bool(item.get("host_only"))
+                if path:
+                    sc[name]["path"] = path
+                if domain and not host_only:
+                    sc[name]["domain"] = domain
+                resp_url = URL()
+                if domain and host_only:
+                    try:
+                        resp_url = URL.build(scheme="https", host=domain)
+                    except ValueError:
+                        sc[name]["domain"] = domain
+                jar.update_cookies(sc, response_url=resp_url)
+
+    def _save_session_cookies(self) -> None:
+        if self._session is None or self._session.closed:
+            return
+        jar = getattr(self._session, "cookie_jar", None)
+        if jar is None:
+            return
+        try:
+            morsels = list(jar)
+        except Exception:
+            morsels = []
+        if not morsels:
+            if not isinstance(jar, aiohttp.CookieJar):
+                self._pending_cookies.update(self.export_cookies())
+            return
+        host_only = set(getattr(jar, "host_only_cookies", ()) or ())
+        expirations = getattr(jar, "_expirations", {}) or {}
+        saved: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for morsel in morsels:
+            if not isinstance(morsel, http.cookies.Morsel):
+                self._pending_cookies.update(self.export_cookies())
+                return
+            domain = str(morsel["domain"] or "")
+            path = str(morsel["path"] or "/")
+            name = str(morsel.key)
+            is_host_only = (domain, name) in host_only
+            attrs: Dict[str, Any] = {}
+            for attr in ("expires", "max-age", "secure", "httponly", "samesite", "comment", "version"):
+                val = morsel.get(attr)
+                if val:
+                    attrs[attr] = val
+            entry: Dict[str, Any] = {
+                "name": name,
+                "value": morsel.value,
+                "coded_value": morsel.coded_value,
+                "domain": domain,
+                "path": path,
+                "host_only": is_host_only,
+                "attrs": attrs,
+            }
+            exp = expirations.get((domain, path.rstrip("/"), name))
+            if exp is not None:
+                entry["expires_ts"] = exp
+            saved[(domain, path, name)] = entry
+        self._pending_morsels.update(saved)
+        self._pending_cookies.clear()
+        self._pending_cookie_entries.clear()
 
     def update_cookies(
         self,
@@ -525,6 +617,30 @@ class HlsClient:
                     jar.update_cookies(cleaned, response_url=URL(url))
                 else:
                     jar.update_cookies(cleaned)
+                return
+        if isinstance(cookies, dict) and url:
+            try:
+                parsed = URL(url)
+                host = parsed.raw_host or ""
+                req_path = parsed.path or "/"
+                cookie_path = (
+                    "/" + req_path[1:req_path.rfind("/")]
+                    if req_path.startswith("/") and "/" in req_path[1:]
+                    else "/"
+                )
+            except Exception:
+                host = ""
+                cookie_path = "/"
+            if host:
+                for k, v in cookies.items():
+                    if k and v is not None:
+                        self._pending_cookie_entries.append({
+                            "name": str(k),
+                            "value": str(v),
+                            "domain": host,
+                            "path": cookie_path or "/",
+                            "host_only": True,
+                        })
                 return
         self._ingest_cookies(cookies)
         if self._session is not None and not self._session.closed:
@@ -545,8 +661,24 @@ class HlsClient:
                 out[cookie.key] = cookie.value
             return out
 
+        if url and (self._pending_morsels or self._pending_cookie_entries or self._pending_cookies):
+            try:
+                loop = asyncio.get_running_loop()
+                tmp_jar = aiohttp.CookieJar(unsafe=True, loop=loop)
+                self._apply_pending_cookies(tmp_jar)
+                filtered = tmp_jar.filter_cookies(URL(url))
+                return {k: m.value for k, m in filtered.items() if m.value is not None}
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
+
         out = dict(self._pending_cookies)
         for item in self._pending_cookie_entries:
+            name = item.get("name")
+            if name:
+                out[str(name)] = str(item.get("value") or "")
+        for item in self._pending_morsels.values():
             name = item.get("name")
             if name:
                 out[str(name)] = str(item.get("value") or "")
@@ -610,7 +742,7 @@ class HlsClient:
         if self._session is not None and not self._session.closed:
             if self._session_proxy_key == desired_key:
                 return self._session
-            self._pending_cookies.update(self.export_cookies())
+            self._save_session_cookies()
             await self.close()
 
         per_host, total = self._pool_limits()
@@ -708,6 +840,9 @@ class HlsClient:
         except Exception:
             await connector.close()
             raise
+        self._pending_cookies.clear()
+        self._pending_cookie_entries.clear()
+        self._pending_morsels.clear()
         self._using_warp = warp_cfg is not None
         self._warp_cfg = warp_cfg
         self._proxy_url = desired_proxy
@@ -717,7 +852,7 @@ class HlsClient:
     async def switch_to_direct(self) -> None:
         """Drop the configured proxy and reconnect directly (keeping cookies)."""
         if self._session is not None and not self._session.closed:
-            self._pending_cookies.update(self.export_cookies())
+            self._save_session_cookies()
             await self._session.close()
         self._session = None
         self._session_proxy_key = None
@@ -729,6 +864,8 @@ class HlsClient:
 
     async def close(self) -> None:
         """Close the underlying session (safe to call more than once)."""
+        if self._session is not None and not self._session.closed:
+            self._save_session_cookies()
         session = self._session
         self._session = None
         self._session_proxy_key = None
@@ -778,11 +915,19 @@ class HlsClient:
                     continue
                 low = k.lower()
                 if low in key_map:
-                    merged.pop(key_map[low], None)
+                    merged.pop(key_map.pop(low), None)
                 if v is not None:
                     key_map[low] = k
                     merged[k] = v
         return merged
+
+    def apply_header_overrides(
+        self, overrides: Optional[Dict[str, Optional[str]]]
+    ) -> None:
+        """Update ``self.headers`` case-insensitively (``None`` removes a key)."""
+        if not overrides:
+            return
+        self.headers = self._merged_headers(overrides)
 
     def _raise_if_proxy_error(self, exc: BaseException) -> None:
         if self._using_warp and is_warp_proxy_error(exc):
@@ -825,7 +970,7 @@ class HlsClient:
                 body = await resp.read()
                 final_url = str(resp.url or url)
                 return decode_text(body, resp.get_encoding()), final_url
-        except (HlsHttpError, WarpProxyError):
+        except (HlsHttpError, HlsProxyError, WarpProxyError):
             raise
         except Exception as exc:
             self._raise_if_proxy_error(exc)
@@ -1053,7 +1198,7 @@ class HlsClient:
                         break
                 final_url = str(resp.url or url)
                 return decode_text(bytes(body), resp.get_encoding()), final_url
-        except (HlsHttpError, WarpProxyError):
+        except (HlsHttpError, HlsProxyError, WarpProxyError):
             raise
         except Exception as exc:
             self._raise_if_proxy_error(exc)
