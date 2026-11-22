@@ -34,7 +34,7 @@ CLOUDFLARE_TRACE_URLS = (
     "https://1.1.1.1/cdn-cgi/trace",
 )
 
-AFFECTED_FEATURES: tuple[str, ...] = ("Direct", "Torrent", "MediaFire")
+AFFECTED_FEATURES: tuple[str, ...] = ("Direct", "Torrent", "MediaFire", "HLS")
 
 # In-memory cache of the persisted ON/OFF toggle (scoped by state_file path)
 _proxy_enabled: Optional[bool] = None
@@ -981,7 +981,7 @@ async def enable_proxy(cfg: Optional[WarpConfig] = None) -> WarpActionResult:
         ok=True,
         enabled=True,
         message=(
-            "WARP proxy routing is now ON for Direct, Torrent, and MediaFire downloads."
+            "WARP proxy routing is now ON for Direct, Torrent, MediaFire, and HLS downloads."
             + note
         ),
         socks5_url=cfg.socks5_url,
@@ -1000,7 +1000,7 @@ async def disable_proxy(cfg: Optional[WarpConfig] = None) -> WarpActionResult:
         ok=True,
         enabled=False,
         message=(
-            "WARP proxy routing is now OFF. Direct, Torrent, and MediaFire will use default routing."
+            "WARP proxy routing is now OFF. Direct, Torrent, MediaFire, and HLS will use default routing."
             + note
         ),
         socks5_url=cfg.socks5_url,

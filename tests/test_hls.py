@@ -5,15 +5,24 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+
+os.environ.setdefault("MONGO_URI", "mongodb://127.0.0.1:27017/telegram_forwarder_test")
+os.environ.setdefault("API_ID", "12345")
+os.environ.setdefault("API_HASH", "0123456789abcdef0123456789abcdef")
+os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN_DO_NOT_USE")
+
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 from aiohttp import web
+from aiohttp_socks import ProxyConnectionError, ProxyConnector
 
 import app.config as _cfg
 import app.hls.client as _client_mod
@@ -35,7 +44,11 @@ from app.hls import (
     select_audio_track,
     select_variant,
 )
+from app.hls import browser as browser_mod
 from app.hls import downloader as dl_mod
+from app.hls import extract as extract_mod
+from app.hls import handler as handler_mod
+from app.warp import WarpProxyConfig, WarpProxyError
 
 
 def _ffmpeg_ok() -> bool:
@@ -802,6 +815,411 @@ class TestHlsEndToEndLocalServer(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await runner.cleanup()
+
+
+WARP_ON_CFG = WarpProxyConfig(
+    enabled=True,
+    host="127.0.0.1",
+    socks5_port=40000,
+    http_port=40001,
+    socks5_url="socks5://127.0.0.1:40000",
+    http_url="http://127.0.0.1:40001",
+)
+
+
+class _AsyncCM:
+    def __init__(self, value=None, exc=None):
+        self._value = value
+        self._exc = exc
+
+    async def __aenter__(self):
+        if self._exc is not None:
+            raise self._exc
+        return self._value
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class TestHlsWarpIntegration(unittest.IsolatedAsyncioTestCase):
+    async def test_hls_client_warp_on_off_explicit_and_cleanup(self):
+        client = _client_mod.HlsClient()
+        try:
+            # 1. WARP ON -> ProxyConnector with rdns=True, trust_env=False
+            with patch.object(_client_mod, "ensure_proxy_ready", new=AsyncMock(return_value=WARP_ON_CFG)), \
+                 patch.object(_client_mod, "create_aiohttp_connector", side_effect=lambda **kw: ProxyConnector.from_url(WARP_ON_CFG.socks5_url, rdns=True, **kw)):
+                sess_on = await client._get_session()
+                self.assertTrue(client.using_warp)
+                self.assertEqual(client.warp_http_proxy_url, WARP_ON_CFG.http_url)
+                self.assertIsInstance(sess_on.connector, ProxyConnector)
+                self.assertTrue(sess_on.connector._rdns)
+                self.assertFalse(sess_on._trust_env)
+                client.update_cookies({"sid": "keepme"}, url="https://cdn.example.com/master.m3u8")
+
+            # 2. Toggle to WARP OFF (no proxy.txt) -> closes old session, keeps cookies, uses TCPConnector
+            with patch.object(_client_mod, "ensure_proxy_ready", new=AsyncMock(return_value=None)), \
+                 patch.object(_client_mod, "read_proxy_url", return_value=None):
+                sess_off = await client._get_session()
+                self.assertTrue(sess_on.closed)
+                self.assertFalse(client.using_warp)
+                self.assertIsNone(client.warp_http_proxy_url)
+                self.assertIsInstance(sess_off.connector, aiohttp.TCPConnector)
+                self.assertNotIsInstance(sess_off.connector, ProxyConnector)
+                self.assertEqual(client.export_cookies("https://cdn.example.com/seg.ts").get("sid"), "keepme")
+
+            # 3. Toggle to WARP OFF with proxy.txt -> existing proxy.txt behavior preserved
+            with patch.object(_client_mod, "ensure_proxy_ready", new=AsyncMock(return_value=None)), \
+                 patch.object(_client_mod, "read_proxy_url", return_value="socks5://user:pass@1.2.3.4:1080"):
+                sess_pt = await client._get_session()
+                self.assertTrue(sess_off.closed)
+                self.assertFalse(client.using_warp)
+                self.assertIsInstance(sess_pt.connector, ProxyConnector)
+        finally:
+            await client.close()
+        self.assertIsNone(client._session)
+        self.assertFalse(client.using_warp)
+
+        # 4. Explicit proxy_url=None bypasses WARP even when ensure_proxy_ready would return ON
+        direct_client = _client_mod.HlsClient(proxy_url=None)
+        try:
+            with patch.object(_client_mod, "ensure_proxy_ready", new=AsyncMock(return_value=WARP_ON_CFG)) as mock_ready:
+                sess_dir = await direct_client._get_session()
+                mock_ready.assert_not_awaited()
+                self.assertFalse(direct_client.using_warp)
+                self.assertNotIsInstance(sess_dir.connector, ProxyConnector)
+        finally:
+            await direct_client.close()
+
+        # 5. Connector closed on ClientSession creation failure
+        err_client = _client_mod.HlsClient()
+        fake_conn = MagicMock()
+        fake_conn.close = AsyncMock()
+        with patch.object(_client_mod, "ensure_proxy_ready", new=AsyncMock(return_value=WARP_ON_CFG)), \
+             patch.object(_client_mod, "create_aiohttp_connector", return_value=fake_conn), \
+             patch.object(_client_mod.aiohttp, "ClientSession", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                await err_client._get_session()
+        fake_conn.close.assert_awaited_once()
+
+    async def test_hls_client_mid_request_proxy_error_warp_on_vs_off(self):
+        # WARP ON -> wraps ProxyConnectionError into WarpProxyError across fetch methods
+        client_on = _client_mod.HlsClient()
+        fake_sess = MagicMock()
+        fake_sess.closed = False
+        fake_sess.get.return_value = _AsyncCM(exc=ProxyConnectionError(111, "refused"))
+        client_on._session = fake_sess
+        client_on._using_warp = True
+        client_on._warp_cfg = WARP_ON_CFG
+        client_on._proxy_url = WARP_ON_CFG.socks5_url
+        client_on._session_proxy_key = ("warp", WARP_ON_CFG.socks5_url)
+
+        with patch.object(_client_mod, "ensure_proxy_ready", new=AsyncMock(return_value=WARP_ON_CFG)):
+            for coro in (
+                client_on.fetch_text_with_url("https://cdn.example.com/a.m3u8"),
+                client_on.fetch_bytes("https://cdn.example.com/key.bin"),
+                client_on.download_bytes("https://cdn.example.com/seg.ts"),
+                client_on.fetch_page("https://player.example.com/watch"),
+                client_on.download_to("https://cdn.example.com/seg.ts", os.path.join(tempfile.gettempdir(), "unused_seg.ts")),
+            ):
+                with self.assertRaises(WarpProxyError) as ctx:
+                    await coro
+                self.assertIn("/warp_status", str(ctx.exception))
+                self.assertIn("/warp_off", str(ctx.exception))
+
+        # WARP OFF with proxy.txt -> raises HlsProxyError, NOT WarpProxyError
+        client_off = _client_mod.HlsClient()
+        fake_sess_off = MagicMock()
+        fake_sess_off.closed = False
+        fake_sess_off.get.return_value = _AsyncCM(exc=ProxyConnectionError(111, "proxy.txt down"))
+        client_off._session = fake_sess_off
+        client_off._using_warp = False
+        client_off._proxy_url = "socks5://1.2.3.4:1080"
+        client_off._session_proxy_key = ("proxy_txt", "socks5://1.2.3.4:1080")
+
+        with patch.object(_client_mod, "ensure_proxy_ready", new=AsyncMock(return_value=None)), \
+             patch.object(_client_mod, "read_proxy_url", return_value="socks5://1.2.3.4:1080"):
+            with self.assertRaises(_client_mod.HlsProxyError) as ctx_off:
+                await client_off.fetch_text_with_url("https://cdn.example.com/a.m3u8")
+            self.assertNotIsInstance(ctx_off.exception, WarpProxyError)
+
+    async def test_downloader_warp_fail_closed_and_engine_b_http_proxy(self):
+        with tempfile.TemporaryDirectory() as work:
+            # 1. Fail-closed when ensure_proxy_ready raises WarpProxyError (no fallback to direct)
+            with patch.object(dl_mod, "_ffmpeg_available", return_value=True), \
+                 patch.object(_cfg, "HLS_PROXY_FALLBACK_DIRECT", True, create=True), \
+                 patch.object(_client_mod, "ensure_proxy_ready", new=AsyncMock(side_effect=WarpProxyError("WARP down /warp_status /warp_off"))):
+                with self.assertRaises(WarpProxyError):
+                    await download_hls_to_mp4("https://cdn.example.com/master.m3u8", "v.m3u8", out_dir=work)
+
+            # 2. Fail-closed when _prepare raises WarpProxyError mid-request (never switches to direct or Engine B)
+            fake_client = MagicMock()
+            fake_client.proxy_url = WARP_ON_CFG.socks5_url
+            fake_client.using_warp = True
+            fake_client.switch_to_direct = AsyncMock()
+            fake_client.close = AsyncMock()
+            with patch.object(dl_mod, "_ffmpeg_available", return_value=True), \
+                 patch.object(_cfg, "HLS_PROXY_FALLBACK_DIRECT", True, create=True), \
+                 patch.object(dl_mod, "_make_client", return_value=fake_client), \
+                 patch.object(dl_mod, "_prepare", new=AsyncMock(side_effect=WarpProxyError("WARP dropped"))):
+                with self.assertRaises(WarpProxyError):
+                    await download_hls_to_mp4("https://cdn.example.com/master.m3u8", "v.m3u8", out_dir=work)
+            fake_client.switch_to_direct.assert_not_awaited()
+
+            # 3. Engine B ("ffmpeg") uses WARP HTTP proxy + httpproxy protocol whitelist
+            captured_args = []
+
+            async def fake_run_ffmpeg(args, dst, timeout, on_progress=None):
+                captured_args.append(list(args))
+                with open(dst, "wb") as fh:
+                    fh.write(b"\x00" * 2048)
+                return True, ""
+
+            with patch.object(dl_mod, "_ffmpeg_available", return_value=True), \
+                 patch.object(dl_mod, "HLS_ENGINE", "ffmpeg"), \
+                 patch.object(dl_mod, "ensure_proxy_ready", new=AsyncMock(return_value=WARP_ON_CFG)), \
+                 patch.object(dl_mod, "_run_ffmpeg_detailed", side_effect=fake_run_ffmpeg):
+                res = await download_hls_to_mp4("https://cdn.example.com/master.m3u8", "ff.m3u8", out_dir=work)
+            self.assertTrue(res.converted)
+            self.assertEqual(res.engine, "ffmpeg")
+            self.assertTrue(captured_args)
+            argv = captured_args[0]
+            self.assertIn("-http_proxy", argv)
+            self.assertEqual(argv[argv.index("-http_proxy") + 1], WARP_ON_CFG.http_url)
+            wl = argv[argv.index("-protocol_whitelist") + 1]
+            self.assertIn("httpproxy", wl)
+
+            # 4. Engine B in auto mode after Engine A HTTP 403 raises WarpProxyError if wireproxy HTTP goes down
+            fake_client_403 = MagicMock()
+            fake_client_403.proxy_url = WARP_ON_CFG.socks5_url
+            fake_client_403.using_warp = True
+            fake_client_403.close = AsyncMock()
+
+            async def fake_fail_ffmpeg(args, dst, timeout, on_progress=None):
+                return False, "Connection refused"
+
+            with patch.object(dl_mod, "_ffmpeg_available", return_value=True), \
+                 patch.object(dl_mod, "HLS_ENGINE", "auto"), \
+                 patch.object(dl_mod, "_make_client", return_value=fake_client_403), \
+                 patch.object(dl_mod, "_prepare", new=AsyncMock(side_effect=_client_mod.HlsHttpError(403, "https://cdn.example.com/m.m3u8"))), \
+                 patch.object(dl_mod, "ensure_proxy_ready", new=AsyncMock(return_value=WARP_ON_CFG)), \
+                 patch.object(dl_mod, "_run_ffmpeg_detailed", side_effect=fake_fail_ffmpeg), \
+                 patch.object(dl_mod, "check_proxy_reachable", new=AsyncMock(return_value=False)):
+                with self.assertRaises(WarpProxyError) as ctx_ff:
+                    await download_hls_to_mp4("https://cdn.example.com/master.m3u8", "ff2.m3u8", out_dir=work)
+            self.assertIn("/warp_status", str(ctx_ff.exception))
+
+    async def test_extract_propagates_warp_proxy_error(self):
+        # 1. Page fetch raises WarpProxyError -> must propagate (not PageScan(reason="error"))
+        client_page_err = MagicMock()
+        client_page_err.fetch_page = AsyncMock(side_effect=WarpProxyError("WARP down"))
+        with self.assertRaises(WarpProxyError):
+            await extract_mod.resolve_stream_from_page(client_page_err, "https://site.example.com/v/1")
+
+        # 2. Candidate validation raises WarpProxyError -> must propagate
+        client_cand_err = MagicMock()
+        client_cand_err.fetch_page = AsyncMock(
+            return_value=('<video src="https://cdn.example.com/master.m3u8"></video>', "https://site.example.com/v/1")
+        )
+        client_cand_err.fetch_text_with_url = AsyncMock(side_effect=WarpProxyError("WARP candidate error"))
+        with self.assertRaises(WarpProxyError):
+            await extract_mod.resolve_stream_from_page(client_cand_err, "https://site.example.com/v/1")
+
+    async def test_browser_warp_proxy_routing_and_singleton_recycle(self):
+        # Save and restore browser module globals around the test
+        orig_pw = browser_mod._pw
+        orig_browser = browser_mod._browser
+        orig_active = browser_mod._active
+        orig_used = browser_mod._browser_used
+        orig_key = browser_mod._browser_proxy_key
+        orig_warp = browser_mod._browser_using_warp
+
+        try:
+            browser_mod._pw = None
+            browser_mod._browser = None
+            browser_mod._active = 0
+            browser_mod._browser_used = False
+            browser_mod._browser_proxy_key = None
+            browser_mod._browser_using_warp = False
+
+            # 1. _resolve_browser_proxy prefers WARP HTTP proxy when ON
+            with patch.object(browser_mod, "ensure_proxy_ready", new=AsyncMock(return_value=WARP_ON_CFG)):
+                proxy_cfg, proxy_key, using_warp = await browser_mod._resolve_browser_proxy()
+            self.assertTrue(using_warp)
+            self.assertEqual(proxy_cfg, {"server": WARP_ON_CFG.http_url})
+            self.assertEqual(proxy_key, ("warp", WARP_ON_CFG.http_url))
+
+            # 2. _get_browser launches with WARP HTTP proxy and recycles when proxy key changes
+            launch_calls = []
+
+            class FakePage:
+                def __init__(self, goto_exc=None):
+                    self.url = "https://site.example.com/watch"
+                    self.frames = []
+                    self.main_frame = self
+                    self._handlers = {}
+                    self._goto_exc = goto_exc
+
+                def set_default_timeout(self, ms):
+                    pass
+
+                def on(self, event, fn):
+                    self._handlers.setdefault(event, []).append(fn)
+
+                async def route(self, pattern, fn):
+                    pass
+
+                async def add_init_script(self, script):
+                    pass
+
+                async def goto(self, url, wait_until="domcontentloaded", timeout=10000):
+                    if self._goto_exc is not None:
+                        raise self._goto_exc
+                    req = MagicMock()
+                    req.url = "https://cdn.example.com/master.m3u8"
+                    req.frame = self
+                    req.all_headers = AsyncMock(return_value={"User-Agent": "FakeUA"})
+                    resp = MagicMock()
+                    resp.url = "https://cdn.example.com/master.m3u8"
+                    resp.status = 200
+                    resp.headers = {"content-type": "application/vnd.apple.mpegurl"}
+                    resp.request = req
+                    for fn in self._handlers.get("response", []):
+                        fn(resp)
+
+                async def close(self):
+                    pass
+
+            goto_exc_holder = {"exc": None}
+
+            class FakeContext:
+                async def new_page(self):
+                    return FakePage(goto_exc=goto_exc_holder["exc"])
+
+                async def cookies(self, urls):
+                    return [{"name": "tok", "value": "123"}]
+
+                async def close(self):
+                    pass
+
+            class FakeBrowser:
+                def __init__(self):
+                    self.closed = False
+
+                def is_connected(self):
+                    return not self.closed
+
+                async def new_context(self, **kwargs):
+                    return FakeContext()
+
+                async def close(self):
+                    self.closed = True
+
+            launched_browsers = []
+
+            class FakeChromium:
+                async def launch(self, **kwargs):
+                    launch_calls.append(kwargs)
+                    b = FakeBrowser()
+                    launched_browsers.append(b)
+                    return b
+
+            class FakePW:
+                def __init__(self):
+                    self.chromium = FakeChromium()
+
+                async def stop(self):
+                    pass
+
+            class FakePWStarter:
+                async def start(self):
+                    return FakePW()
+
+            fake_pw_pkg = types.ModuleType("playwright")
+            fake_async_api = types.ModuleType("playwright.async_api")
+            fake_async_api.async_playwright = lambda: FakePWStarter()
+            fake_pw_pkg.async_api = fake_async_api
+
+            with patch.dict(sys.modules, {"playwright": fake_pw_pkg, "playwright.async_api": fake_async_api}), \
+                 patch.object(browser_mod, "browser_available", return_value=True), \
+                 patch.object(browser_mod, "ensure_proxy_ready", new=AsyncMock(return_value=WARP_ON_CFG)):
+                scan = await browser_mod.resolve_stream_with_browser("https://site.example.com/watch", timeout=5)
+                self.assertEqual(scan.url, "https://cdn.example.com/master.m3u8")
+                self.assertTrue(scan.used_proxy)
+                self.assertTrue(scan.used_warp)
+                self.assertEqual(launch_calls[-1].get("proxy"), {"server": WARP_ON_CFG.http_url})
+
+                # Proxy failure on page.goto when WARP is ON raises WarpProxyError
+                goto_exc_holder["exc"] = RuntimeError("Page.goto: net::ERR_PROXY_CONNECTION_FAILED")
+                with self.assertRaises(WarpProxyError):
+                    await browser_mod.resolve_stream_with_browser("https://site.example.com/watch", timeout=5)
+
+            # Toggling WARP OFF recycles the idle singleton browser without proxy
+            goto_exc_holder["exc"] = None
+            with patch.dict(sys.modules, {"playwright": fake_pw_pkg, "playwright.async_api": fake_async_api}), \
+                 patch.object(browser_mod, "browser_available", return_value=True), \
+                 patch.object(browser_mod, "ensure_proxy_ready", new=AsyncMock(return_value=None)), \
+                 patch.object(browser_mod, "_playwright_proxy", return_value=None):
+                scan_off = await browser_mod.resolve_stream_with_browser("https://site.example.com/watch", timeout=5)
+                self.assertTrue(launched_browsers[0].closed)
+                self.assertFalse(scan_off.used_proxy)
+                self.assertFalse(scan_off.used_warp)
+                self.assertNotIn("proxy", launch_calls[-1])
+
+            await browser_mod.close_browser()
+        finally:
+            browser_mod._pw = orig_pw
+            browser_mod._browser = orig_browser
+            browser_mod._active = orig_active
+            browser_mod._browser_used = orig_used
+            browser_mod._browser_proxy_key = orig_key
+            browser_mod._browser_using_warp = orig_warp
+
+    async def test_handler_catches_and_reports_warp_proxy_error(self):
+        # 1. page_hls_handler catches WarpProxyError, replies to user, and claims message (returns True)
+        msg = MagicMock()
+        msg.from_user = MagicMock(id=101, username="tester", is_premium=False)
+        msg.text = "https://video.example.com/watch/123"
+        msg.caption = None
+        msg.reply_text = AsyncMock()
+
+        warp_err = WarpProxyError(
+            "WARP proxy error (HLS): Local WARP wireproxy unreachable.\n"
+            "Check proxy health with /warp_status, or disable WARP routing with /warp_off."
+        )
+        with patch.object(handler_mod, "HLS_ENABLED", True), \
+             patch.object(handler_mod, "HLS_PAGE_EXTRACT", True), \
+             patch.object(handler_mod, "_ensure_user_ready", new=AsyncMock(return_value=101)), \
+             patch.object(handler_mod, "_scan_page_with_client", new=AsyncMock(side_effect=warp_err)):
+            claimed = await handler_mod.page_hls_handler(MagicMock(), msg)
+        self.assertTrue(claimed)
+        msg.reply_text.assert_awaited_once()
+        self.assertIn("/warp_status", msg.reply_text.call_args.args[0])
+
+        # 2. process_hls_download catches WarpProxyError and edits status_msg cleanly
+        from app.bot import main as bot_main
+
+        status_msg = MagicMock()
+        status_msg.edit_text = AsyncMock()
+        fake_slot = MagicMock(sid="sid_hls_warp")
+        with patch.object(handler_mod.manager, "get_client", new=AsyncMock(return_value=MagicMock())), \
+             patch.object(bot_main, "begin_process", return_value=fake_slot), \
+             patch.object(bot_main, "release_process") as mock_release, \
+             patch.object(bot_main, "is_cancelled", return_value=False), \
+             patch.object(handler_mod, "_load_custom_thumb", new=AsyncMock(return_value=None)), \
+             patch.object(handler_mod, "_get_backup_group_peer", new=AsyncMock(return_value=MagicMock())), \
+             patch.object(handler_mod, "_call_download_hls", new=AsyncMock(side_effect=warp_err)), \
+             patch.object(handler_mod, "safe_edit", new=AsyncMock()) as mock_edit, \
+             patch.object(handler_mod, "clear_reply_markup", new=AsyncMock()):
+            await handler_mod.process_hls_download(
+                MagicMock(),
+                101,
+                msg,
+                status_msg,
+                url="https://cdn.example.com/master.m3u8",
+                slot_sid="sid_hls_warp",
+            )
+        mock_release.assert_called_once_with(fake_slot)
+        self.assertTrue(any("/warp_off" in str(call.args[1]) for call in mock_edit.call_args_list if len(call.args) >= 2))
 
 
 if __name__ == "__main__":

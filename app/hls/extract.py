@@ -50,6 +50,7 @@ from app.hls.client import (
     redact_url,
 )
 from app.hls.playlist import is_hls_playlist
+from app.warp import WarpProxyError
 
 # ---------------------------------------------------------------------------
 # What counts as a manifest
@@ -535,6 +536,8 @@ async def _first_valid(
                 text, final_url = await _fetch_text_compat(
                     client, url, headers=req_hdrs if supports_headers else None
                 )
+            except WarpProxyError:
+                raise
             except Exception as e:
                 detail = f"{type(e).__name__}: {e}"
                 status = getattr(e, "status", None)
@@ -571,6 +574,8 @@ async def resolve_stream_from_page(
     """
     try:
         fetched = await _fetch_page_compat(client, page_url, max_bytes=max_bytes)
+    except WarpProxyError:
+        raise
     except Exception as e:
         return PageScan(
             page_url=page_url,
@@ -609,6 +614,8 @@ async def resolve_stream_from_page(
                     max_bytes=max_bytes,
                     headers={"Referer": final_page_url},
                 )
+            except WarpProxyError:
+                raise
             except Exception as e:
                 print(f"[HLS] Embed hop failed ({redact_url(embed)}): {e}")
                 continue

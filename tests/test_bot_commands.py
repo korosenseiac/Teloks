@@ -137,8 +137,10 @@ class TestCommandGuideAndBotCommands(unittest.TestCase):
             registered,
             f"Guide vs registered mismatch: missing={registered - documented_slash_cmds}, extra={documented_slash_cmds - registered}",
         )
-        # Ensure MediaFire folder claim is absent
+        # Ensure MediaFire folder claim is absent and HLS is documented as WARP-enabled
         self.assertNotIn("folder MediaFire", guide)
+        self.assertIn("HLS", guide)
+        self.assertIn("HLS", bot_main.format_warp_status_message(_sample_status()))
 
     def test_message_splitting_and_truncation_4096(self):
         long_text = "\n\n".join(f"Section {i}: " + ("a" * 500) for i in range(15))
@@ -305,12 +307,15 @@ class TestWarpBotHandlersAndAuth(unittest.IsolatedAsyncioTestCase):
             )
             with patch.object(bot_main, "enable_proxy", new=AsyncMock(return_value=on_res)), \
                  patch.object(bot_main, "sync_aria2_proxy", new=AsyncMock()) as mock_sync, \
+                 patch.object(bot_main, "close_hls_browser", new=AsyncMock()) as mock_close_browser, \
                  patch.object(bot_main, "safe_edit", new=AsyncMock()) as mock_edit:
                 await bot_main.warp_on_handler(MagicMock(), msg_on)
                 mock_sync.assert_awaited_once_with("http://127.0.0.1:40001")
+                mock_close_browser.assert_awaited_once()
                 self.assertIn("WARP Proxy: ON", mock_edit.call_args.args[1])
+                self.assertIn("HLS", mock_edit.call_args.args[1])
 
-            # /warp_off syncs aria2 with None
+            # /warp_off syncs aria2 with None and closes idle HLS browser
             msg_off, _ = _make_message(42, "/warp_off")
             off_res = WarpActionResult(
                 ok=True,
@@ -320,10 +325,13 @@ class TestWarpBotHandlersAndAuth(unittest.IsolatedAsyncioTestCase):
             )
             with patch.object(bot_main, "disable_proxy", new=AsyncMock(return_value=off_res)), \
                  patch.object(bot_main, "sync_aria2_proxy", new=AsyncMock()) as mock_sync2, \
+                 patch.object(bot_main, "close_hls_browser", new=AsyncMock()) as mock_close_browser2, \
                  patch.object(bot_main, "safe_edit", new=AsyncMock()) as mock_edit2:
                 await bot_main.warp_off_handler(MagicMock(), msg_off)
                 mock_sync2.assert_awaited_once_with(None)
+                mock_close_browser2.assert_awaited_once()
                 self.assertIn("WARP Proxy: OFF", mock_edit2.call_args.args[1])
+                self.assertIn("HLS", mock_edit2.call_args.args[1])
 
             # /commands works for regular (non-owner) users
             msg_help, _ = _make_message(777, "/commands")

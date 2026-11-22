@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from aiohttp_socks import ProxyConnectionError, ProxyConnector, ProxyError
 
 from app.warp import (
+    AFFECTED_FEATURES,
     DEFAULT_WARP_ENDPOINT,
     FALLBACK_WARP_IPV4_ENDPOINT,
     WarpConfig,
@@ -250,6 +251,8 @@ class TestWarpStateAndLifecycle(unittest.IsolatedAsyncioTestCase):
             res_on = await enable_proxy(cfg=self.cfg)
             self.assertTrue(res_on.ok)
             self.assertTrue(res_on.enabled)
+            self.assertEqual(AFFECTED_FEATURES, ("Direct", "Torrent", "MediaFire", "HLS"))
+            self.assertIn("HLS", res_on.message)
             self.assertTrue(is_proxy_enabled(self.cfg))
             self.assertEqual(get_active_socks5_url(), "socks5://127.0.0.1:40000")
             self.assertEqual(get_active_http_url(), "http://127.0.0.1:40001")
@@ -285,6 +288,7 @@ class TestWarpStateAndLifecycle(unittest.IsolatedAsyncioTestCase):
             res_off = await disable_proxy(cfg=self.cfg)
             self.assertTrue(res_off.ok)
             self.assertFalse(res_off.enabled)
+            self.assertIn("HLS", res_off.message)
             self.assertFalse(is_proxy_enabled(self.cfg))
             self.assertIsNone(get_active_socks5_url())
             self.assertIsNone(get_active_http_url())

@@ -54,6 +54,7 @@ from app.torrent.handler import (
     MAGNET_LINK_PATTERN, TORRENT_URL_PATTERN,
 )
 from app.direct.handler import direct_link_handler, process_direct_download, DIRECT_LINK_PATTERN
+from app.hls.browser import close_browser as close_hls_browser
 from app.hls.handler import (
     hls_link_handler, page_hls_handler, process_hls_download,
     HLS_LINK_PATTERN, PAGE_LINK_PATTERN,
@@ -810,7 +811,7 @@ def build_command_guide() -> str:
         "• `/guide` — Alias bagi `/commands`\n"
         "• `/help` — Alias bagi `/commands`\n\n"
         "**🛡️ WARP Wireproxy (Owner Only)**\n"
-        "_Mengalihkan trafik muat turun **Direct**, **Torrent**, dan **MediaFire** melalui Cloudflare WARP wireproxy di VPS._\n"
+        "_Mengalihkan trafik muat turun **Direct**, **Torrent**, **MediaFire**, dan **HLS** melalui Cloudflare WARP wireproxy di VPS._\n"
         "• `/warp` — Paparkan status WARP; menyokong sub-arahan:\n"
         "  `/warp status` | `/warp install` | `/warp on` | `/warp off`\n"
         "• `/warp_install` — Pasang WARP wireproxy di VPS dengan progres langsung (tambah `force` untuk pasang semula)\n"
@@ -830,7 +831,7 @@ def build_command_guide() -> str:
         "• **MediaFire** — Pautan fail MediaFire + ekstrak `.zip`/`.rar` _(guna WARP jika ON)_\n"
         "• **Torrent** — Link `magnet:`, URL `.torrent`, atau fail `.torrent` _(guna WARP jika ON; boleh hantar gambar semasa prompt caption sebagai thumbnail khas untuk torrent 1 video)_\n"
         "• **TeraBox** — Pautan kongsi fail & folder TeraBox\n"
-        "• **HLS / Video Page** — Pautan strim `.m3u8` / `.m3u` & halaman video disokong (ditukar ke MP4)"
+        "• **HLS / Video Page** — Pautan strim `.m3u8` / `.m3u` & halaman video disokong (ditukar ke MP4) _(guna WARP jika ON)_"
     )
 
 
@@ -1072,6 +1073,14 @@ async def _sync_torrent_proxy_best_effort(proxy_url: Optional[str]) -> None:
         print(f"[WARP] Failed to sync aria2 proxy ({proxy_url!r}): {exc}")
 
 
+async def _sync_hls_browser_proxy_best_effort() -> None:
+    """Reset idle HLS Chromium instance so the next scan picks up WARP ON/OFF."""
+    try:
+        await close_hls_browser()
+    except Exception as exc:
+        print(f"[WARP] Failed to reset HLS browser proxy state: {exc}")
+
+
 async def _run_warp_install_flow(
     status_msg: Message,
     force: bool = False,
@@ -1167,6 +1176,7 @@ async def _handle_warp_on(message: Message) -> None:
     if result.ok:
         http_url = result.http_url or (result.status.http_url if result.status else None)
         await _sync_torrent_proxy_best_effort(http_url)
+        await _sync_hls_browser_proxy_best_effort()
     await safe_edit(
         status_msg,
         format_warp_toggle_result(result, turning_on=True),
@@ -1187,6 +1197,7 @@ async def _handle_warp_off(message: Message) -> None:
         return
     if result.ok:
         await _sync_torrent_proxy_best_effort(None)
+        await _sync_hls_browser_proxy_best_effort()
     await safe_edit(
         status_msg,
         format_warp_toggle_result(result, turning_on=False),
@@ -1237,7 +1248,7 @@ async def warp_command_handler(client: Client, message: Message):
             "🛡️ **Penggunaan Arahan `/warp` (Owner Only)**\n\n"
             "• `/warp` atau `/warp status` — Semak status WARP wireproxy & IP\n"
             "• `/warp install` (atau `/warp install force`) — Pasang WARP wireproxy di VPS\n"
-            "• `/warp on` — Aktifkan WARP proxy (Direct, Torrent, MediaFire)\n"
+            "• `/warp on` — Aktifkan WARP proxy (Direct, Torrent, MediaFire, HLS)\n"
             "• `/warp off` — Nyahaktifkan WARP proxy\n\n"
             "Alias pintas: `/warp_status`, `/warp_install`, `/warp_on`, `/proxy_on`, `/warp_off`, `/proxy_off`"
         )
@@ -1255,7 +1266,7 @@ async def warp_install_handler(client: Client, message: Message):
 
 @app.on_message(filters.command(["warp_on", "proxy_on"]))
 async def warp_on_handler(client: Client, message: Message):
-    """Turn WARP proxy routing ON for Direct, Torrent, and MediaFire (Owner only)."""
+    """Turn WARP proxy routing ON for Direct, Torrent, MediaFire, and HLS (Owner only)."""
     if not await _require_owner_message(message):
         return
     await _handle_warp_on(message)
@@ -1313,6 +1324,7 @@ async def warp_callback_handler(client: Client, callback_query):
             if result.ok:
                 http_url = result.http_url or (result.status.http_url if result.status else None)
                 await _sync_torrent_proxy_best_effort(http_url)
+                await _sync_hls_browser_proxy_best_effort()
             await safe_edit(
                 msg,
                 format_warp_toggle_result(result, turning_on=True),
@@ -1331,6 +1343,7 @@ async def warp_callback_handler(client: Client, callback_query):
             result = await disable_proxy()
             if result.ok:
                 await _sync_torrent_proxy_best_effort(None)
+                await _sync_hls_browser_proxy_best_effort()
             await safe_edit(
                 msg,
                 format_warp_toggle_result(result, turning_on=False),

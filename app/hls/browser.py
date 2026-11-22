@@ -61,6 +61,12 @@ from app.config import (
     HLS_BROWSER_TIMEOUT,
 )
 from app.hls.client import DEFAULT_USER_AGENT, default_headers, read_proxy_url
+from app.warp import (
+    WarpProxyError,
+    check_proxy_reachable,
+    ensure_proxy_ready,
+    format_warp_proxy_error,
+)
 
 #: Chromium switches that make it survive on a small headless VPS.
 _LAUNCH_ARGS = (
@@ -168,6 +174,8 @@ class BrowserScan:
     requests: int = 0
     #: True when Chromium itself went through the configured proxy.
     used_proxy: bool = False
+    #: True when Chromium went through the local WARP wireproxy HTTP listener.
+    used_warp: bool = False
     #: Effective page/frame URL (after redirects or inside embed iframe).
     page_url: str = ""
     #: Captured request headers (User-Agent, Referer, Origin, auth headers).
@@ -306,6 +314,8 @@ _browser: Any = None
 _active = 0
 _browser_last_used = 0.0
 _browser_used: bool = False
+_browser_proxy_key: Optional[tuple] = None
+_browser_using_warp: bool = False
 _sem: Optional[asyncio.Semaphore] = None
 _idle_task: Optional[asyncio.Task] = None
 
@@ -313,6 +323,25 @@ _idle_task: Optional[asyncio.Task] = None
 def _browser_used_proxy() -> bool:
     """True when the running Chromium was launched through the proxy."""
     return _browser_used
+
+
+async def _resolve_browser_proxy() -> Tuple[Optional[Dict[str, str]], tuple, bool]:
+    """Resolve Playwright proxy config, preferring WARP HTTP proxy when ON."""
+    warp_cfg = await ensure_proxy_ready(
+        require_http=True,
+        require_socks5=False,
+        feature="HLS",
+    )
+    if warp_cfg is not None:
+        return ({"server": warp_cfg.http_url}, ("warp", warp_cfg.http_url), True)
+    proxy = _playwright_proxy()
+    if proxy:
+        return (
+            proxy,
+            ("proxy_txt", proxy.get("server", ""), proxy.get("username", "")),
+            False,
+        )
+    return (None, ("direct", None), False)
 
 
 def _playwright_proxy() -> Optional[Dict[str, str]]:
@@ -347,17 +376,56 @@ def _concurrency() -> asyncio.Semaphore:
     return _sem
 
 
-async def _get_browser():
-    """Start Chromium on first use and reuse it for every later job."""
-    global _pw, _browser, _browser_last_used, _browser_used, _idle_task
+async def _get_browser(
+    proxy: Optional[Dict[str, str]] = None,
+    proxy_key: Optional[tuple] = None,
+    using_warp: bool = False,
+) -> Tuple[Any, bool]:
+    """Start Chromium on first use and reuse it for matching proxy settings."""
+    global _pw, _browser, _browser_last_used, _browser_used, _browser_proxy_key, _browser_using_warp, _idle_task
+    if proxy_key is None:
+        proxy = _playwright_proxy()
+        proxy_key = (
+            ("proxy_txt", proxy.get("server", ""), proxy.get("username", ""))
+            if proxy
+            else ("direct", None)
+        )
+
     if _browser is not None:
         try:
             if _browser.is_connected():
-                _browser_last_used = time.time()
-                return _browser
+                if _browser_proxy_key == proxy_key:
+                    _browser_last_used = time.time()
+                    return _browser, False
+                if _active <= 1:
+                    try:
+                        await _browser.close()
+                    except Exception:
+                        pass
+                    _browser = None
+                    _browser_used = False
+                    _browser_proxy_key = None
+                    _browser_using_warp = False
+                else:
+                    from playwright.async_api import async_playwright
+
+                    _resolve_browser_cache()
+                    if _pw is None:
+                        _pw = await async_playwright().start()
+                    eph_kwargs: Dict[str, Any] = {"headless": True, "args": list(_LAUNCH_ARGS)}
+                    if proxy:
+                        eph_kwargs["proxy"] = proxy
+                    eph_browser = await _pw.chromium.launch(**eph_kwargs)
+                    print(
+                        f"[HLS] Ephemeral browser started (proxy={'yes' if proxy else 'no'}, "
+                        f"warp={'yes' if using_warp else 'no'})"
+                    )
+                    return eph_browser, True
         except Exception:
-            pass
-        _browser = None
+            _browser = None
+            _browser_used = False
+            _browser_proxy_key = None
+            _browser_using_warp = False
 
     from playwright.async_api import async_playwright
 
@@ -369,17 +437,21 @@ async def _get_browser():
         _pw = await async_playwright().start()
 
     kwargs: Dict[str, Any] = {"headless": True, "args": list(_LAUNCH_ARGS)}
-    proxy = _playwright_proxy()
     if proxy:
         kwargs["proxy"] = proxy
     _browser = await _pw.chromium.launch(**kwargs)
     _browser_used = proxy is not None
+    _browser_proxy_key = proxy_key
+    _browser_using_warp = using_warp
     _browser_last_used = time.time()
-    print(f"[HLS] Browser started (proxy={'yes' if proxy else 'no'})")
+    print(
+        f"[HLS] Browser started (proxy={'yes' if proxy else 'no'}, "
+        f"warp={'yes' if using_warp else 'no'})"
+    )
 
     if _idle_task is None or _idle_task.done():
         _idle_task = asyncio.create_task(_idle_watchdog())
-    return _browser
+    return _browser, False
 
 
 async def _idle_watchdog() -> None:
@@ -401,7 +473,7 @@ async def _idle_watchdog() -> None:
 
 async def close_browser() -> None:
     """Shut Chromium and Playwright down (safe to call at any time)."""
-    global _browser, _pw, _browser_last_used
+    global _browser, _pw, _browser_last_used, _browser_used, _browser_proxy_key, _browser_using_warp
     if _active:
         return
     if _browser is not None:
@@ -410,6 +482,9 @@ async def close_browser() -> None:
         except Exception as e:
             print(f"[HLS] Browser close failed: {e}")
         _browser = None
+    _browser_used = False
+    _browser_proxy_key = None
+    _browser_using_warp = False
     if _pw is not None:
         try:
             await _pw.stop()
@@ -679,11 +754,20 @@ async def resolve_stream_with_browser(
         _active += 1
         context = None
         page = None
+        browser = None
+        is_ephemeral = False
         requests_seen = 0
         last_request_at = time.time()
         try:
+            proxy_cfg, proxy_key, using_warp = await _resolve_browser_proxy()
             try:
-                browser = await _get_browser()
+                browser, is_ephemeral = await _get_browser(
+                    proxy=proxy_cfg,
+                    proxy_key=proxy_key,
+                    using_warp=using_warp,
+                )
+            except WarpProxyError:
+                raise
             except Exception as e:
                 _log_launch_failure(e)
                 return BrowserScan(reason="no-browser", detail=f"{type(e).__name__}: {e}")
@@ -752,6 +836,22 @@ async def resolve_stream_with_browser(
                     )
                     loaded = True
                 except Exception as e:
+                    if using_warp:
+                        err_low = str(e).lower()
+                        proxy_err_marker = any(
+                            m in err_low
+                            for m in (
+                                "err_proxy_connection_failed",
+                                "err_tunnel_connection_failed",
+                                "err_socks_connection_failed",
+                            )
+                        )
+                        if proxy_err_marker or not await check_proxy_reachable(
+                            require_http=True, require_socks5=False, timeout=1.5
+                        ):
+                            raise WarpProxyError(
+                                format_warp_proxy_error(e, feature="HLS")
+                            ) from e
                     if not verified_hit.done():
                         print(f"[HLS] Browser: page load issue ({type(e).__name__}: {e})")
 
@@ -839,7 +939,8 @@ async def resolve_stream_with_browser(
                         source=source,
                         reason="ok",
                         requests=requests_seen,
-                        used_proxy=_browser_used_proxy(),
+                        used_proxy=(using_warp or proxy_cfg is not None),
+                        used_warp=using_warp,
                         page_url=effective_page_url,
                         headers=headers,
                         cookies=cookies,
@@ -851,6 +952,8 @@ async def resolve_stream_with_browser(
                     requests=requests_seen,
                     page_url=effective_page_url,
                 )
+            except WarpProxyError:
+                raise
             except Exception as e:
                 return BrowserScan(
                     reason="error", detail=f"{type(e).__name__}: {e}",
@@ -863,6 +966,11 @@ async def resolve_stream_with_browser(
                             await closer.close()
                         except Exception:
                             pass
+                if is_ephemeral and browser is not None:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
         finally:
             _active -= 1
             _browser_last_used = time.time()

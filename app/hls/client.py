@@ -30,6 +30,15 @@ from yarl import URL
 
 import app.config as _app_config
 from app.config import HLS_DISABLE_PROXY
+from app.warp import (
+    WarpProxyConfig,
+    WarpProxyError,
+    create_aiohttp_connector,
+    ensure_proxy_ready,
+    format_warp_proxy_error,
+    get_active_socks5_url,
+    is_warp_proxy_error,
+)
 
 # ---------------------------------------------------------------------------
 # Constants (kept in sync with app/direct/client.py and app/hls/browser.py)
@@ -452,11 +461,18 @@ class HlsClient:
             self._ingest_cookies(cookies)
 
         self._session: Optional[aiohttp.ClientSession] = None
-        # AUTO_PROXY (the default) follows proxy.txt; None forces a direct
-        # connection for this client only (see app/hls/browser.py).
-        self._proxy_url: Optional[str] = (
-            read_proxy_url() if proxy_url is AUTO_PROXY else proxy_url
-        )
+        # AUTO_PROXY (the default) uses WARP when ON, falling back to proxy.txt;
+        # explicit values (e.g. None for direct) bypass WARP/proxy.txt.
+        self._proxy_mode: str = "auto" if proxy_url is AUTO_PROXY else "explicit"
+        self._explicit_proxy_url: Optional[str] = None if proxy_url is AUTO_PROXY else proxy_url
+        self._session_proxy_key: Optional[tuple] = None
+        self._using_warp: bool = False
+        self._warp_cfg: Optional[WarpProxyConfig] = None
+        if proxy_url is AUTO_PROXY:
+            active_warp = get_active_socks5_url()
+            self._proxy_url: Optional[str] = active_warp if active_warp else read_proxy_url()
+        else:
+            self._proxy_url = proxy_url
         self._max_connections = max_connections
         self._connect_timeout = connect_timeout
         self._segment_timeout = segment_timeout
@@ -574,17 +590,77 @@ class HlsClient:
         return per_host, total
 
     async def _get_session(self) -> aiohttp.ClientSession:
+        warp_cfg: Optional[WarpProxyConfig] = None
+        if self._proxy_mode == "auto":
+            warp_cfg = await ensure_proxy_ready(
+                require_http=False,
+                require_socks5=True,
+                feature="HLS",
+            )
+            if warp_cfg is not None:
+                desired_proxy: Optional[str] = warp_cfg.socks5_url
+                desired_key: tuple = ("warp", warp_cfg.socks5_url)
+            else:
+                desired_proxy = read_proxy_url()
+                desired_key = ("proxy_txt", desired_proxy) if desired_proxy else ("direct", None)
+        else:
+            desired_proxy = self._explicit_proxy_url
+            desired_key = ("explicit", desired_proxy) if desired_proxy else ("direct", None)
+
         if self._session is not None and not self._session.closed:
-            return self._session
+            if self._session_proxy_key == desired_key:
+                return self._session
+            self._pending_cookies.update(self.export_cookies())
+            await self.close()
 
         per_host, total = self._pool_limits()
         connector: aiohttp.BaseConnector
-        if self._proxy_url:
+        if warp_cfg is not None:
+            try:
+                try:
+                    connector = create_aiohttp_connector(
+                        limit_per_host=per_host,
+                        limit=total,
+                        ttl_dns_cache=300,
+                        keepalive_timeout=60,
+                        enable_cleanup_closed=True,
+                    )
+                except TypeError:
+                    connector = create_aiohttp_connector(
+                        limit_per_host=per_host,
+                        limit=total,
+                    )
+                if connector is None:
+                    from aiohttp_socks import ProxyConnector
+                    try:
+                        connector = ProxyConnector.from_url(
+                            warp_cfg.socks5_url,
+                            rdns=True,
+                            limit_per_host=per_host,
+                            limit=total,
+                            ttl_dns_cache=300,
+                            keepalive_timeout=60,
+                            enable_cleanup_closed=True,
+                        )
+                    except TypeError:
+                        connector = ProxyConnector.from_url(
+                            warp_cfg.socks5_url,
+                            rdns=True,
+                            limit_per_host=per_host,
+                            limit=total,
+                        )
+            except WarpProxyError:
+                raise
+            except Exception as exc:
+                raise WarpProxyError(
+                    format_warp_proxy_error(exc, feature="HLS")
+                ) from exc
+        elif desired_proxy:
             try:
                 from aiohttp_socks import ProxyConnector
                 try:
                     connector = ProxyConnector.from_url(
-                        self._proxy_url,
+                        desired_proxy,
                         rdns=True,
                         limit_per_host=per_host,
                         limit=total,
@@ -594,14 +670,15 @@ class HlsClient:
                     )
                 except TypeError:
                     connector = ProxyConnector.from_url(
-                        self._proxy_url,
+                        desired_proxy,
                         rdns=True,
                         limit_per_host=per_host,
                         limit=total,
                     )
             except ImportError:
                 print("[HLS] 'aiohttp_socks' not installed. Ignoring SOCKS5 proxy.")
-                self._proxy_url = None
+                desired_proxy = None
+                desired_key = ("direct", None)
                 connector = aiohttp.TCPConnector(
                     limit_per_host=per_host,
                     limit=total,
@@ -631,6 +708,10 @@ class HlsClient:
         except Exception:
             await connector.close()
             raise
+        self._using_warp = warp_cfg is not None
+        self._warp_cfg = warp_cfg
+        self._proxy_url = desired_proxy
+        self._session_proxy_key = desired_key
         return self._session
 
     async def switch_to_direct(self) -> None:
@@ -639,13 +720,34 @@ class HlsClient:
             self._pending_cookies.update(self.export_cookies())
             await self._session.close()
         self._session = None
+        self._session_proxy_key = None
+        self._proxy_mode = "explicit"
+        self._explicit_proxy_url = None
         self._proxy_url = None
+        self._using_warp = False
+        self._warp_cfg = None
 
     async def close(self) -> None:
         """Close the underlying session (safe to call more than once)."""
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
+        session = self._session
         self._session = None
+        self._session_proxy_key = None
+        self._using_warp = False
+        self._warp_cfg = None
+        if session is not None and not session.closed:
+            await session.close()
+
+    @property
+    def using_warp(self) -> bool:
+        """Whether the active HTTP session is routed through WARP wireproxy."""
+        return self._using_warp
+
+    @property
+    def warp_http_proxy_url(self) -> Optional[str]:
+        """Active WARP HTTP proxy URL when using WARP, else ``None``."""
+        if self._using_warp and self._warp_cfg is not None:
+            return self._warp_cfg.http_url
+        return None
 
     @property
     def proxy_url(self) -> Optional[str]:
@@ -683,6 +785,10 @@ class HlsClient:
         return merged
 
     def _raise_if_proxy_error(self, exc: BaseException) -> None:
+        if self._using_warp and is_warp_proxy_error(exc):
+            raise WarpProxyError(
+                format_warp_proxy_error(exc, feature="HLS")
+            ) from exc
         if self._proxy_url and _is_proxy_exception(exc):
             raise HlsProxyError(self._proxy_url, exc) from exc
 
@@ -719,7 +825,7 @@ class HlsClient:
                 body = await resp.read()
                 final_url = str(resp.url or url)
                 return decode_text(body, resp.get_encoding()), final_url
-        except HlsHttpError:
+        except (HlsHttpError, WarpProxyError):
             raise
         except Exception as exc:
             self._raise_if_proxy_error(exc)
@@ -853,7 +959,7 @@ class HlsClient:
 
                 await self._read_segment_response(resp, url, byte_range, _collect)
                 return bytes(buf)
-        except (HlsHttpError, HlsProxyError):
+        except (HlsHttpError, HlsProxyError, WarpProxyError):
             raise
         except Exception as exc:
             self._raise_if_proxy_error(exc)
@@ -896,7 +1002,7 @@ class HlsClient:
 
                 await self._read_segment_response(resp, url, byte_range, _collect)
                 return bytes(buf)
-        except (HlsHttpError, HlsProxyError):
+        except (HlsHttpError, HlsProxyError, WarpProxyError):
             raise
         except Exception as exc:
             self._raise_if_proxy_error(exc)
@@ -947,7 +1053,7 @@ class HlsClient:
                         break
                 final_url = str(resp.url or url)
                 return decode_text(bytes(body), resp.get_encoding()), final_url
-        except HlsHttpError:
+        except (HlsHttpError, WarpProxyError):
             raise
         except Exception as exc:
             self._raise_if_proxy_error(exc)
@@ -1030,7 +1136,7 @@ class HlsClient:
                     os.remove(path)
                 except OSError:
                     pass
-            if isinstance(exc, (HlsHttpError, HlsProxyError)):
+            if isinstance(exc, (HlsHttpError, HlsProxyError, WarpProxyError)):
                 raise
             self._raise_if_proxy_error(exc)
             raise

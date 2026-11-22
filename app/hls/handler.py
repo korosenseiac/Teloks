@@ -66,6 +66,7 @@ from app.utils.caption import (
 from app.utils.media import MAX_FILE_SIZE, MAX_FILE_SIZE_PREMIUM
 from app.utils.message import safe_edit, clear_reply_markup
 from app.utils.streamer import SessionInvalidError
+from app.warp import WarpProxyError, is_proxy_enabled_async
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +509,8 @@ async def _browser_stage(
 
     try:
         scan = await resolve_stream_with_browser(page_url, timeout=HLS_BROWSER_TIMEOUT)
+    except WarpProxyError:
+        raise
     except Exception as e:
         print(f"[HLS] Browser stage failed for {page_url.split('?', 1)[0]}: "
               f"{type(e).__name__}: {e}")
@@ -520,7 +523,8 @@ async def _browser_stage(
                 pass
 
     if scan.url:
-        force_direct = (not scan.used_proxy) and read_proxy_url() is not None
+        used_warp = bool(getattr(scan, "used_warp", False))
+        force_direct = (not used_warp) and (not scan.used_proxy) and (read_proxy_url() is not None)
         if force_direct:
             print("[HLS] Browser had to go direct while proxy.txt is configured - "
                   "this job will download directly too, so the minted URL matches "
@@ -607,6 +611,13 @@ async def page_hls_handler(bot: Client, message: Message) -> bool:
         scan, scan_headers, scan_cookies = await _scan_page_with_client(
             page_url, page_headers, proxy_url=AUTO_PROXY,
         )
+    except WarpProxyError as e:
+        print(f"[HLS] WARP proxy error during page scan for {page_url.split('?', 1)[0]}: {e}")
+        try:
+            await message.reply_text(f"❌ {e}")
+        except Exception:
+            pass
+        return True
     except Exception as e:
         print(f"[HLS] Page scan failed for {page_url.split('?', 1)[0]}: "
               f"{type(e).__name__}: {e}")
@@ -630,9 +641,19 @@ async def page_hls_handler(bot: Client, message: Message) -> bool:
         # Skip Chromium for binary/attachment responses (not-a-page); keep it
         # for pages without static manifests and HTTP/bot-check errors.
         if scan.reason != "not-a-page":
-            url, page_used, force_direct, scan_headers, scan_cookies = (
-                await _browser_stage(message, page_url, page_used)
-            )
+            try:
+                url, page_used, force_direct, scan_headers, scan_cookies = (
+                    await _browser_stage(message, page_url, page_used)
+                )
+            except WarpProxyError as e:
+                print(
+                    f"[HLS] WARP proxy error during browser stage for {page_url.split('?', 1)[0]}: {e}"
+                )
+                try:
+                    await message.reply_text(f"❌ {e}")
+                except Exception:
+                    pass
+                return True
             # If the proxy fetch itself errored and browser stage didn't yield a
             # manifest (e.g. Playwright missing or proxied), retry direct once.
             if (
@@ -640,6 +661,7 @@ async def page_hls_handler(bot: Client, message: Message) -> bool:
                 and scan.reason == "error"
                 and HLS_PROXY_FALLBACK_DIRECT
                 and read_proxy_url() is not None
+                and not await is_proxy_enabled_async()
             ):
                 try:
                     direct_scan, direct_hdrs, direct_cookies = (
@@ -1109,6 +1131,15 @@ async def process_hls_download(
             await tracker.stop("❌ Sesi anda telah tamat. Sila /start dan login semula.")
         else:
             await safe_edit(status_msg, "❌ Sesi anda telah tamat. Sila /start dan login semula.")
+    except WarpProxyError as e:
+        print(f"[HLS] WARP proxy error for user {user_id}: {e}")
+        if tracker:
+            await tracker.stop(f"❌ {e}")
+        else:
+            try:
+                await safe_edit(status_msg, f"❌ {e}")
+            except Exception:
+                pass
     except Exception as e:
         safe_err = _sanitize_error_text(e)
         print(f"[HLS] Handler error: {safe_err}")

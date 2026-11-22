@@ -86,6 +86,12 @@ from app.utils.video_compressor import (
     MP4_SAFE_VIDEO,
     convert_semaphore,
 )
+from app.warp import (
+    WarpProxyError,
+    check_proxy_reachable,
+    ensure_proxy_ready,
+    format_warp_proxy_error,
+)
 
 # ---------------------------------------------------------------------------
 # Outcome reason codes
@@ -395,6 +401,33 @@ def _is_proxy_error(exc: BaseException) -> bool:
     return "proxy" in msg and ("connect" in msg or "socks" in msg or "timed out" in msg or "refused" in msg)
 
 
+def _looks_like_ffmpeg_warp_proxy_error(err_text: str, proxy_url: Optional[str]) -> bool:
+    """Return True if ffmpeg stderr suggests the local WARP HTTP proxy failed."""
+    msg = (err_text or "").lower()
+    if not msg:
+        return False
+    if proxy_url:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(proxy_url)
+        if parsed.hostname and parsed.port:
+            endpoint = f"{parsed.hostname.lower()}:{parsed.port}"
+            if endpoint in msg:
+                return True
+    return "proxy" in msg and any(
+        tok in msg
+        for tok in (
+            "refused",
+            "failed",
+            "error",
+            "timed out",
+            "unreachable",
+            "cannot",
+            "not on whitelist",
+        )
+    )
+
+
 def _is_permanent_error(exc: BaseException) -> bool:
     if getattr(exc, "is_permanent", False):
         status = _extract_http_status(exc)
@@ -438,7 +471,7 @@ async def _retry_call(op_name: str, fn: Callable[[], Any]) -> Any:
     for attempt in range(1, attempts + 1):
         try:
             return await fn()
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, WarpProxyError):
             raise
         except Exception as exc:
             last_exc = exc
@@ -709,7 +742,7 @@ def _build_remux_args(
         else:
             args += [
                 "-allowed_extensions", "ALL",
-                "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                "-protocol_whitelist", "file,http,https,httpproxy,tcp,tls,crypto",
                 "-reconnect", "1", "-reconnect_streamed", "1",
                 "-reconnect_delay_max", "10",
             ]
@@ -1488,7 +1521,7 @@ async def _engine_segments(
             return await _localize_playlist(
                 client, audio_pl, audio_dir, on_chunk=on_chunk, sem=shared_sem,
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, WarpProxyError):
             raise
         except Exception as exc:
             _log(f"[HLS] Audio track download failed (continuing video-only): {_sanitize_detail(str(exc))}")
@@ -1580,7 +1613,7 @@ async def _prepare(
         for variant in ordered:
             try:
                 v_text, v_final_url = await _fetch_text_resilient(client, variant.url)
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, WarpProxyError):
                 raise
             except Exception as exc:
                 last_exc = exc
@@ -1631,7 +1664,7 @@ async def _prepare(
         prep.audio_text = audio_text
         if not is_master_playlist(audio_text):
             prep.audio_pl = parse_media(audio_text, audio_final_url)
-    except _HlsError:
+    except (_HlsError, WarpProxyError):
         raise
     except Exception as e:
         _log(f"[HLS] Could not read audio playlist {_sanitize_detail(prep.audio_url)}: {_sanitize_detail(str(e))}")
@@ -1711,11 +1744,12 @@ async def download_hls_to_mp4(
                     prep_detail = _sanitize_detail(str(e))
                     _log(f"[HLS] Prepare failed: {prep_detail}")
                     break
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, WarpProxyError):
                     raise
                 except Exception as e:
                     if (
                         proxy_try == 0
+                        and not getattr(client, "using_warp", False)
                         and _is_proxy_error(e)
                         and client.proxy_url is not None
                         and _cfg_proxy_fallback_direct()
@@ -1795,7 +1829,7 @@ async def download_hls_to_mp4(
                     )
                     segments_downloaded = bool(local_inputs)
                     break
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, WarpProxyError):
                     raise
                 except _HlsError as e:
                     if e.reason in (R_DRM, R_NO_SEGMENTS):
@@ -1809,6 +1843,7 @@ async def download_hls_to_mp4(
                 except Exception as e:
                     if (
                         seg_try == 0
+                        and not getattr(client, "using_warp", False)
                         and _is_proxy_error(e)
                         and client.proxy_url is not None
                         and _cfg_proxy_fallback_direct()
@@ -1852,10 +1887,26 @@ async def download_hls_to_mp4(
             or (
                 engine == "auto"
                 and not segments_downloaded
-                and (not is_socks_proxy(client.proxy_url) or _cfg_proxy_fallback_direct())
+                and (
+                    getattr(client, "using_warp", False)
+                    or not is_socks_proxy(client.proxy_url)
+                    or _cfg_proxy_fallback_direct()
+                )
             )
         )
         if can_run_ffmpeg:
+            ffmpeg_proxy_url = client.proxy_url
+            ffmpeg_using_warp = False
+            if proxy_url is AUTO_PROXY:
+                warp_http_cfg = await ensure_proxy_ready(
+                    require_http=True,
+                    require_socks5=False,
+                    feature="HLS",
+                )
+                if warp_http_cfg is not None:
+                    ffmpeg_proxy_url = warp_http_cfg.http_url
+                    ffmpeg_using_warp = True
+
             await _notify(status_cb, "⬇️ Memuat turun & menukar ke MP4 (ffmpeg)…")
             target_url = prep.video_url if prep and prep.video_url else url
             inputs: List[str] = [target_url]
@@ -1863,7 +1914,7 @@ async def download_hls_to_mp4(
                 inputs.append(prep.audio_url)
             extra = (
                 _client_ffmpeg_headers(client, base_headers, cookies, target_url)
-                + ffmpeg_proxy_args(client.proxy_url)
+                + ffmpeg_proxy_args(ffmpeg_proxy_url)
             )
             async with convert_semaphore():
                 ok = await _remux_with_fallbacks(
@@ -1880,6 +1931,22 @@ async def download_hls_to_mp4(
                 result.engine = "ffmpeg"
                 _log(f"[HLS] OK {result.name} ({result.size} bytes) via ffmpeg")
                 return result
+            if ffmpeg_using_warp:
+                last_ffmpeg_err = remux_errors[-1] if remux_errors else ""
+                proxy_still_up = await check_proxy_reachable(
+                    require_http=True,
+                    require_socks5=False,
+                    timeout=1.5,
+                )
+                if not proxy_still_up or _looks_like_ffmpeg_warp_proxy_error(
+                    last_ffmpeg_err, ffmpeg_proxy_url
+                ):
+                    raise WarpProxyError(
+                        format_warp_proxy_error(
+                            RuntimeError(last_ffmpeg_err or "wireproxy HTTP listener unreachable"),
+                            feature="HLS",
+                        )
+                    )
 
         # ---- 5. Accurate failure classification --------------------------
         if segments_downloaded:
