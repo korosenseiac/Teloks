@@ -129,6 +129,11 @@ class TestWarpConfig(unittest.TestCase):
         rendered_no_ka = build_wg_profile(parsed, keepalive=0)
         self.assertNotIn("Keepalive", rendered_no_ka)
 
+        # Optional PreSharedKey preservation
+        with_psk = SAMPLE_WGCF_PROFILE + "PreSharedKey = cHNrcHNrcHNrcHNrcHNrcHNrcHNrcHNrcHNrcHNrcHM=\n"
+        rendered_psk = build_wg_profile(parse_wgcf_profile(with_psk))
+        self.assertIn("PreSharedKey = cHNrcHNrcHNrcHNrcHNrcHNrcHNrcHNrcHNrcHNrcHM=", rendered_psk)
+
     def test_build_wireproxy_conf_localhost_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = _make_cfg(tmp)
@@ -510,6 +515,91 @@ class TestWarpInstaller(unittest.IsolatedAsyncioTestCase):
         if bash_bin:
             proc = subprocess.run([bash_bin, "-n", script_path], capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+        # Regression: ViRb3/wgcf has no --version flag; must use --help instead
+        text = raw.decode("utf-8")
+        self.assertNotIn("WGCF_BIN\" --version", text)
+        self.assertIn("WGCF_BIN\" --help", text)
+        self.assertIn("register --accept-tos", text)
+        self.assertIn("\"$WGCF_BIN\" generate", text)
+        self.assertIn("\"$WIREPROXY_BIN\" -v", text)
+        self.assertIn("\"$WIREPROXY_BIN\" -c \"$WIREPROXY_CONF\" -n", text)
+
+    async def test_wgcf_cli_uses_help_not_version_and_retries_cleanly(self):
+        # 1. Reuse path uses --help (never --version)
+        os.makedirs(self.cfg.bin_dir, exist_ok=True)
+        with open(self.cfg.wgcf_bin, "wb") as fh:
+            fh.write(b"\x7fELFdummy")
+
+        seen_calls = []
+
+        async def fake_exec(*args, **kwargs):
+            seen_calls.append(args)
+            self.assertNotIn("--version", args, "ViRb3/wgcf does not support --version")
+            return (0, "Usage:\n  wgcf [flags]", "")
+
+        with patch.object(warp_installer, "run_exec", side_effect=fake_exec):
+            bin_path = await warp_installer._ensure_wgcf_binary(
+                MagicMock(), self.cfg, "amd64", force=False, on_progress=None
+            )
+            self.assertEqual(bin_path, self.cfg.wgcf_bin)
+            self.assertEqual(seen_calls[-1], (self.cfg.wgcf_bin, "--help"))
+
+        # 2. Fresh-download self-check also uses --help
+        seen_calls.clear()
+
+        async def fake_dl(session, url, dest):
+            with open(dest, "wb") as fh:
+                fh.write(b"\x7fELFdummy")
+            return 9
+
+        with patch.object(warp_installer, "_resolve_release_asset", new=AsyncMock(return_value=("https://example/wgcf", "v2.3.1"))), \
+             patch.object(warp_installer, "_download_to_path", side_effect=fake_dl), \
+             patch.object(warp_installer, "run_exec", side_effect=fake_exec):
+            bin_path2 = await warp_installer._ensure_wgcf_binary(
+                MagicMock(), self.cfg, "amd64", force=True, on_progress=None
+            )
+            self.assertEqual(bin_path2, self.cfg.wgcf_bin)
+            self.assertEqual(seen_calls[-1], (self.cfg.wgcf_bin, "--help"))
+
+        # 3. _register_warp_account cleans partial wgcf-account.toml between register retries
+        #    and retries transient wgcf generate failures
+        reg_attempts = 0
+        gen_attempts = 0
+
+        async def fake_reg_gen(*args, **kwargs):
+            nonlocal reg_attempts, gen_attempts
+            if "register" in args:
+                self.assertIn("--accept-tos", args)
+                reg_attempts += 1
+                if reg_attempts == 1:
+                    # Simulate partial file left behind on failed first register attempt
+                    with open(self.cfg.wgcf_account_path, "w", encoding="utf-8") as fh:
+                        fh.write("partial = true\n")
+                    return (1, "", "HTTP 429")
+                # Must have been cleaned before retry #2
+                self.assertFalse(os.path.exists(self.cfg.wgcf_account_path))
+                with open(self.cfg.wgcf_account_path, "w", encoding="utf-8") as fh:
+                    fh.write("device_id = 'ok'\n")
+                return (0, "ok", "")
+            if "generate" in args:
+                gen_attempts += 1
+                if gen_attempts == 1:
+                    return (1, "", "transient 502")
+                with open(self.cfg.wgcf_profile_path, "w", encoding="utf-8") as fh:
+                    fh.write(SAMPLE_WGCF_PROFILE)
+                return (0, "ok", "")
+            raise AssertionError(f"Unexpected command: {args}")
+
+        with patch.object(warp_installer, "run_exec", side_effect=fake_reg_gen), \
+             patch.object(warp_installer.asyncio, "sleep", new=AsyncMock()):
+            await warp_installer._register_warp_account(
+                self.cfg, self.cfg.wgcf_bin, force=True, on_progress=None
+            )
+            self.assertEqual(reg_attempts, 2)
+            self.assertEqual(gen_attempts, 2)
+            self.assertTrue(os.path.isfile(self.cfg.wgcf_account_path))
+            self.assertTrue(os.path.isfile(self.cfg.wgcf_profile_path))
 
 
 if __name__ == "__main__":

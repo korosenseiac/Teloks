@@ -319,8 +319,9 @@ async def _ensure_wgcf_binary(
     force: bool,
     on_progress: Optional[ProgressCallback],
 ) -> str:
+    wgcf_cwd = cfg.data_dir if os.path.isdir(cfg.data_dir) else None
     if not force and os.path.isfile(cfg.wgcf_bin) and os.access(cfg.wgcf_bin, os.X_OK):
-        rc, _, _ = await run_exec(cfg.wgcf_bin, "--version", timeout=10.0)
+        rc, _, _ = await run_exec(cfg.wgcf_bin, "--help", cwd=wgcf_cwd, timeout=10.0)
         if rc == 0:
             await _emit_progress(on_progress, "Reusing existing wgcf binary.")
             return cfg.wgcf_bin
@@ -348,7 +349,8 @@ async def _ensure_wgcf_binary(
             pass
         raise
 
-    rc, stdout, stderr = await run_exec(cfg.wgcf_bin, "--version", timeout=10.0)
+    wgcf_cwd = cfg.data_dir if os.path.isdir(cfg.data_dir) else None
+    rc, stdout, stderr = await run_exec(cfg.wgcf_bin, "--help", cwd=wgcf_cwd, timeout=10.0)
     if rc != 0:
         raise RuntimeError(f"wgcf self-check failed: {stderr or stdout or f'exit {rc}'}")
     await _emit_progress(on_progress, f"Installed wgcf ({tag}).")
@@ -392,6 +394,13 @@ async def _register_warp_account(
                 _chmod_safe(cfg.wgcf_account_path, 0o600)
                 break
             last_err = stderr or stdout or f"wgcf register exited with code {rc}"
+            # Remove any partial account file left by a mid-register API error so
+            # wgcf's EnsureNoExistingAccount() check does not block retries.
+            if os.path.isfile(cfg.wgcf_account_path):
+                try:
+                    os.unlink(cfg.wgcf_account_path)
+                except OSError:
+                    pass
             if attempt < 3:
                 await asyncio.sleep(2.0 * attempt)
         else:
@@ -409,17 +418,22 @@ async def _register_warp_account(
             pass
 
     await _emit_progress(on_progress, "Generating Cloudflare WARP WireGuard profile...")
-    rc, stdout, stderr = await run_exec(
-        wgcf_bin,
-        "generate",
-        cwd=cfg.data_dir,
-        timeout=45.0,
-    )
-    if rc != 0 or not os.path.isfile(cfg.wgcf_profile_path):
-        raise RuntimeError(
-            f"wgcf generate failed: {stderr or stdout or f'exit code {rc}'}"
+    last_gen_err = ""
+    for attempt in range(1, 4):
+        rc, stdout, stderr = await run_exec(
+            wgcf_bin,
+            "generate",
+            cwd=cfg.data_dir,
+            timeout=45.0,
         )
-    _chmod_safe(cfg.wgcf_profile_path, 0o600)
+        if rc == 0 and os.path.isfile(cfg.wgcf_profile_path):
+            _chmod_safe(cfg.wgcf_profile_path, 0o600)
+            break
+        last_gen_err = stderr or stdout or f"exit code {rc}"
+        if attempt < 3:
+            await asyncio.sleep(2.0 * attempt)
+    else:
+        raise RuntimeError(f"wgcf generate failed: {last_gen_err}")
 
 
 def _read_text_if_exists(path: str) -> Optional[str]:

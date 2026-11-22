@@ -316,6 +316,7 @@ def build_wg_profile(
     dns_servers = _get_values_ci(iface, "DNS") or [DEFAULT_WARP_DNS]
 
     public_keys = _get_values_ci(peer, "PublicKey")
+    preshared_keys = _get_values_ci(peer, "PreSharedKey")
     allowed_ips = _get_values_ci(peer, "AllowedIPs") or ["0.0.0.0/0", "::/0"]
     endpoints = _get_values_ci(peer, "Endpoint")
 
@@ -339,9 +340,13 @@ def build_wg_profile(
         "",
         "[Peer]",
         f"PublicKey = {public_keys[0]}",
+    ]
+    if preshared_keys:
+        lines.append(f"PreSharedKey = {preshared_keys[0]}")
+    lines.extend([
         f"AllowedIPs = {', '.join(allowed_ips)}",
         f"Endpoint = {final_endpoint}",
-    ]
+    ])
     if keepalive > 0:
         lines.append(f"{keepalive_key} = {int(keepalive)}")
     lines.append("")

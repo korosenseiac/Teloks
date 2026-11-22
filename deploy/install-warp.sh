@@ -167,7 +167,7 @@ download_wireproxy() {
 }
 
 download_wgcf() {
-  if [ "$FORCE" -eq 0 ] && [ -x "$WGCF_BIN" ] && "$WGCF_BIN" --version >/dev/null 2>&1; then
+  if [ "$FORCE" -eq 0 ] && [ -x "$WGCF_BIN" ] && "$WGCF_BIN" --help >/dev/null 2>&1; then
     ok "Reusing existing wgcf binary ($WGCF_BIN)"
     return 0
   fi
@@ -182,7 +182,7 @@ download_wgcf() {
   curl -fsSL "$url" -o "$dl_file"
   install -m 0755 "$dl_file" "$WGCF_BIN"
   rm -f "$dl_file"
-  "$WGCF_BIN" --version >/dev/null 2>&1 || die "Downloaded wgcf binary failed self-check"
+  "$WGCF_BIN" --help >/dev/null 2>&1 || die "Downloaded wgcf binary failed self-check"
   ok "Installed wgcf ($tag)"
 }
 
@@ -291,6 +291,7 @@ else
       reg_ok=1
       break
     fi
+    rm -f "$WGCF_ACCOUNT"
     if [ "$attempt" -lt 3 ]; then
       info "Registration attempt ${attempt} failed; retrying in $((attempt * 2))s..."
       sleep $((attempt * 2))
@@ -303,7 +304,18 @@ fi
 
 if [ ! -f "$WGCF_PROFILE" ] || [ "$FORCE" -eq 1 ]; then
   info "Generating WireGuard profile..."
-  (cd "$WARP_DATA_DIR" && "$WGCF_BIN" generate)
+  gen_ok=0
+  for attempt in 1 2 3; do
+    if (cd "$WARP_DATA_DIR" && "$WGCF_BIN" generate) && [ -f "$WGCF_PROFILE" ]; then
+      gen_ok=1
+      break
+    fi
+    if [ "$attempt" -lt 3 ]; then
+      info "Profile generation attempt ${attempt} failed; retrying in $((attempt * 2))s..."
+      sleep $((attempt * 2))
+    fi
+  done
+  [ "$gen_ok" -eq 1 ] || die "wgcf generate failed after 3 attempts"
   chmod 600 "$WGCF_PROFILE"
 fi
 
