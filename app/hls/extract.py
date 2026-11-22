@@ -32,15 +32,22 @@ import asyncio
 import base64
 import binascii
 import html as _html
+import inspect
 import re
-from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
-from urllib.parse import SplitResult, urljoin, urlsplit
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import SplitResult, unquote, urljoin, urlsplit
 
 from app.config import (
     HLS_PAGE_FOLLOW_EMBED,
     HLS_PAGE_MAX_BYTES,
     HLS_PAGE_MAX_CANDIDATES,
+)
+from app.hls.client import (
+    DEFAULT_USER_AGENT,
+    HlsHttpError,
+    default_headers,
+    redact_url,
 )
 from app.hls.playlist import is_hls_playlist
 
@@ -68,6 +75,17 @@ _URL_STOP = r"""\s\"'<>\\`\[\]{}$"""
 #: Absolute and protocol-relative URLs anywhere in the page.
 _ABS_URL = re.compile(r"""(?:https?:)?//[^""" + _URL_STOP + r"""]+""", re.IGNORECASE)
 
+#: URL-encoded absolute URLs inside query parameters or attributes.
+_PCT_URL = re.compile(r"""https?%3A%2F%2F[^""" + _URL_STOP + r"""&]+""", re.IGNORECASE)
+
+#: JS/JSON player config properties pointing to an m3u8 URL even if ``.m3u8``
+#: sits in a query param or non-terminal path segment.
+_PLAYER_URL_KV = re.compile(
+    r"""(?:["']?(?:file|hls|hlsUrl|stream|streamUrl|manifest|playlist)["']?\s*[:=]|["'](?:src|source|url)["']?\s*:)\s*"""
+    r"""(?:"([^"\\<>]+\.m3u8?[^"\\<>]*)"|'([^'\\<>]+\.m3u8?[^'\\<>]*)')""",
+    re.IGNORECASE,
+)
+
 #: Page-relative manifest paths, e.g. ``/hls/1234/master.m3u8``.
 #: The lookbehind stops it from re-matching the path part of a full URL.
 _REL_MANIFEST = re.compile(
@@ -76,16 +94,15 @@ _REL_MANIFEST = re.compile(
     re.IGNORECASE,
 )
 
-#: ``<iframe src=...>`` / ``<embed src=...>`` — a player page often hides the
-#: manifest behind one embed hop.
+#: ``<iframe src=...>`` / ``<embed src=...>`` (plus ``data-src=`` lazy embeds).
 _EMBED = re.compile(
-    r"""<(?:iframe|embed)\b[^>]*?\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"'>]+))""",
+    r"""<(?:iframe|embed)\b[^>]*?\b(?:data-)?src\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"'>]+))""",
     re.IGNORECASE,
 )
 
-#: Base64 blobs (some players ship the manifest URL encoded). 80 chars is long
-#: enough to be a URL and short enough to keep the search cheap.
-_B64_BLOB = re.compile(r"""[A-Za-z0-9+/_-]{80,}={0,2}""")
+#: Base64 blobs (some players ship the manifest URL encoded). 40 chars catches
+#: short URLs (~30 bytes) while keeping the search cheap.
+_B64_BLOB = re.compile(r"""[A-Za-z0-9+/_-]{40,}={0,2}""")
 
 #: Markers that a page embeds a player (used only for the user-facing hint).
 _PLAYER_MARKERS = (
@@ -93,18 +110,45 @@ _PLAYER_MARKERS = (
     "<video", "player", "<iframe",
 )
 
+#: Known ad/tracker hosts to ignore for embed hops and deprioritize for streams.
+_AD_HOST_PARTS = (
+    "doubleclick", "googlesyndication", "google-analytics", "googletagmanager",
+    "adsbygoogle", "adservice", "popads", "popcash", "propellerads",
+    "exoclick", "juicyads", "trafficjunky", "adsterra", "hilltopads",
+    "facebook.net", "criteo", "taboola", "outbrain", "openfpcdn",
+)
+
+_AD_STREAM_MARKERS = (
+    "/vast", "preroll", "/ads/", "adserver", "doubleclick", "googlesyndication",
+    "preview.", "/preview/", "trailer", "teaser",
+)
+
 
 def _unescape(text: str) -> str:
     """Undo the encodings sites use when they embed a URL.
 
-    HTML entities (``&amp;``), JSON/JS escaped slashes (``\\/``) and escaped
-    ``\\uXXXX`` characters for ``/ = & ?`` — all of which would otherwise hide a
-    perfectly good manifest URL from the scanner.
+    HTML entities (``&amp;``), JSON/JS escaped slashes (``\\/``), hex escapes
+    (``\\x2f``) and escaped ``\\uXXXX`` characters for ``/ = & ? : %``.
     """
-    text = text.replace("\\/", "/")
-    for code, char in (("002F", "/"), ("002f", "/"), ("003D", "="),
-                       ("0026", "&"), ("003F", "?"), ("003A", ":")):
+    text = text.replace("\\\\/", "/").replace("\\/", "/")
+    for code, char in (
+        ("002F", "/"), ("002f", "/"),
+        ("003D", "="), ("003d", "="),
+        ("0026", "&"),
+        ("003F", "?"), ("003f", "?"),
+        ("003A", ":"), ("003a", ":"),
+        ("0025", "%"),
+    ):
         text = text.replace(f"\\u{code}", char)
+    for code, char in (
+        ("2F", "/"), ("2f", "/"),
+        ("3D", "="), ("3d", "="),
+        ("26", "&"),
+        ("3F", "?"), ("3f", "?"),
+        ("3A", ":"), ("3a", ":"),
+        ("25", "%"),
+    ):
+        text = text.replace(f"\\x{code}", char)
     return _html.unescape(text)
 
 
@@ -120,6 +164,13 @@ def _safe_urlsplit(url: str) -> Optional[SplitResult]:
         return urlsplit(url)
     except ValueError:
         return None
+
+
+def _origin_of(url: str) -> str:
+    parts = _safe_urlsplit(url)
+    if parts is None or not parts.scheme or not parts.netloc:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}"
 
 
 def _clean_candidate(raw: str, base_url: str) -> str:
@@ -146,16 +197,21 @@ def _clean_candidate(raw: str, base_url: str) -> str:
     return joined if _safe_urlsplit(joined) else ""
 
 
-def _looks_like_stream(url: str) -> bool:
-    """True when the URL path ends in a playable source extension."""
+def _looks_like_stream(url: str, *, allow_query_m3u8: bool = False) -> bool:
+    """True when the URL looks like a playable source."""
     parts = _safe_urlsplit(url)
     if parts is None:
         return False
-    return parts.path.lower().endswith(HLS_EXTENSIONS + OTHER_STREAM_EXTENSIONS)
+    path_low = parts.path.lower()
+    if path_low.endswith(HLS_EXTENSIONS + OTHER_STREAM_EXTENSIONS):
+        return True
+    if allow_query_m3u8 and (".m3u8" in url.lower() or ".m3u" in path_low):
+        return True
+    return False
 
 
-def _rank(url: str) -> Tuple[int, int, int, int]:
-    """Sort key: HLS before other sources, master before variant, token first.
+def _rank(url: str) -> Tuple[int, int, int, int, int]:
+    """Sort key: HLS before other sources, non-ad first, master before variant, token first.
 
     Lower is better. A ``master.m3u8`` wins over an ``index.m3u8``, an `m3u8`
     with a query string (the freshly minted, signed one) wins over a bare path,
@@ -163,13 +219,24 @@ def _rank(url: str) -> Tuple[int, int, int, int]:
     """
     parts = _safe_urlsplit(url)
     path = (parts.path if parts is not None else "").lower()
-    is_hls = 0 if path.endswith(HLS_EXTENSIONS) else 1
+    host = (parts.hostname if parts is not None else "") or ""
+    low_full = url.lower()
+    is_hls = 0 if (path.endswith(HLS_EXTENSIONS) or ".m3u8" in low_full) else 1
+    is_junk = (
+        1
+        if (
+            any(part in host for part in _AD_HOST_PARTS)
+            or any(marker in low_full for marker in _AD_STREAM_MARKERS)
+        )
+        else 0
+    )
     term = path.rsplit("/", 1)[-1]
-    is_master = 0 if ("master" in term or "manifest" in term) else 1
+    is_master = 0 if ("master" in term or "manifest" in term or "playlist" in term) else 1
     has_query = 0 if "?" in url else 1
-    return (is_hls, is_master, has_query, len(url))
+    return (is_hls, is_junk, is_master, has_query, len(url))
 
-def _decoded_blobs(text: str, limit: int = 8) -> List[str]:
+
+def _decoded_blobs(text: str, limit: int = 12) -> List[str]:
     """Text of up to *limit* base64 blobs that decode to something URL-ish.
 
     Best-effort and heavily bounded: players that store the source in a base64
@@ -195,8 +262,9 @@ def find_manifests(html: str, base_url: str, limit: int = 3) -> List[str]:
     """Every stream/manifest URL referenced by *html*, best candidate first.
 
     Handles the encodings seen in the wild: plain URLs in attributes or JS
-    strings, escaped slashes (``https:\\/\\/…``), ``&amp;`` entities,
-    protocol-relative and page-relative paths, and base64 config blobs.
+    strings, escaped slashes (``https:\\/\\/…``), ``\\x2f`` hex escapes,
+    ``&amp;`` entities, percent-encoded URLs, protocol-relative and
+    page-relative paths, and base64 config blobs.
     """
     if not html:
         return []
@@ -205,13 +273,13 @@ def find_manifests(html: str, base_url: str, limit: int = 3) -> List[str]:
     found: List[str] = []
     seen = set()
 
-    def _add(raw: str) -> None:
+    def _add(raw: str, *, allow_query_m3u8: bool = False) -> None:
         try:
             url = _clean_candidate(raw, base_url)
         except ValueError:
             # A hostile/broken page must never abort the scan; skip the junk.
             return
-        if not url or url in seen or not _looks_like_stream(url):
+        if not url or url in seen or not _looks_like_stream(url, allow_query_m3u8=allow_query_m3u8):
             return
         seen.add(url)
         found.append(url)
@@ -220,14 +288,32 @@ def find_manifests(html: str, base_url: str, limit: int = 3) -> List[str]:
         _add(match.group(0))
     for match in _REL_MANIFEST.finditer(text):
         _add(match.group(1))
+    for match in _PLAYER_URL_KV.finditer(text):
+        raw_kv = match.group(1) or match.group(2) or ""
+        if "%3a%2f%2f" in raw_kv.lower():
+            continue
+        _add(raw_kv, allow_query_m3u8=True)
+    for match in _PCT_URL.finditer(text):
+        _add(unquote(match.group(0)), allow_query_m3u8=True)
     for blob in _decoded_blobs(text):
         for match in _ABS_URL.finditer(blob):
             _add(match.group(0))
         for match in _REL_MANIFEST.finditer(blob):
             _add(match.group(1))
+        for match in _PLAYER_URL_KV.finditer(blob):
+            raw_kv = match.group(1) or match.group(2) or ""
+            _add(raw_kv, allow_query_m3u8=True)
 
     found.sort(key=_rank)
     return found[:max(1, limit)]
+
+
+def _is_ad_url(url: str) -> bool:
+    parts = _safe_urlsplit(url)
+    if parts is None:
+        return True
+    host = (parts.hostname or "").lower()
+    return any(part in host for part in _AD_HOST_PARTS)
 
 
 def find_embed_urls(html: str, base_url: str, limit: int = 2) -> List[str]:
@@ -236,7 +322,7 @@ def find_embed_urls(html: str, base_url: str, limit: int = 2) -> List[str]:
         return []
 
     text = _unescape(html)
-    ranked: List[Tuple[int, str]] = []
+    ranked: List[Tuple[int, int, str]] = []
     seen = set()
     for match in _EMBED.finditer(text):
         raw = match.group(1) or match.group(2) or match.group(3) or ""
@@ -249,11 +335,14 @@ def find_embed_urls(html: str, base_url: str, limit: int = 2) -> List[str]:
         low = url.lower()
         if low.endswith((".jpg", ".png", ".gif", ".webp", ".svg", ".css", ".js")):
             continue
+        if _is_ad_url(url):
+            continue
         seen.add(url)
-        ranked.append((0 if ("embed" in low or "player" in low) else 1, url))
+        priority = 0 if any(k in low for k in ("embed", "player", "stream", "video")) else 1
+        ranked.append((priority, len(url), url))
 
-    ranked.sort(key=lambda item: (item[0], len(item[1])))
-    return [url for _, url in ranked[:max(1, limit)]]
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [url for _, _, url in ranked[:max(1, limit)]]
 
 
 def looks_like_player_page(html: str) -> bool:
@@ -274,8 +363,8 @@ class PageScan:
 
     #: The manifest URL to hand to the downloader (None when nothing was found).
     url: Optional[str] = None
-    #: The page that actually carried it (may be an embed followed from the
-    #: submitted page) — used as the browser-like ``Referer`` for the stream.
+    #: The page that actually carried it (may be an embed or redirect target)
+    #: — used as the browser-like ``Referer`` for the stream.
     page_url: str = ""
     #: "ok" | "not-a-page" | "no-manifest" | "no-valid-manifest" | "error"
     reason: str = ""
@@ -285,31 +374,184 @@ class PageScan:
     player_page: bool = False
     #: Free-text detail for the log line.
     detail: str = ""
+    #: Request headers that worked for the manifest (UA, Referer, Origin).
+    headers: Dict[str, str] = field(default_factory=dict)
+    #: Cookies captured during page/embed/manifest loading.
+    cookies: Dict[str, str] = field(default_factory=dict)
 
 
-async def _first_valid(client, urls: Sequence[str]) -> Tuple[Optional[str], str]:
+def _supports_kwarg(fn: Any, kw: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == kw:
+            return True
+    return False
+
+
+async def _fetch_page_compat(
+    client: Any,
+    url: str,
+    max_bytes: int,
+    headers: Optional[Dict[str, str]] = None,
+) -> Optional[Tuple[str, str]]:
+    fetch_page_fn = getattr(client, "fetch_page", None)
+    if callable(fetch_page_fn):
+        kwargs: Dict[str, Any] = {"max_bytes": max_bytes}
+        if headers and _supports_kwarg(fetch_page_fn, "headers"):
+            kwargs["headers"] = headers
+        return await fetch_page_fn(url, **kwargs)
+
+    fetch_text_fn = client.fetch_page_text
+    kwargs = {"max_bytes": max_bytes}
+    if headers and _supports_kwarg(fetch_text_fn, "headers"):
+        kwargs["headers"] = headers
+    html = await fetch_text_fn(url, **kwargs)
+    if html is None:
+        return None
+    return html, url
+
+
+async def _fetch_text_compat(
+    client: Any,
+    url: str,
+    headers: Optional[Dict[str, Optional[str]]] = None,
+) -> Tuple[str, str]:
+    fn = getattr(client, "fetch_text_with_url", None)
+    if callable(fn):
+        if headers and _supports_kwarg(fn, "headers"):
+            return await fn(url, headers=headers)
+        return await fn(url)
+
+    fn_text = client.fetch_text
+    if headers and _supports_kwarg(fn_text, "headers"):
+        text = await fn_text(url, headers=headers)
+    else:
+        text = await fn_text(url)
+    return text, url
+
+
+def _header_attempts(referer_url: str, candidate_url: str) -> List[Dict[str, Optional[str]]]:
+    """Ordered browser-like header sets to validate a candidate playlist."""
+    attempts: List[Dict[str, Optional[str]]] = []
+    ref_origin = _origin_of(referer_url)
+    cand_origin = _origin_of(candidate_url)
+
+    if referer_url:
+        # 1) Full document Referer + Origin (standard browser XHR from page/embed).
+        first: Dict[str, Optional[str]] = {"Referer": referer_url}
+        if ref_origin:
+            first["Origin"] = ref_origin
+        attempts.append(first)
+
+        # 2) Origin-only Referer + Origin (Chrome default cross-origin policy:
+        #    strict-origin-when-cross-origin strips path/query on Referer).
+        if ref_origin and referer_url != f"{ref_origin}/":
+            attempts.append({"Referer": f"{ref_origin}/", "Origin": ref_origin})
+
+        # 3) Referer without Origin (some non-CORS or legacy servers reject Origin).
+        attempts.append({"Referer": referer_url, "Origin": None})
+
+    # 4) Stream's own origin as Referer (fallback for CDNs enforcing own-origin hotlink).
+    if cand_origin and cand_origin != ref_origin:
+        attempts.append({"Referer": f"{cand_origin}/", "Origin": None})
+
+    if not attempts:
+        attempts.append({})
+    return attempts
+
+
+def _build_winning_headers(
+    client: Any,
+    referer_url: str,
+    used_attempt: Dict[str, Optional[str]],
+) -> Dict[str, str]:
+    ua = getattr(client, "user_agent", None)
+    if not ua:
+        hdrs = getattr(client, "headers", None) or {}
+        ua = hdrs.get("User-Agent") or hdrs.get("user-agent") or DEFAULT_USER_AGENT
+    out: Dict[str, str] = {
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    ref = used_attempt.get("Referer") or referer_url
+    if ref:
+        out["Referer"] = ref
+    orig = used_attempt.get("Origin")
+    if orig:
+        out["Origin"] = orig
+    return out
+
+
+def _collect_cookies(client: Any, manifest_url: str, page_url: str) -> Dict[str, str]:
+    export_fn = getattr(client, "export_cookies", None)
+    if not callable(export_fn):
+        return {}
+    cookies: Dict[str, str] = {}
+    try:
+        page_cookies = export_fn(page_url) if page_url else {}
+        manifest_cookies = export_fn(manifest_url) if manifest_url else {}
+        if isinstance(page_cookies, dict) and page_cookies:
+            # Share cookies when manifest & page share a parent domain.
+            mp = _safe_urlsplit(manifest_url)
+            pp = _safe_urlsplit(page_url)
+            mhost = (mp.hostname or "").lower() if mp else ""
+            phost = (pp.hostname or "").lower() if pp else ""
+            if mhost and phost and mhost.split(".")[-2:] == phost.split(".")[-2:]:
+                cookies.update(page_cookies)
+        if isinstance(manifest_cookies, dict):
+            cookies.update(manifest_cookies)
+    except Exception:
+        return {}
+    return cookies
+
+
+async def _first_valid(
+    client: Any,
+    urls: Sequence[str],
+    *,
+    referer_url: str = "",
+) -> Tuple[Optional[str], str, Dict[str, str]]:
     """First candidate that really is an HLS playlist, plus why the rest failed.
 
-    Returns ``(url, detail)``. *url* is ``None`` when no candidate turned out to
-    be a playlist; *detail* is then a short, log-friendly note about the last
-    rejection (``HTTP 403``, a timeout, "not a playlist (12 KB)" …) so the
-    caller's "no-valid-manifest" line can say what actually happened instead of
-    leaving a bare candidate count to guess from.
+    Returns ``(url, detail, winning_headers)``.
     """
     detail = ""
     for url in urls:
-        short = url.split("?", 1)[0]
-        try:
-            text = await client.fetch_text(url)
-        except Exception as e:
-            detail = f"{type(e).__name__}: {e}"
-            print(f"[HLS] Candidate rejected ({short}): {detail}")
-            continue
-        if is_hls_playlist(text):
-            return url, ""
-        detail = f"{short} is not a playlist ({len(text)} B)"
-        print(f"[HLS] Candidate rejected ({detail})")
-    return None, detail
+        short = redact_url(url)
+        attempts = _header_attempts(referer_url, url)
+        # If client doesn't support per-request headers (mock), run once.
+        supports_headers = _supports_kwarg(
+            getattr(client, "fetch_text_with_url", client.fetch_text), "headers"
+        )
+        if not supports_headers:
+            attempts = [{}]
+
+        for idx, req_hdrs in enumerate(attempts):
+            try:
+                text, final_url = await _fetch_text_compat(
+                    client, url, headers=req_hdrs if supports_headers else None
+                )
+            except Exception as e:
+                detail = f"{type(e).__name__}: {e}"
+                status = getattr(e, "status", None)
+                if status in (401, 403) and idx + 1 < len(attempts):
+                    continue
+                print(f"[HLS] Candidate rejected ({short}): {detail}")
+                break
+
+            if is_hls_playlist(text.lstrip("\ufeff \t\r\n")):
+                winning_hdrs = _build_winning_headers(client, referer_url, req_hdrs)
+                return final_url or url, "", winning_hdrs
+
+            detail = f"{short} is not a playlist ({len(text)} B)"
+            print(f"[HLS] Candidate rejected ({detail})")
+            break
+
+    return None, detail, {}
 
 
 async def resolve_stream_from_page(
@@ -328,52 +570,77 @@ async def resolve_stream_from_page(
     ``scan.url``; ``scan.reason`` explains a miss.
     """
     try:
-        html = await client.fetch_page_text(page_url, max_bytes=max_bytes)
+        fetched = await _fetch_page_compat(client, page_url, max_bytes=max_bytes)
     except Exception as e:
-        return PageScan(page_url=page_url, reason="not-a-page", detail=str(e))
-    if html is None:
+        return PageScan(
+            page_url=page_url,
+            reason="error",
+            detail=f"{type(e).__name__}: {e}",
+        )
+    if fetched is None:
         return PageScan(page_url=page_url, reason="not-a-page")
 
-    candidates = find_manifests(html, page_url, limit=limit)
+    html, final_page_url = fetched
+    final_page_url = final_page_url or page_url
+
+    candidates = find_manifests(html, final_page_url, limit=limit)
     detail = ""
     if candidates:
-        url, detail = await _first_valid(client, candidates)
+        url, detail, winning_hdrs = await _first_valid(
+            client, candidates, referer_url=final_page_url
+        )
         if url:
+            cookies = _collect_cookies(client, url, final_page_url)
             return PageScan(
-                url=url, page_url=page_url, reason="ok", candidates=len(candidates),
+                url=url,
+                page_url=final_page_url,
+                reason="ok",
+                candidates=len(candidates),
+                headers=winning_hdrs,
+                cookies=cookies,
             )
 
     if follow_embed:
-        for embed in find_embed_urls(html, page_url):
+        for embed in find_embed_urls(html, final_page_url):
             try:
-                sub = await client.fetch_page_text(embed, max_bytes=max_bytes)
+                sub_fetched = await _fetch_page_compat(
+                    client,
+                    embed,
+                    max_bytes=max_bytes,
+                    headers={"Referer": final_page_url},
+                )
             except Exception as e:
-                print(f"[HLS] Embed hop failed ({embed.split('?')[0]}): {e}")
+                print(f"[HLS] Embed hop failed ({redact_url(embed)}): {e}")
                 continue
-            if not sub:
+            if not sub_fetched:
                 continue
-            sub_candidates = find_manifests(sub, embed, limit=limit)
+            sub, embed_final_url = sub_fetched
+            embed_final_url = embed_final_url or embed
+            sub_candidates = find_manifests(sub, embed_final_url, limit=limit)
             if not sub_candidates:
                 continue
-            url, sub_detail = await _first_valid(client, sub_candidates)
+            url, sub_detail, winning_hdrs = await _first_valid(
+                client, sub_candidates, referer_url=embed_final_url
+            )
             if url:
+                cookies = _collect_cookies(client, url, embed_final_url)
                 return PageScan(
-                    url=url, page_url=embed, reason="ok",
+                    url=url,
+                    page_url=embed_final_url,
+                    reason="ok",
                     candidates=len(sub_candidates),
+                    headers=winning_hdrs,
+                    cookies=cookies,
                 )
-            # The embed hop is the deepest attempt, so its reason is the most
-            # useful one to report.
             detail = sub_detail
 
     return PageScan(
-        page_url=page_url,
+        page_url=final_page_url,
         reason="no-manifest" if not candidates else "no-valid-manifest",
         candidates=len(candidates),
         player_page=looks_like_player_page(html),
         detail=detail,
     )
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +673,16 @@ if __name__ == "__main__":
     _check("JS-escaped slashes",
            find_manifests(escaped, BASE) == ["https://cdn.example.com/hls/master.m3u8?t=1"],
            str(find_manifests(escaped, BASE)))
+
+    hex_escaped = r'<script>var s = "https:\x3a\x2f\x2fcdn.example.com\x2fhls\x2fhex.m3u8?a=1\x26b=2";</script>'
+    _check("JS hex-escaped slashes",
+           find_manifests(hex_escaped, BASE) == ["https://cdn.example.com/hls/hex.m3u8?a=1&b=2"],
+           str(find_manifests(hex_escaped, BASE)))
+
+    pct_escaped = '<iframe src="https://p.example.com/?url=https%3A%2F%2Fcdn.example.com%2Fpct%2Fmaster.m3u8%3Ft%3D7&autoplay=1"></iframe>'
+    _check("percent-encoded URL in attribute",
+           find_manifests(pct_escaped, BASE) == ["https://cdn.example.com/pct/master.m3u8?t=7"],
+           str(find_manifests(pct_escaped, BASE)))
 
     entity = '<video src="https://cdn.example.com/a/master.m3u8?t=1&amp;e=2"></video>'
     _check("HTML entity in query",
@@ -450,6 +727,13 @@ if __name__ == "__main__":
            and order[-1].endswith("clip.mp4"), str(order))
     _check("poster image ignored", all("1.jpg" not in u for u in order), str(order))
     _check("limit honoured", len(find_manifests(mixed, BASE, limit=2)) == 2)
+    ad_vs_real = (
+        '<script>vast="https://ads.example.com/preroll/master.m3u8?t=1";'
+        'main="https://cdn.example.com/real/index.m3u8?t=2";</script>'
+    )
+    _check("ad manifest ranked behind real manifest",
+           find_manifests(ad_vs_real, BASE)[0] == "https://cdn.example.com/real/index.m3u8?t=2",
+           str(find_manifests(ad_vs_real, BASE)))
     _check("trailing CSS/JSON junk stripped",
            find_manifests("background:url(https://cdn.example.com/y/master.m3u8?t=3);", BASE)
            == ["https://cdn.example.com/y/master.m3u8?t=3"],
@@ -463,19 +747,19 @@ if __name__ == "__main__":
 
     print("--- embeds / player detection ---")
     embeds = find_embed_urls(
+        '<iframe src="https://doubleclick.net/banner.html"></iframe>'
         '<iframe src="https://ads.example.com/banner.html"></iframe>'
-        '<iframe src="https://site.example.com/embed/player-123"></iframe>', BASE)
-    _check("embed/player host ranked first",
-           embeds[0] == "https://site.example.com/embed/player-123", str(embeds))
+        '<iframe data-src="https://site.example.com/embed/player-123"></iframe>', BASE)
+    _check("ad host filtered & embed/player host ranked first",
+           embeds[0] == "https://site.example.com/embed/player-123"
+           and all("doubleclick" not in u for u in embeds),
+           str(embeds))
     _check("player page detected",
            looks_like_player_page('<script src="hls.js"></script><video id="v">'))
     _check("plain page not a player page",
            not looks_like_player_page("<html><body><p>blog post</p></body></html>"))
 
     print("--- hostile page junk never aborts the scan ---")
-    # The production shape that broke the scan: a JS template literal with an
-    # unmatched '[' reached urlsplit() as a bad host ("Invalid IPv6 URL") and
-    # killed the whole page, even though the real manifest was further down.
     junk_page = (
         "<html><head><script>var tpl = `//${cdnHost}[${videoId}]/v`;"
         "var re = /a[b]/; var x = 'https://host]x/path/master.m3u8';</script>"
@@ -504,7 +788,7 @@ if __name__ == "__main__":
     print("--- page scan against a client-bound CDN (loopback) ---")
 
     SECRET = "s3cr3t"
-    FOREIGN_UA = "ForeignBrowser/1.0"   # the browser that minted the copied URL
+    FOREIGN_UA = "ForeignBrowser/1.0"
 
     def token_for(user_agent: str) -> str:
         """Stand-in for the CDN token: bound to the client that asked for it."""
@@ -520,7 +804,9 @@ if __name__ == "__main__":
                 '<script>var src = "http:\\/\\/127.0.0.1:%d\\/media\\/master.m3u8'
                 '?t=%s";</script></body></html>' % (request.url.port, token_for(ua))
             )
-            return web.Response(text=body, content_type="text/html")
+            resp = web.Response(text=body, content_type="text/html")
+            resp.set_cookie("cdn_sess", "tok_page_99", path="/")
+            return resp
 
         async def master(request):
             token = token_for(request.headers.get("User-Agent", ""))
@@ -535,8 +821,6 @@ if __name__ == "__main__":
             token = token_for(request.headers.get("User-Agent", ""))
             if request.query.get("t") != token:
                 return web.Response(status=403)
-            # Real CDNs sign every segment for the requesting client, so each
-            # line carries its own token.
             return web.Response(
                 text=f"#EXTM3U\n#EXTINF:4,\nseg0.ts?t={token}\n#EXT-X-ENDLIST\n")
 
@@ -551,23 +835,18 @@ if __name__ == "__main__":
                 headers={"Content-Disposition": 'attachment; filename="x.zip"'})
 
         async def page_bad_charset(request):
-            """Page whose only candidate is a playlist with a stray cp1252 byte."""
             return web.Response(
                 text='<html><body><script>var src = "/media/master-cp1252.m3u8";'
                      "</script></body></html>",
                 content_type="text/html")
 
         async def master_bad_charset(request):
-            # No charset in the header plus a stray 0xe9 in the body: exactly the
-            # shape that used to raise UnicodeDecodeError out of resp.text() and
-            # turn a perfectly good manifest into "Candidate rejected".
             body = (b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n"
                     b"# caf\xe9\nindex.m3u8\n")
             return web.Response(body=body,
                                 content_type="application/vnd.apple.mpegurl")
 
         async def page_junk_candidate(request):
-            """Page offering a candidate that is not a playlist at all."""
             return web.Response(
                 text='<html><body><script>var src = "/media/notaplaylist.m3u8";'
                      "</script></body></html>",
@@ -576,6 +855,35 @@ if __name__ == "__main__":
         async def not_a_playlist(request):
             return web.Response(body=b"<html>caf\xe9 not a playlist</html>",
                                 content_type="application/vnd.apple.mpegurl")
+
+        async def redirect_page(request):
+            raise web.HTTPFound("/embed-target/watch")
+
+        async def embed_target(request):
+            return web.Response(
+                text='<html><body><iframe src="/player/frame-1"></iframe></body></html>',
+                content_type="text/html",
+            )
+
+        async def player_frame(request):
+            return web.Response(
+                text='<html><body><script>var s = "stream.m3u8";</script>'
+                     '<source src="/player/strict.m3u8"></body></html>',
+                content_type="text/html",
+            )
+
+        async def strict_m3u8(request):
+            ref = request.headers.get("Referer", "")
+            orig = request.headers.get("Origin", "")
+            if not ref.endswith("/player/frame-1") or not orig:
+                return web.Response(status=403, text="bad referer/origin")
+            return web.Response(
+                text="#EXTM3U\n#EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST\n",
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def error_page(request):
+            return web.Response(status=403, text="blocked")
 
         app = web.Application()
         app.router.add_get("/page", page)
@@ -587,6 +895,11 @@ if __name__ == "__main__":
         app.router.add_get("/media/master-cp1252.m3u8", master_bad_charset)
         app.router.add_get("/page-junk-candidate", page_junk_candidate)
         app.router.add_get("/media/notaplaylist.m3u8", not_a_playlist)
+        app.router.add_get("/redir", redirect_page)
+        app.router.add_get("/embed-target/watch", embed_target)
+        app.router.add_get("/player/frame-1", player_frame)
+        app.router.add_get("/player/strict.m3u8", strict_m3u8)
+        app.router.add_get("/blocked", error_page)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -597,9 +910,6 @@ if __name__ == "__main__":
         client: Optional[HlsClient] = None
 
         try:
-            # 1) The URL a user copies out of a browser is signed for THAT
-            #    client: replaying it from here must fail, exactly like the
-            #    real CDN did for the reported site.
             client = HlsClient(headers={"User-Agent": "BotFetcher/1.0"})
             foreign = f"{base}/media/master.m3u8?t={token_for(FOREIGN_UA)}"
             blocked = ""
@@ -610,7 +920,6 @@ if __name__ == "__main__":
             _check("foreign-signed URL rejected (403) like the real CDN",
                    "403" in blocked, blocked or "request unexpectedly succeeded")
 
-            # 2) Loading the page OURSELVES mints a URL bound to our client.
             scan = await resolve_stream_from_page(client, f"{base}/page")
             _check("page scan found a manifest", bool(scan.url),
                    f"{scan.reason} {scan.detail}")
@@ -618,8 +927,13 @@ if __name__ == "__main__":
             _check("minted for us, not for the browser",
                    bool(scan.url) and token_for(FOREIGN_UA) not in scan.url,
                    str(scan.url))
+            _check("cookies captured on PageScan",
+                   scan.cookies.get("cdn_sess") == "tok_page_99",
+                   str(scan.cookies))
+            _check("headers captured on PageScan",
+                   "Referer" in scan.headers and "Origin" in scan.headers,
+                   str(scan.headers))
 
-            # 3) ...and the whole chain works with that freshly minted token.
             master_text = await client.fetch_text(scan.url) if scan.url else ""
             _check("minted master is a playlist", is_hls_playlist(master_text))
             child = urljoin(scan.url or "", master_text.splitlines()[-1]) if master_text else ""
@@ -629,21 +943,26 @@ if __name__ == "__main__":
             seg_body = await client.fetch_bytes(seg) if seg else b""
             _check("minted segment works", len(seg_body) > 0, seg)
 
-            # 4) A playlist served where a page was expected -> clean "no page".
             playlist_as_page = f"{base}/media/master.m3u8?t={token_for('BotFetcher/1.0')}"
             scan2 = await resolve_stream_from_page(client, playlist_as_page)
             _check("non-page response reports not-a-page",
                    scan2.url is None and scan2.reason == "not-a-page", str(scan2))
 
-            # 5) A real file is never downloaded twice by the sniffer.
+            scan_err = await resolve_stream_from_page(client, f"{base}/blocked")
+            _check("HTTP error page reports error (not not-a-page)",
+                   scan_err.url is None and scan_err.reason == "error", str(scan_err))
+
+            scan_embed = await resolve_stream_from_page(client, f"{base}/redir")
+            _check("redirect + embed hop sets embed Referer & Origin",
+                   scan_embed.reason == "ok"
+                   and scan_embed.page_url == f"{base}/player/frame-1"
+                   and scan_embed.headers.get("Referer") == f"{base}/player/frame-1"
+                   and scan_embed.headers.get("Origin") == base,
+                   str(scan_embed))
+
             file_text = await client.fetch_page_text(f"{base}/file.zip")
             _check("attachment/binary page refused", file_text is None, str(file_text))
 
-            # 6) Regression for the production crash: a playlist whose body
-            #    carries a stray cp1252 byte while the response declares no
-            #    charset. ``resp.text()`` raised UnicodeDecodeError there, the
-            #    scan logged "Candidate rejected" and a perfectly good manifest
-            #    was thrown away.
             scan_bad = await resolve_stream_from_page(client, f"{base}/page-bad-charset")
             _check("non-utf8 playlist with no charset still accepted",
                    scan_bad.reason == "ok" and bool(scan_bad.url),
@@ -652,7 +971,6 @@ if __name__ == "__main__":
             _check("such a body decodes into a playlist", is_hls_playlist(raw),
                    repr(raw[:32]))
 
-            # 7) A candidate that is not a playlist must say so, not raise.
             scan_junk = await resolve_stream_from_page(
                 client, f"{base}/page-junk-candidate")
             _check("non-playlist candidate reports why",
@@ -670,4 +988,3 @@ if __name__ == "__main__":
     for name in failures:
         print(f"    FAILED: {name}")
     sys.exit(1 if failures else 0)
-

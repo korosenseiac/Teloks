@@ -18,32 +18,38 @@ Self-test (offline, no network needed):
 from __future__ import annotations
 
 import asyncio
+import datetime
+import email.utils
+import http.cookies
 import os
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import quote, urlparse
 
 import aiohttp
+from yarl import URL
 
+import app.config as _app_config
 from app.config import HLS_DISABLE_PROXY
 
 # ---------------------------------------------------------------------------
-# Constants (kept in sync with app/direct/client.py)
+# Constants (kept in sync with app/direct/client.py and app/hls/browser.py)
 # ---------------------------------------------------------------------------
 
-_USER_AGENT = (
+DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
+_USER_AGENT = DEFAULT_USER_AGENT
 
-# Timeout for playlist / metadata requests.
-_TIMEOUT = aiohttp.ClientTimeout(total=60, sock_connect=30)
-
-# Timeout for segment downloads (generous — a segment can be several MB).
-_SEGMENT_TIMEOUT = aiohttp.ClientTimeout(total=300, sock_connect=60, sock_read=120)
+_DEFAULT_CONNECT_TIMEOUT = 15.0
+_DEFAULT_SEGMENT_TIMEOUT = 120.0
+_DEFAULT_WORKERS = 16
 
 # Flush buffered bytes to disk once this many are pending.
-_FLUSH_THRESHOLD = 4 * 1024 * 1024
+_FLUSH_THRESHOLD = 1024 * 1024
+_CHUNK_READ_SIZE = 256 * 1024
+_MAX_IGNORED_RANGE_SKIP = 32 * 1024 * 1024
 
 # Headers for a *page* fetch (manifest extraction): a browser asks for HTML and
 # accepts the JSON/script wrappers some players use instead of plain markup.
@@ -56,6 +62,120 @@ _PAGE_CONTENT_TYPES = {
     "application/xhtml+xml", "application/json", "application/ld+json",
     "application/javascript", "application/x-javascript",
 }
+
+_PERMANENT_HTTP_STATUSES = frozenset({401, 403, 404, 410, 451})
+
+
+# ---------------------------------------------------------------------------
+# Errors & URL sanitization
+# ---------------------------------------------------------------------------
+
+def redact_url(url: str) -> str:
+    """Strip query tokens and fragments before placing a URL in logs/errors."""
+    if not url:
+        return ""
+    return url.split("?", 1)[0].split("#", 1)[0]
+
+
+def _redact_proxy_url(proxy_url: Optional[str]) -> str:
+    if not proxy_url:
+        return ""
+    try:
+        parsed = urlparse(proxy_url)
+    except ValueError:
+        return "<proxy>"
+    if not parsed.hostname:
+        return "<proxy>"
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        secs = float(raw)
+        return max(0.5, min(60.0, secs))
+    except ValueError:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        delta = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        return max(0.5, min(60.0, delta))
+    except Exception:
+        return None
+
+
+class HlsHttpError(ValueError):
+    """HTTP >= 400 response with structured status and Retry-After metadata."""
+
+    def __init__(
+        self,
+        status: int,
+        url: str,
+        *,
+        retry_after: Optional[float] = None,
+        detail: str = "",
+    ) -> None:
+        self.status = int(status)
+        self.url = redact_url(url)
+        self.retry_after = retry_after
+        self.detail = detail
+        msg = f"HTTP {self.status} for {self.url}"
+        if detail:
+            msg = f"{msg} ({detail})"
+        super().__init__(msg)
+
+    @property
+    def is_permanent(self) -> bool:
+        """True for status codes unlikely to recover on blind retry."""
+        return self.status in _PERMANENT_HTTP_STATUSES
+
+
+class HlsProxyError(ValueError):
+    """Proxy connection/handshake failure (separate from stream HTTP errors)."""
+
+    def __init__(
+        self,
+        proxy_url: Optional[str],
+        cause: Optional[BaseException] = None,
+    ) -> None:
+        self.proxy_url = _redact_proxy_url(proxy_url)
+        self.cause = cause
+        detail = f"{type(cause).__name__}: {cause}" if cause is not None else "unreachable"
+        super().__init__(f"Proxy connection failed ({self.proxy_url}): {detail}")
+
+
+def _is_proxy_exception(exc: BaseException) -> bool:
+    """True when *exc* (or its chain) indicates the proxy itself failed."""
+    try:
+        import aiohttp_socks
+        socks_errors: Tuple[type, ...] = (
+            aiohttp_socks.ProxyError,
+            aiohttp_socks.ProxyConnectionError,
+            aiohttp_socks.ProxyTimeoutError,
+        )
+    except Exception:
+        socks_errors = ()
+
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, aiohttp.ClientProxyConnectionError):
+            return True
+        if socks_errors and isinstance(cur, socks_errors):
+            return True
+        cls_name = type(cur).__name__
+        if cls_name in ("ProxyError", "ProxyConnectionError", "ProxyTimeoutError"):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -149,41 +269,106 @@ def ffmpeg_proxy_args(proxy_url: Optional[str]) -> List[str]:
 # Request headers
 # ---------------------------------------------------------------------------
 
-def default_headers(url: str) -> Dict[str, str]:
-    """Browser-like headers, including the ``Referer`` most HLS CDNs expect.
-
-    The origin of the stream URL is the best proxy for the page that embedded
-    the player, and it is what makes a large number of otherwise-403 streams
-    work. A malformed URL is tolerated (no ``Referer``) rather than raising:
-    page URLs come from chat messages and junk must never break a job.
-    """
-    headers: Dict[str, str] = {"User-Agent": _USER_AGENT, "Accept": "*/*"}
+def _origin_from_url(url: Optional[str]) -> str:
+    if not url:
+        return ""
     try:
         parsed = urlparse(url)
     except ValueError:
-        return headers
+        return ""
     if parsed.scheme and parsed.netloc:
-        headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
+
+
+def default_headers(
+    url: str,
+    *,
+    referer: Optional[str] = None,
+    origin: Optional[str] = None,
+) -> Dict[str, str]:
+    """Browser-like headers, including ``Referer`` (and ``Origin`` when given).
+
+    The origin of the stream URL is the best proxy for the page that embedded
+    the player, and it is what makes a large number of otherwise-403 streams
+    work. When *referer* is passed explicitly, ``Origin`` is derived from it
+    unless *origin* overrides it. A malformed URL is tolerated rather than
+    raising: page URLs come from chat messages and junk must never break a job.
+    """
+    headers: Dict[str, str] = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if referer:
+        headers["Referer"] = referer
+        derived_origin = origin if origin is not None else _origin_from_url(referer)
+        if derived_origin:
+            headers["Origin"] = derived_origin
+        return headers
+
+    if origin:
+        headers["Origin"] = origin
+
+    stream_origin = _origin_from_url(url)
+    if stream_origin:
+        headers["Referer"] = f"{stream_origin}/"
     return headers
 
 
-def ffmpeg_header_args(headers: Dict[str, str]) -> List[str]:
-    """Convert request headers into ffmpeg ``-user_agent`` / ``-headers`` args."""
+def _sanitize_header_part(text: str) -> str:
+    return text.replace("\r", "").replace("\n", "").replace("\x00", "")
+
+
+def ffmpeg_header_args(
+    headers: Dict[str, str],
+    cookies: Optional[Union[Dict[str, str], str]] = None,
+) -> List[str]:
+    """Convert request headers (and optional cookies) into ffmpeg args."""
     args: List[str] = []
-    ua = headers.get("User-Agent") or headers.get("user-agent")
+    ua = ""
+    has_cookie = False
+    lines: List[str] = []
+
+    for key, val in (headers or {}).items():
+        if not key or val is None:
+            continue
+        k = _sanitize_header_part(str(key)).strip()
+        v = _sanitize_header_part(str(val)).strip()
+        if not k or not v:
+            continue
+        low = k.lower()
+        if low == "user-agent":
+            ua = v
+            continue
+        if low == "cookie":
+            has_cookie = True
+        lines.append(f"{k}: {v}\r\n")
+
+    if not has_cookie and cookies:
+        if isinstance(cookies, str):
+            cookie_str = _sanitize_header_part(cookies).strip()
+        else:
+            cookie_str = "; ".join(
+                f"{_sanitize_header_part(str(k)).strip()}={_sanitize_header_part(str(v)).strip()}"
+                for k, v in cookies.items()
+                if k and v is not None
+            )
+        if cookie_str:
+            lines.append(f"Cookie: {cookie_str}\r\n")
+
     if ua:
         args += ["-user_agent", ua]
-    block = "".join(
-        f"{k}: {v}\r\n" for k, v in headers.items() if k.lower() != "user-agent"
-    )
+    block = "".join(lines)
     if block:
         args += ["-headers", block]
     return args
 
 
-def _append_bytes(path: str, data: bytes) -> None:
-    """Append bytes to *path* (blocking — always called via an executor)."""
-    with open(path, "ab") as fh:
+def _write_bytes(path: str, data: bytes, append: bool) -> None:
+    """Write/append bytes to *path* (blocking — always called via an executor)."""
+    mode = "ab" if append else "wb"
+    with open(path, mode) as fh:
         fh.write(data)
 
 
@@ -212,6 +397,18 @@ def decode_text(body: bytes, encoding: Optional[str] = None) -> str:
     return body.decode("utf-8", "replace")
 
 
+def _parse_cookie_header(raw: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for part in raw.split(";"):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip()
+        if k:
+            out[k] = v.strip()
+    return out
+
+
 # ---------------------------------------------------------------------------
 # HlsClient
 # ---------------------------------------------------------------------------
@@ -227,40 +424,222 @@ class HlsClient:
         self,
         headers: Optional[Dict[str, str]] = None,
         proxy_url: Any = AUTO_PROXY,
+        *,
+        cookies: Optional[Union[Dict[str, str], Iterable[Dict[str, Any]]]] = None,
+        max_connections: Optional[int] = None,
+        connect_timeout: Optional[float] = None,
+        segment_timeout: Optional[float] = None,
     ) -> None:
-        self.headers = dict(headers or {})
+        raw_headers = dict(headers or {})
+        self._pending_cookies: Dict[str, str] = {}
+        self._pending_cookie_entries: List[Dict[str, Any]] = []
+        self.headers: Dict[str, str] = {}
+
+        for k, v in raw_headers.items():
+            if not k or v is None:
+                continue
+            if str(k).lower() == "cookie":
+                self._pending_cookies.update(_parse_cookie_header(str(v)))
+            else:
+                self.headers[str(k)] = str(v)
+
+        if "User-Agent" not in self.headers and "user-agent" not in {
+            k.lower() for k in self.headers
+        }:
+            self.headers["User-Agent"] = DEFAULT_USER_AGENT
+
+        if cookies:
+            self._ingest_cookies(cookies)
+
         self._session: Optional[aiohttp.ClientSession] = None
         # AUTO_PROXY (the default) follows proxy.txt; None forces a direct
         # connection for this client only (see app/hls/browser.py).
         self._proxy_url: Optional[str] = (
             read_proxy_url() if proxy_url is AUTO_PROXY else proxy_url
         )
+        self._max_connections = max_connections
+        self._connect_timeout = connect_timeout
+        self._segment_timeout = segment_timeout
+
+    # -------------------------------------------------------------- cookies
+
+    def _ingest_cookies(
+        self, cookies: Union[Dict[str, str], Iterable[Dict[str, Any]]]
+    ) -> None:
+        if isinstance(cookies, dict):
+            for k, v in cookies.items():
+                if k and v is not None:
+                    self._pending_cookies[str(k)] = str(v)
+        else:
+            for item in cookies:
+                if isinstance(item, dict) and item.get("name"):
+                    self._pending_cookie_entries.append(dict(item))
+
+    def _apply_pending_cookies(self, jar: aiohttp.CookieJar) -> None:
+        if self._pending_cookies:
+            jar.update_cookies(self._pending_cookies)
+        if self._pending_cookie_entries:
+            sc = http.cookies.SimpleCookie()
+            for item in self._pending_cookie_entries:
+                name = str(item.get("name") or "")
+                if not name:
+                    continue
+                val = str(item.get("value") or "")
+                sc[name] = val
+                if item.get("domain"):
+                    sc[name]["domain"] = str(item["domain"])
+                if item.get("path"):
+                    sc[name]["path"] = str(item["path"])
+            if sc:
+                jar.update_cookies(sc)
+
+    def update_cookies(
+        self,
+        cookies: Union[Dict[str, str], Iterable[Dict[str, Any]]],
+        url: Optional[str] = None,
+    ) -> None:
+        """Add or update cookies on this client (and its open session jar)."""
+        if not cookies:
+            return
+        if self._session is not None and not self._session.closed:
+            jar = self._session.cookie_jar
+            if isinstance(cookies, dict):
+                cleaned = {str(k): str(v) for k, v in cookies.items() if k and v is not None}
+                if url:
+                    jar.update_cookies(cleaned, response_url=URL(url))
+                else:
+                    jar.update_cookies(cleaned)
+                return
+        self._ingest_cookies(cookies)
+        if self._session is not None and not self._session.closed:
+            self._apply_pending_cookies(self._session.cookie_jar)
+
+    def export_cookies(self, url: Optional[str] = None) -> Dict[str, str]:
+        """Return cookies as ``{name: value}`` (filtered by *url* if given)."""
+        if self._session is not None and not self._session.closed:
+            jar = self._session.cookie_jar
+            if url:
+                try:
+                    filtered = jar.filter_cookies(URL(url))
+                    return {k: m.value for k, m in filtered.items() if m.value is not None}
+                except Exception:
+                    pass
+            out: Dict[str, str] = {}
+            for cookie in jar:
+                out[cookie.key] = cookie.value
+            return out
+
+        out = dict(self._pending_cookies)
+        for item in self._pending_cookie_entries:
+            name = item.get("name")
+            if name:
+                out[str(name)] = str(item.get("value") or "")
+        return out
 
     # ------------------------------------------------------------- session
+
+    def _effective_connect_timeout(self) -> float:
+        raw = (
+            self._connect_timeout
+            if self._connect_timeout is not None
+            else getattr(_app_config, "HLS_CONNECT_TIMEOUT", _DEFAULT_CONNECT_TIMEOUT)
+        )
+        return max(3.0, float(raw))
+
+    def _effective_segment_timeout(self) -> float:
+        raw = (
+            self._segment_timeout
+            if self._segment_timeout is not None
+            else getattr(_app_config, "HLS_SEGMENT_TIMEOUT", _DEFAULT_SEGMENT_TIMEOUT)
+        )
+        return max(10.0, float(raw))
+
+    def _meta_timeout(self) -> aiohttp.ClientTimeout:
+        connect_to = self._effective_connect_timeout()
+        return aiohttp.ClientTimeout(total=45.0, sock_connect=connect_to, sock_read=30.0)
+
+    def _segment_client_timeout(self) -> aiohttp.ClientTimeout:
+        connect_to = self._effective_connect_timeout()
+        seg_to = self._effective_segment_timeout()
+        return aiohttp.ClientTimeout(
+            total=seg_to,
+            sock_connect=connect_to,
+            sock_read=min(60.0, seg_to),
+        )
+
+    def _pool_limits(self) -> Tuple[int, int]:
+        workers = int(getattr(_app_config, "HLS_SEGMENT_WORKERS", _DEFAULT_WORKERS) or _DEFAULT_WORKERS)
+        per_host = max(32, int(self._max_connections or (workers * 2)))
+        total = max(128, per_host * 2)
+        return per_host, total
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is not None and not self._session.closed:
             return self._session
 
+        per_host, total = self._pool_limits()
         connector: aiohttp.BaseConnector
         if self._proxy_url:
             try:
                 from aiohttp_socks import ProxyConnector
-                connector = ProxyConnector.from_url(
-                    self._proxy_url, limit_per_host=8, limit=64,
-                )
+                try:
+                    connector = ProxyConnector.from_url(
+                        self._proxy_url,
+                        rdns=True,
+                        limit_per_host=per_host,
+                        limit=total,
+                        ttl_dns_cache=300,
+                        keepalive_timeout=60,
+                        enable_cleanup_closed=True,
+                    )
+                except TypeError:
+                    connector = ProxyConnector.from_url(
+                        self._proxy_url,
+                        rdns=True,
+                        limit_per_host=per_host,
+                        limit=total,
+                    )
             except ImportError:
                 print("[HLS] 'aiohttp_socks' not installed. Ignoring SOCKS5 proxy.")
-                connector = aiohttp.TCPConnector(limit_per_host=8, limit=64)
+                self._proxy_url = None
+                connector = aiohttp.TCPConnector(
+                    limit_per_host=per_host,
+                    limit=total,
+                    ttl_dns_cache=300,
+                    keepalive_timeout=60,
+                    enable_cleanup_closed=True,
+                )
         else:
-            connector = aiohttp.TCPConnector(limit_per_host=8, limit=64)
+            connector = aiohttp.TCPConnector(
+                limit_per_host=per_host,
+                limit=total,
+                ttl_dns_cache=300,
+                keepalive_timeout=60,
+                enable_cleanup_closed=True,
+            )
 
-        self._session = aiohttp.ClientSession(
-            headers=self.headers or {"User-Agent": _USER_AGENT},
-            connector=connector,
-            read_bufsize=1024 * 1024,
-        )
+        jar = aiohttp.CookieJar(unsafe=True)
+        self._apply_pending_cookies(jar)
+
+        try:
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                cookie_jar=jar,
+                read_bufsize=2 * 1024 * 1024,
+                trust_env=False,
+            )
+        except Exception:
+            await connector.close()
+            raise
         return self._session
+
+    async def switch_to_direct(self) -> None:
+        """Drop the configured proxy and reconnect directly (keeping cookies)."""
+        if self._session is not None and not self._session.closed:
+            self._pending_cookies.update(self.export_cookies())
+            await self._session.close()
+        self._session = None
+        self._proxy_url = None
 
     async def close(self) -> None:
         """Close the underlying session (safe to call more than once)."""
@@ -273,45 +652,264 @@ class HlsClient:
         """The proxy this client (and therefore every fetch) uses."""
         return self._proxy_url
 
+    @property
+    def user_agent(self) -> str:
+        """The active User-Agent string sent by this client."""
+        for k, v in self.headers.items():
+            if k.lower() == "user-agent" and v:
+                return v
+        return DEFAULT_USER_AGENT
+
+    def _merged_headers(
+        self, extra: Optional[Dict[str, Optional[str]]] = None
+    ) -> Dict[str, str]:
+        merged: Dict[str, str] = {}
+        key_map: Dict[str, str] = {}
+        for k, v in self.headers.items():
+            if k and v is not None:
+                low = k.lower()
+                key_map[low] = k
+                merged[k] = v
+        if extra:
+            for k, v in extra.items():
+                if not k:
+                    continue
+                low = k.lower()
+                if low in key_map:
+                    merged.pop(key_map[low], None)
+                if v is not None:
+                    key_map[low] = k
+                    merged[k] = v
+        return merged
+
+    def _raise_if_proxy_error(self, exc: BaseException) -> None:
+        if self._proxy_url and _is_proxy_exception(exc):
+            raise HlsProxyError(self._proxy_url, exc) from exc
+
+    @staticmethod
+    def _raise_for_status(resp: aiohttp.ClientResponse, url: str) -> None:
+        if resp.status >= 400:
+            retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+            raise HlsHttpError(
+                resp.status,
+                str(resp.url or url),
+                retry_after=retry_after,
+            )
+
     # ------------------------------------------------------------ fetching
 
-    async def fetch_text(self, url: str) -> str:
+    async def fetch_text_with_url(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Tuple[str, str]:
+        """Fetch a playlist document and return ``(text, final_url)``."""
+        session = await self._get_session()
+        req_headers = self._merged_headers(headers)
+        try:
+            async with session.get(
+                url,
+                headers=req_headers,
+                timeout=self._meta_timeout(),
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                self._raise_for_status(resp, url)
+                body = await resp.read()
+                final_url = str(resp.url or url)
+                return decode_text(body, resp.get_encoding()), final_url
+        except HlsHttpError:
+            raise
+        except Exception as exc:
+            self._raise_if_proxy_error(exc)
+            raise
+
+    async def fetch_text(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, Optional[str]]] = None,
+    ) -> str:
         """Fetch a playlist document and return it as text.
 
-        Decoding is deliberately lenient (see :func:`decode_text`): a body whose
-        charset is mis-declared must not surface as an exception, because that
-        would hide the real reason a candidate was rejected — and would discard
-        a manifest that happens to live in such a body.
+        Decoding is deliberately lenient (see :func:`decode_text`).
         """
-        session = await self._get_session()
-        async with session.get(
-            url, timeout=_TIMEOUT, allow_redirects=True, ssl=False,
-        ) as resp:
-            if resp.status >= 400:
-                raise ValueError(f"HTTP {resp.status} for {url}")
-            return decode_text(await resp.read(), resp.get_encoding())
+        text, _ = await self.fetch_text_with_url(url, headers=headers)
+        return text
+
+    async def _read_segment_response(
+        self,
+        resp: aiohttp.ClientResponse,
+        url: str,
+        byte_range: Optional[Tuple[int, int]],
+        on_piece: Callable[[bytes], Any],
+    ) -> int:
+        expected: Optional[int] = None
+        offset = 0
+        if byte_range is not None:
+            offset, expected = int(byte_range[0]), int(byte_range[1])
+
+        total_written = 0
+        if (
+            byte_range is not None
+            and resp.status == 200
+            and not resp.headers.get("Content-Range")
+            and not (
+                offset == 0
+                and resp.content_length is not None
+                and resp.content_length == expected
+            )
+        ):
+            # Server ignored Range: and returned the full object starting at 0.
+            if offset > _MAX_IGNORED_RANGE_SKIP:
+                raise ValueError(
+                    f"Server ignored Range header (200 OK) at offset {offset} for {redact_url(url)}"
+                )
+            end = offset + (expected or 0)
+            pos = 0
+            async for chunk in resp.content.iter_chunked(_CHUNK_READ_SIZE):
+                if not chunk:
+                    continue
+                chunk_end = pos + len(chunk)
+                if chunk_end > offset and pos < end:
+                    start_idx = max(0, offset - pos)
+                    stop_idx = min(len(chunk), end - pos)
+                    piece = chunk[start_idx:stop_idx]
+                    if piece:
+                        res = on_piece(piece)
+                        if asyncio.iscoroutine(res):
+                            await res
+                        total_written += len(piece)
+                pos = chunk_end
+                if pos >= end:
+                    break
+        else:
+            async for chunk in resp.content.iter_chunked(_CHUNK_READ_SIZE):
+                if not chunk:
+                    continue
+                res = on_piece(chunk)
+                if asyncio.iscoroutine(res):
+                    await res
+                total_written += len(chunk)
+
+        if expected is not None:
+            if total_written != expected:
+                raise ValueError(
+                    f"Byte-range segment truncated: got {total_written} of {expected} "
+                    f"bytes for {redact_url(url)}"
+                )
+        else:
+            if total_written == 0:
+                raise ValueError(f"Empty response (0 bytes) for {redact_url(url)}")
+            cl = resp.content_length
+            if (
+                cl is not None
+                and cl > 0
+                and not resp.headers.get("Content-Encoding")
+                and total_written < cl
+            ):
+                raise ValueError(
+                    f"Segment truncated: got {total_written} of {cl} bytes for {redact_url(url)}"
+                )
+        return total_written
 
     async def fetch_bytes(
-        self, url: str, byte_range: Optional[tuple] = None
+        self,
+        url: str,
+        byte_range: Optional[Tuple[int, int]] = None,
+        on_chunk: Optional[Callable[[int], None]] = None,
+        *,
+        headers: Optional[Dict[str, Optional[str]]] = None,
     ) -> bytes:
-        """Fetch small binary data (AES-128 key files, fMP4 init segments)."""
+        """Fetch binary data (AES-128 key files, init segments, or media chunks)."""
         session = await self._get_session()
-        headers: Dict[str, str] = {}
+        extra: Dict[str, Optional[str]] = dict(headers or {})
         if byte_range is not None:
-            offset, length = byte_range
-            headers["Range"] = f"bytes={offset}-{offset + length - 1}"
-        async with session.get(
-            url, headers=headers, timeout=_TIMEOUT, allow_redirects=True, ssl=False,
-        ) as resp:
-            if resp.status >= 400:
-                raise ValueError(f"HTTP {resp.status} for {url}")
-            return await resp.read()
+            offset, length = int(byte_range[0]), int(byte_range[1])
+            extra["Range"] = f"bytes={offset}-{offset + length - 1}"
+        req_headers = self._merged_headers(extra)
 
+        try:
+            async with session.get(
+                url,
+                headers=req_headers,
+                timeout=self._meta_timeout() if byte_range is None and on_chunk is None else self._segment_client_timeout(),
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                self._raise_for_status(resp, url)
+                if byte_range is None and on_chunk is None:
+                    return await resp.read()
+                buf = bytearray()
 
-    async def fetch_page_text(
-        self, url: str, max_bytes: int = 4 * 1024 * 1024
-    ) -> Optional[str]:
-        """Fetch an HTML/JSON *page* for manifest extraction.
+                def _collect(piece: bytes) -> None:
+                    buf.extend(piece)
+                    if on_chunk is not None:
+                        try:
+                            on_chunk(len(piece))
+                        except Exception as e:
+                            print(f"[HLS] progress callback failed: {e}")
+
+                await self._read_segment_response(resp, url, byte_range, _collect)
+                return bytes(buf)
+        except (HlsHttpError, HlsProxyError):
+            raise
+        except Exception as exc:
+            self._raise_if_proxy_error(exc)
+            raise
+
+    async def download_bytes(
+        self,
+        url: str,
+        byte_range: Optional[Tuple[int, int]] = None,
+        on_chunk: Optional[Callable[[int], None]] = None,
+        *,
+        headers: Optional[Dict[str, Optional[str]]] = None,
+    ) -> bytes:
+        """Stream a segment into memory with Range/truncation checks & progress."""
+        session = await self._get_session()
+        extra: Dict[str, Optional[str]] = dict(headers or {})
+        if byte_range is not None:
+            offset, length = int(byte_range[0]), int(byte_range[1])
+            extra["Range"] = f"bytes={offset}-{offset + length - 1}"
+        req_headers = self._merged_headers(extra)
+
+        try:
+            async with session.get(
+                url,
+                headers=req_headers,
+                timeout=self._segment_client_timeout(),
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                self._raise_for_status(resp, url)
+                buf = bytearray()
+
+                def _collect(piece: bytes) -> None:
+                    buf.extend(piece)
+                    if on_chunk is not None:
+                        try:
+                            on_chunk(len(piece))
+                        except Exception as e:
+                            print(f"[HLS] progress callback failed: {e}")
+
+                await self._read_segment_response(resp, url, byte_range, _collect)
+                return bytes(buf)
+        except (HlsHttpError, HlsProxyError):
+            raise
+        except Exception as exc:
+            self._raise_if_proxy_error(exc)
+            raise
+
+    async def fetch_page(
+        self,
+        url: str,
+        max_bytes: int = 4 * 1024 * 1024,
+        *,
+        headers: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Optional[Tuple[str, str]]:
+        """Fetch an HTML/JSON *page* and return ``(text, final_url)`` or ``None``.
 
         Returns ``None`` — instead of raising — for anything that is not a page
         (a file download, an image, a playlist), so the caller can simply step
@@ -319,74 +917,89 @@ class HlsClient:
         up to *max_bytes*, so a huge page can never stall a job.
         """
         session = await self._get_session()
-        async with session.get(
-            url, headers=_PAGE_HEADERS, timeout=_TIMEOUT,
-            allow_redirects=True, ssl=False,
-        ) as resp:
-            if resp.status >= 400:
-                raise ValueError(f"HTTP {resp.status} for {url.split('?', 1)[0]}")
-            if "attachment" in (resp.headers.get("Content-Disposition") or "").lower():
-                return None
-            ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-            if ctype and not (
-                ctype.startswith("text/")
-                or ctype in _PAGE_CONTENT_TYPES
-                or ctype.endswith(("+json", "+xml"))
-            ):
-                return None
+        extra: Dict[str, Optional[str]] = dict(_PAGE_HEADERS)
+        if headers:
+            extra.update(headers)
+        req_headers = self._merged_headers(extra)
+        try:
+            async with session.get(
+                url,
+                headers=req_headers,
+                timeout=self._meta_timeout(),
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                self._raise_for_status(resp, url)
+                if "attachment" in (resp.headers.get("Content-Disposition") or "").lower():
+                    return None
+                ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                if ctype and not (
+                    ctype.startswith("text/")
+                    or ctype in _PAGE_CONTENT_TYPES
+                    or ctype.endswith(("+json", "+xml"))
+                ):
+                    return None
 
-            body = bytearray()
-            async for chunk in resp.content.iter_chunked(64 * 1024):
-                body.extend(chunk)
-                if len(body) >= max_bytes:
-                    break
-            # Lenient decoding on purpose: plenty of player pages announce utf-8
-            # and then serve a stray cp1252 byte, which must not cost us the
-            # manifests the rest of the document contains.
-            return decode_text(bytes(body), resp.get_encoding())
+                body = bytearray()
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    body.extend(chunk)
+                    if len(body) >= max_bytes:
+                        break
+                final_url = str(resp.url or url)
+                return decode_text(bytes(body), resp.get_encoding()), final_url
+        except HlsHttpError:
+            raise
+        except Exception as exc:
+            self._raise_if_proxy_error(exc)
+            raise
+
+    async def fetch_page_text(
+        self,
+        url: str,
+        max_bytes: int = 4 * 1024 * 1024,
+        *,
+        headers: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Optional[str]:
+        """Fetch an HTML/JSON *page* for manifest extraction (text only)."""
+        res = await self.fetch_page(url, max_bytes=max_bytes, headers=headers)
+        return res[0] if res is not None else None
 
     async def download_to(
         self,
         url: str,
         path: str,
         on_chunk: Optional[Callable[[int], None]] = None,
-        byte_range: Optional[tuple] = None,
+        byte_range: Optional[Tuple[int, int]] = None,
+        *,
+        headers: Optional[Dict[str, Optional[str]]] = None,
     ) -> int:
         """Download *url* to *path*, returning the number of bytes written.
 
         Bytes are buffered and flushed through an executor so the event loop is
         never blocked by disk I/O. ``on_chunk(n)`` fires for every flushed chunk
         so the caller can drive a progress bar.
-
-        The target file is recreated on every call, so a retry always starts from
-        a clean file.
         """
         session = await self._get_session()
         loop = asyncio.get_running_loop()
 
-        headers: Dict[str, str] = {}
-        expected: Optional[int] = None
+        extra: Dict[str, Optional[str]] = dict(headers or {})
         if byte_range is not None:
-            offset, length = byte_range
-            headers["Range"] = f"bytes={offset}-{offset + length - 1}"
-            expected = length
-
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except OSError:
-            pass
+            offset, length = int(byte_range[0]), int(byte_range[1])
+            extra["Range"] = f"bytes={offset}-{offset + length - 1}"
+        req_headers = self._merged_headers(extra)
 
         written = 0
+        has_flushed = False
         buf = bytearray()
 
         async def _flush() -> None:
-            nonlocal written
+            nonlocal written, has_flushed
             if not buf:
                 return
             data = bytes(buf)
             buf.clear()
-            await loop.run_in_executor(None, _append_bytes, path, data)
+            await loop.run_in_executor(None, _write_bytes, path, data, has_flushed)
+            has_flushed = True
             written += len(data)
             if on_chunk is not None:
                 try:
@@ -394,32 +1007,33 @@ class HlsClient:
                 except Exception as e:
                     print(f"[HLS] progress callback failed: {e}")
 
-        async with session.get(
-            url,
-            headers=headers,
-            timeout=_SEGMENT_TIMEOUT,
-            allow_redirects=True,
-            ssl=False,
-        ) as resp:
-            if resp.status >= 400:
-                raise ValueError(f"HTTP {resp.status} for {url}")
-            async for chunk in resp.content.iter_chunked(1024 * 1024):
-                if not chunk:
-                    continue
-                buf.extend(chunk)
-                if len(buf) >= _FLUSH_THRESHOLD:
-                    await _flush()
-            await _flush()
+        async def _on_piece(piece: bytes) -> None:
+            buf.extend(piece)
+            if len(buf) >= _FLUSH_THRESHOLD:
+                await _flush()
 
-        if expected is not None and written != expected:
-            # A truncated byte-range segment would corrupt the mux (and break AES
-            # decryption), so treat it as a hard failure and let the downloader
-            # retry it instead of shipping a broken MP4.
-            raise ValueError(
-                f"Byte-range segment truncated: got {written} of {expected} "
-                f"bytes for {url}"
-            )
-        return written
+        try:
+            async with session.get(
+                url,
+                headers=req_headers,
+                timeout=self._segment_client_timeout(),
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                self._raise_for_status(resp, url)
+                await self._read_segment_response(resp, url, byte_range, _on_piece)
+                await _flush()
+            return written
+        except Exception as exc:
+            if has_flushed and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if isinstance(exc, (HlsHttpError, HlsProxyError)):
+                raise
+            self._raise_if_proxy_error(exc)
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -443,26 +1057,44 @@ if __name__ == "__main__":
     _check("Referer derived from origin",
            hdrs.get("Referer") == "https://cdn.example.com/", str(hdrs))
     _check("UA present", "Mozilla" in hdrs.get("User-Agent", ""), str(hdrs))
-    args = ffmpeg_header_args(hdrs)
+    hdrs_ref = default_headers(
+        "https://cdn.example.com/hls/master.m3u8",
+        referer="https://player.example.com/embed/1",
+    )
+    _check("Origin derived from explicit referer",
+           hdrs_ref.get("Origin") == "https://player.example.com"
+           and hdrs_ref.get("Referer") == "https://player.example.com/embed/1",
+           str(hdrs_ref))
+    args = ffmpeg_header_args(hdrs, cookies={"cf_bm": "tok123"})
     _check("-user_agent emitted", "-user_agent" in args, str(args))
     _check("-headers block CRLF terminated",
            args[args.index("-headers") + 1].endswith("\r\n"), str(args))
     _check("UA not duplicated into -headers",
            "User-Agent" not in args[args.index("-headers") + 1], str(args))
+    _check("Cookie merged into -headers",
+           "Cookie: cf_bm=tok123\r\n" in args[args.index("-headers") + 1], str(args))
     _check("page fetch asks for HTML",
            _PAGE_HEADERS["Accept"].startswith("text/html"), str(_PAGE_HEADERS))
 
-    print("--- proxy ---")
+    print("--- proxy & errors ---")
     _check("socks5 detected", is_socks_proxy("socks5://u:p@h:1080"))
     _check("socks5 -> no ffmpeg args", ffmpeg_proxy_args("socks5://u:p@h:1080") == [])
     _check("http -> ffmpeg args",
            ffmpeg_proxy_args("http://h:8080") == ["-http_proxy", "http://h:8080"])
     _check("no proxy -> no args", ffmpeg_proxy_args(None) == [])
+    err_403 = HlsHttpError(403, "https://cdn.example.com/x.ts?token=secret", retry_after=5.0)
+    _check("HlsHttpError subclasses ValueError & redacts query",
+           isinstance(err_403, ValueError)
+           and err_403.is_permanent
+           and err_403.retry_after == 5.0
+           and "secret" not in str(err_403),
+           str(err_403))
+    perr = HlsProxyError("socks5://user:secretpass@127.0.0.1:1080", RuntimeError("down"))
+    _check("HlsProxyError redacts proxy credentials",
+           isinstance(perr, ValueError) and "secretpass" not in str(perr),
+           str(perr))
 
     print("--- lenient decoding (production: 'Candidate rejected' on a good page) ---")
-    # A body that announces utf-8 but is really cp1252 used to raise
-    # UnicodeDecodeError out of resp.text(), which the page scan reported as
-    # "Candidate rejected" — losing the manifest that was inside it.
     playlist_bytes = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n# caf\xe9\nv.m3u8\n"
     _check("no declared charset + cp1252 byte -> decoded",
            is_hls_playlist(decode_text(playlist_bytes)), repr(decode_text(playlist_bytes)))
@@ -472,8 +1104,6 @@ if __name__ == "__main__":
            is_hls_playlist(decode_text(playlist_bytes, "not-a-real-charset")))
     _check("pure ASCII unchanged",
            decode_text(b"#EXTM3U\n") == "#EXTM3U\n", repr(decode_text(b"#EXTM3U\n")))
-    # Binary bytes must come back as *some* string (and simply not look like a
-    # playlist) instead of blowing up the caller.
     binary_body = bytes(range(256))
     _check("binary body survives decoding",
            not is_hls_playlist(decode_text(binary_body, "utf-8")),
@@ -483,4 +1113,3 @@ if __name__ == "__main__":
     for name in failures:
         print(f"    FAILED: {name}")
     sys.exit(1 if failures else 0)
-

@@ -10,16 +10,19 @@ device/GPU fingerprinting and bot detection (``openfpcdn.io/botd``). No amount o
 regex, header or proxy work can reach that URL — something has to *run* the page.
 
 So this module launches Playwright's Chromium, opens the page, and returns the
-first HLS manifest the page asks for:
+first HLS manifest the page asks for along with the browser's effective
+User-Agent, Referer, Origin, custom request headers, frame/final page URL, and
+cookies so downstream segment downloads match the exact browser session:
 
-* **Network capture** — every request Playwright reports is checked for an
-  ``.m3u8``; the first hit wins and the page is closed immediately (we do not
-  wait for playback, and no video data is downloaded).
-* **JS tap** (fallback) — an init script wraps ``jwplayer``, ``fetch`` and
-  ``XMLHttpRequest``, so a URL that is *built* but never requested (autoplay
-  blocked, player paused) is still recovered.
-* **Ad/weight blocking** — images, fonts, stylesheets and known ad hosts are
-  aborted to keep the scan fast and cheap; the document, scripts and XHR pass.
+* **Network capture** — requests and responses are watched for ``.m3u8`` (or
+  ``mpegurl`` content types); a successful ``<400`` manifest response wins
+  immediately, while ad/blocked requests are ignored.
+* **JS tap** (fallback) — an init script wraps ``jwplayer``, ``Hls.prototype``,
+  ``HTMLMediaElement.prototype.src``, ``fetch`` and ``XMLHttpRequest`` across all
+  frames, so a URL that is *built* but never requested is still recovered.
+* **Ad/weight blocking** — images, fonts, non-manifest media and known ad hosts
+  are aborted to keep the scan fast and cheap; stylesheets, scripts and XHR
+  pass so layout-checking players still initialize.
 
 The browser is a module-level singleton: one Chromium process, one isolated
 context per job, serialised by a lock (``HLS_BROWSER_MAX_CONCURRENCY``), and
@@ -46,8 +49,8 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from app.config import (
@@ -57,7 +60,7 @@ from app.config import (
     HLS_BROWSER_PROXY,
     HLS_BROWSER_TIMEOUT,
 )
-from app.hls.client import read_proxy_url
+from app.hls.client import DEFAULT_USER_AGENT, default_headers, read_proxy_url
 
 #: Chromium switches that make it survive on a small headless VPS.
 _LAUNCH_ARGS = (
@@ -73,10 +76,13 @@ _LAUNCH_ARGS = (
     "--disable-renderer-backgrounding",
     "--disable-features=Translate,MediaRouter,OptimizationHints",
     "--autoplay-policy=no-user-gesture-required",
+    "--disable-blink-features=AutomationControlled",
 )
 
 #: Resource types that can never carry the manifest and only cost time.
-_BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
+#: Keep stylesheets unblocked so players checking layout/offsetWidth still boot.
+#: Non-manifest media is aborted in _block_heavy, while manifest media passes.
+_BLOCKED_RESOURCE_TYPES = {"image", "font"}
 
 #: Ad/tracker hosts that are aborted by default (the page's own player never
 #: lives on them, and they are the main reason these pages are slow).
@@ -87,18 +93,11 @@ _BLOCKED_HOST_PARTS = (
     "facebook.net", "criteo", "taboola", "outbrain", "openfpcdn",
 )
 
+_AD_PATH_MARKERS = ("/vast", "preroll", "/ads/", "adserver")
+
 #: Bot root (two levels above ``<bot>/app/hls/browser.py``).
 _BOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-#: Chromium caches to fall back on when the default one is out of reach.
-#:
-#: The systemd unit hardens the service with ``ProtectHome=true`` (see
-#: deploy/install.sh), which makes ``/home`` *empty* for the bot process. A
-#: Chromium installed in ``/home/botuser/.cache/ms-playwright`` therefore works
-#: perfectly from a shell and is still invisible to the bot, which reports
-#: "Chromium is not downloaded" forever. Keeping the browser in the bot
-#: directory (``<bot>/ms-playwright``, writable via ``ReadWritePaths``) is what
-#: the installer does, and these are the places this module looks for it.
 _CACHE_CANDIDATES = (
     os.path.join(_BOT_DIR, "ms-playwright"),
     "/opt/telegram-forwarder-bot/ms-playwright",
@@ -116,12 +115,7 @@ def _has_browser(path: str) -> bool:
 
 
 def _home_masked() -> bool:
-    """True when this process cannot see its own home directory.
-
-    That is the signature of ``ProtectHome=true``: ``$HOME`` still points at
-    ``/home/<user>`` but the path is not there. Worth naming in the log, because
-    it looks identical to "the browser was never downloaded".
-    """
+    """True when this process cannot see its own home directory."""
     for home in (os.environ.get("HOME"), os.path.expanduser("~")):
         if home and home.startswith(("/home/", "/root")) and not os.path.isdir(home):
             return True
@@ -129,13 +123,7 @@ def _home_masked() -> bool:
 
 
 def _resolve_browser_cache() -> None:
-    """Point Playwright at a Chromium it can actually reach.
-
-    ``PLAYWRIGHT_BROWSERS_PATH`` wins when set (the systemd unit sets it), then
-    the legacy ``~/.cache/ms-playwright`` is kept if it is visible and populated,
-    then the candidates above. Must run **before** the driver starts: that
-    variable is read by the driver process, not by the Python API.
-    """
+    """Point Playwright at a Chromium it can actually reach."""
     if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
         return
     if _has_browser(os.path.expanduser("~/.cache/ms-playwright")):
@@ -148,12 +136,7 @@ def _resolve_browser_cache() -> None:
 
 
 def browser_available() -> bool:
-    """True when the ``playwright`` package is importable.
-
-    The Chromium download is checked at launch time (Playwright reports a clear
-    "Executable doesn't exist" error, which :func:`resolve_stream_with_browser`
-    turns into an actionable log line), so this stays a cheap, cached check.
-    """
+    """True when the ``playwright`` package is importable."""
     global _AVAILABLE
     if _AVAILABLE is None:
         _AVAILABLE = importlib.util.find_spec("playwright") is not None
@@ -181,12 +164,16 @@ class BrowserScan:
     reason: str = ""
     #: Free-text detail for the log line.
     detail: str = ""
-    #: Requests the page made while we watched (a rough "the page really
-    #: loaded" signal, and useful when a scan fails).
+    #: Requests the page made while we watched.
     requests: int = 0
-    #: True when Chromium itself went through the configured proxy. The caller
-    #: uses this to keep the download on the same egress as the page.
+    #: True when Chromium itself went through the configured proxy.
     used_proxy: bool = False
+    #: Effective page/frame URL (after redirects or inside embed iframe).
+    page_url: str = ""
+    #: Captured request headers (User-Agent, Referer, Origin, auth headers).
+    headers: Dict[str, str] = field(default_factory=dict)
+    #: Browser cookies captured for the manifest/page context.
+    cookies: Dict[str, str] = field(default_factory=dict)
 
 
 def _looks_like_manifest(url: str) -> bool:
@@ -204,6 +191,14 @@ def _is_blocked_url(url: str) -> bool:
         return True
     return any(part in host for part in _BLOCKED_HOST_PARTS)
 
+
+def _is_ad_manifest(url: str) -> bool:
+    if _is_blocked_url(url):
+        return True
+    low = url.lower()
+    return any(marker in low for marker in _AD_PATH_MARKERS)
+
+
 #: Installed before any page script runs: records the first HLS URL the page
 #: *builds*, whether or not the request ever leaves the browser (autoplay
 #: blocked, player paused, request aborted by our own ad filter...).
@@ -211,10 +206,20 @@ _TAP_JS = r"""
 (() => {
   if (window.__hlsTapInstalled) return;
   window.__hlsTapInstalled = true;
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  } catch (e) {}
+  window.__hlsTapList = window.__hlsTapList || [];
+  const isAd = (u) => {
+    const low = String(u).toLowerCase();
+    return low.indexOf('doubleclick') !== -1 || low.indexOf('googlesyndication') !== -1
+      || low.indexOf('/vast') !== -1 || low.indexOf('preroll') !== -1;
+  };
   const note = (u) => {
     try {
-      if (typeof u === 'string' && u.indexOf('.m3u8') !== -1 && !window.__hlsTap) {
-        window.__hlsTap = u;
+      if (typeof u === 'string' && u.indexOf('.m3u8') !== -1 && !isAd(u)) {
+        if (!window.__hlsTap) window.__hlsTap = u;
+        if (window.__hlsTapList.indexOf(u) === -1) window.__hlsTapList.push(u);
       }
     } catch (e) {}
   };
@@ -235,6 +240,17 @@ _TAP_JS = r"""
       return of.apply(this, arguments);
     };
   }
+  try {
+    const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+    if (desc && desc.set) {
+      Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: desc.get,
+        set(v) { note(v); return desc.set.call(this, v); },
+      });
+    }
+  } catch (e) {}
   let jw = window.jwplayer;
   const wrapSetup = (obj) => {
     try {
@@ -259,16 +275,23 @@ _TAP_JS = r"""
   } catch (e) {}
   try {
     let H = window.Hls;
+    const hookHls = (v) => {
+      if (v && v.prototype && typeof v.prototype.loadSource === 'function' && !v.prototype.__hlsTapped) {
+        const orig = v.prototype.loadSource;
+        v.prototype.loadSource = function (u) { note(u); return orig.apply(this, arguments); };
+        v.prototype.__hlsTapped = true;
+      }
+      if (typeof v === 'function' && typeof v.loadSource === 'function' && !v.__hlsTapped) {
+        const OL = v.loadSource;
+        v.loadSource = function (u) { note(u); return OL.apply(this, arguments); };
+        v.__hlsTapped = true;
+      }
+    };
+    if (H) hookHls(H);
     Object.defineProperty(window, 'Hls', {
       configurable: true,
       get() { return H; },
-      set(v) {
-        if (typeof v === 'function' && typeof v.loadSource === 'function') {
-          const OL = v.loadSource;
-          v.loadSource = function (u) { note(u); return OL.apply(this, arguments); };
-        }
-        H = v;
-      },
+      set(v) { hookHls(v); H = v; },
     });
   } catch (e) {}
 })();
@@ -396,9 +419,15 @@ async def close_browser() -> None:
 
 
 async def _block_heavy(route, request) -> None:
-    """Abort ads, images, fonts and stylesheets; let everything else through."""
+    """Abort ads, images, fonts and non-manifest media; let player assets pass."""
     try:
-        if request.resource_type in _BLOCKED_RESOURCE_TYPES or _is_blocked_url(request.url):
+        rtype = request.resource_type
+        url = request.url
+        if _is_blocked_url(url):
+            await route.abort()
+        elif rtype in _BLOCKED_RESOURCE_TYPES:
+            await route.abort()
+        elif rtype == "media" and not _looks_like_manifest(url):
             await route.abort()
         else:
             await route.continue_()
@@ -409,31 +438,137 @@ async def _block_heavy(route, request) -> None:
             pass
 
 
-async def _read_tap(page) -> str:
-    """Read the URL the page's JS built but never requested."""
+async def _read_tap(page) -> Tuple[str, str]:
+    """Read any tapped or DOM-attached manifest URL across all page frames."""
     try:
-        value = await page.evaluate("() => window.__hlsTap || ''")
+        frames = list(page.frames)
     except Exception:
-        return ""
-    return value if isinstance(value, str) else ""
+        frames = [page]
+    if page.main_frame not in frames:
+        frames.insert(0, page.main_frame)
+
+    for frame in frames:
+        try:
+            value = await frame.evaluate(
+                """() => {
+                  if (window.__hlsTap) return window.__hlsTap;
+                  if (Array.isArray(window.__hlsTapList) && window.__hlsTapList.length) {
+                    return window.__hlsTapList[0];
+                  }
+                  const els = document.querySelectorAll('video, source');
+                  for (const el of els) {
+                    const src = el.getAttribute('src') || el.currentSrc || el.src || '';
+                    if (src && src.indexOf('.m3u8') !== -1) return src;
+                  }
+                  return '';
+                }"""
+            )
+            if isinstance(value, str) and value:
+                f_url = ""
+                try:
+                    f_url = frame.url or ""
+                except Exception:
+                    f_url = ""
+                return value, f_url
+        except Exception:
+            continue
+    return "", ""
+
+
+async def _try_wake_player(page) -> None:
+    """Best-effort click on common player overlays for click-to-play embeds."""
+    selectors = (
+        ".jw-icon-display",
+        ".vjs-big-play-button",
+        ".plyr__control--overlaid",
+        "video",
+    )
+    try:
+        frames = list(page.frames)
+    except Exception:
+        frames = [page]
+    for frame in frames:
+        for sel in selectors:
+            try:
+                el = await frame.query_selector(sel)
+                if el is not None and await el.is_visible():
+                    await el.click(timeout=300, no_wait_after=True)
+                    return
+            except Exception:
+                continue
+
+
+async def _extract_request_headers(req, effective_page_url: str) -> Dict[str, str]:
+    raw: Dict[str, str] = {}
+    try:
+        raw = await req.all_headers()
+    except Exception:
+        try:
+            raw = dict(req.headers or {})
+        except Exception:
+            raw = {}
+
+    out: Dict[str, str] = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    for k, v in raw.items():
+        if not k or not v:
+            continue
+        low = k.lower()
+        if low == "user-agent":
+            out["User-Agent"] = v
+        elif low == "referer":
+            out["Referer"] = v
+        elif low == "origin":
+            out["Origin"] = v
+        elif low == "authorization":
+            out["Authorization"] = v
+        elif low.startswith("x-") and low not in ("x-client-data", "x-requested-with"):
+            out[k] = v
+
+    if "Referer" not in out and effective_page_url:
+        out["Referer"] = effective_page_url
+    if "Origin" not in out and out.get("Referer"):
+        parsed = urlparse(out["Referer"])
+        if parsed.scheme and parsed.netloc:
+            out["Origin"] = f"{parsed.scheme}://{parsed.netloc}"
+    return out
+
+
+async def _extract_cookies(context, manifest_url: str, page_url: str) -> Dict[str, str]:
+    cookies: Dict[str, str] = {}
+    if manifest_url and manifest_url.startswith(("http://", "https://")):
+        try:
+            m_items = await context.cookies([manifest_url])
+            for item in m_items or []:
+                name = item.get("name")
+                val = item.get("value")
+                if name and val is not None:
+                    cookies[str(name)] = str(val)
+        except Exception:
+            pass
+    if not cookies and page_url and page_url.startswith(("http://", "https://")):
+        try:
+            mp = urlparse(manifest_url)
+            pp = urlparse(page_url)
+            mhost = (mp.hostname or "").lower()
+            phost = (pp.hostname or "").lower()
+            if mhost and phost and mhost.split(".")[-2:] == phost.split(".")[-2:]:
+                p_items = await context.cookies([page_url])
+                for item in p_items or []:
+                    name = item.get("name")
+                    val = item.get("value")
+                    if name and val is not None:
+                        cookies[str(name)] = str(val)
+        except Exception:
+            pass
+    return cookies
 
 
 def _install_hint() -> str:
-    """The exact commands that install Chromium for the account running the bot.
-
-    The browser goes *outside* ``/home``: the systemd unit uses
-    ``ProtectHome=true``, which makes ``/home`` empty for the bot, so a Chromium
-    there is unreachable for the service. ``<bot>/ms-playwright`` is already
-    writable for the service (``ReadWritePaths``), and the unit advertises it via
-    ``PLAYWRIGHT_BROWSERS_PATH``.
-
-    ``sudo -u <user>`` on its own is NOT enough either: sudo keeps the *invoking*
-    user's ``HOME`` unless ``-H`` is given, so the browser would be downloaded
-    into the wrong user's cache. Hence ``-H`` plus an explicit
-    ``PLAYWRIGHT_BROWSERS_PATH``. The system libraries are a separate, root-only
-    step (``--with-deps`` would call sudo from inside this account, where there
-    is no password to give).
-    """
+    """The exact commands that install Chromium for the account running the bot."""
     cache = os.path.join(_BOT_DIR, "ms-playwright")
     try:
         import pwd
@@ -450,28 +585,13 @@ def _install_hint() -> str:
     )
 
 
-#: Playwright's launch error names the executable it wanted: "Executable doesn't
-#: exist at <path>". We quote that path back so the log says where it looked.
 _MISSING_EXE = re.compile(r"Executable doesn't exist at (.+)", re.MULTILINE)
 
 
 def _describe_cache(wanted: str) -> str:
-    """One log line: the build Playwright wants vs. what the cache holds.
-
-    "Chromium is not downloaded" covers two very different situations, and only
-    one of them needs a download:
-
-    * nothing is in the cache at all - the download never completed, and
-    * the cache holds an *older* ``chromium-<rev>`` because the ``playwright``
-      package was upgraded afterwards. Playwright only launches the build
-      matching its own version, so a 450 MB browser sits there unusable while the
-      bot reports it as missing. Re-running the download is the fix.
-
-    Printing both makes that visible instead of costing another round trip.
-    """
+    """One log line: the build Playwright wants vs. what the cache holds."""
     if not wanted:
         return "      cache contains:   (unknown - Playwright did not name a path)"
-    # <cache>/chromium-<rev>/<platform dir>/<executable>
     build = os.path.basename(os.path.dirname(os.path.dirname(wanted)))
     cache = os.path.dirname(os.path.dirname(os.path.dirname(wanted)))
     if not os.path.isdir(cache):
@@ -516,8 +636,6 @@ def _log_launch_failure(err: Exception) -> None:
             _HINT_LOGGED = True
             match = _MISSING_EXE.search(message)
             wanted = (match.group(1).strip() if match else "")
-            # Report the cache Playwright actually used (it also honours
-            # PLAYWRIGHT_BROWSERS_PATH); fall back to the Linux default.
             cache = (
                 os.path.dirname(os.path.dirname(os.path.dirname(wanted)))
                 if wanted else os.path.expanduser("~/.cache/ms-playwright")
@@ -571,10 +689,15 @@ async def resolve_stream_with_browser(
                 return BrowserScan(reason="no-browser", detail=f"{type(e).__name__}: {e}")
 
             loop = asyncio.get_running_loop()
-            first_hit: asyncio.Future = loop.create_future()
+            verified_hit: asyncio.Future = loop.create_future()
+            fallback_req: Any = None
+            fallback_url: str = ""
+            fallback_seen_at: float = 0.0
+            failed_urls: set[str] = set()
 
             try:
                 context = await browser.new_context(
+                    user_agent=DEFAULT_USER_AGENT,
                     viewport={"width": 1280, "height": 720},
                     locale="en-US",
                     ignore_https_errors=True,
@@ -583,18 +706,41 @@ async def resolve_stream_with_browser(
                 page.set_default_timeout(timeout * 1000)
 
                 def _on_request(request) -> None:
-                    nonlocal requests_seen, last_request_at
+                    nonlocal requests_seen, last_request_at, fallback_req, fallback_url, fallback_seen_at
                     requests_seen += 1
                     last_request_at = time.time()
                     try:
-                        if not first_hit.done() and _looks_like_manifest(request.url):
-                            # Playwright reports absolute URLs, but a page can
-                            # still emit a protocol-relative one.
-                            first_hit.set_result(urljoin(page_url, request.url))
+                        req_url = request.url
+                        if _is_ad_manifest(req_url):
+                            return
+                        if _looks_like_manifest(req_url) and (
+                            fallback_req is None or fallback_req.url in failed_urls
+                        ):
+                            fallback_req = request
+                            fallback_url = urljoin(page_url, req_url)
+                            fallback_seen_at = time.time()
+                    except Exception:
+                        pass
+
+                def _on_response(response) -> None:
+                    try:
+                        resp_url = response.url
+                        if _is_ad_manifest(resp_url):
+                            return
+                        ctype = (response.headers.get("content-type") or "").lower()
+                        is_manifest = _looks_like_manifest(resp_url) or ("mpegurl" in ctype)
+                        if not is_manifest:
+                            return
+                        if 200 <= response.status < 300:
+                            if not verified_hit.done():
+                                verified_hit.set_result((urljoin(page_url, resp_url), response.request))
+                        elif response.status >= 400:
+                            failed_urls.add(resp_url)
                     except Exception:
                         pass
 
                 page.on("request", _on_request)
+                page.on("response", _on_response)
                 if HLS_BROWSER_BLOCK_ADS:
                     await page.route("**/*", _block_heavy)
                 await page.add_init_script(_TAP_JS)
@@ -606,54 +752,105 @@ async def resolve_stream_with_browser(
                     )
                     loaded = True
                 except Exception as e:
-                    # A slow, partly blocked page can still have produced it.
-                    if not first_hit.done():
+                    if not verified_hit.done():
                         print(f"[HLS] Browser: page load issue ({type(e).__name__}: {e})")
 
                 url = ""
                 source = ""
-                # Wait for the manifest, but stop early once the page has loaded
-                # and its network has been quiet for a while — a page that will
-                # never ask for a playlist should not burn the whole timeout.
+                winning_req = None
+                effective_page_url = page.url or page_url
+                if not effective_page_url.startswith(("http://", "https://")):
+                    effective_page_url = page_url
+
                 quiet = max(5, min(15, timeout // 4))
                 deadline = loop.time() + timeout
+                tried_click = False
+
                 while True:
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         break
                     try:
-                        url = await asyncio.wait_for(
-                            asyncio.shield(first_hit), timeout=min(0.5, remaining),
+                        url, winning_req = await asyncio.wait_for(
+                            asyncio.shield(verified_hit), timeout=min(0.5, remaining),
                         )
                         source = "network"
                         break
                     except asyncio.TimeoutError:
                         pass
+
+                    if loaded and not tried_click and fallback_req is None:
+                        # If page has a click-to-play overlay, wake it once.
+                        if (time.time() - last_request_at) >= 1.5:
+                            tried_click = True
+                            await _try_wake_player(page)
+
+                    if (
+                        fallback_req is not None
+                        and fallback_req.url not in failed_urls
+                        and (time.time() - fallback_seen_at) >= 1.5
+                    ):
+                        url = fallback_url
+                        winning_req = fallback_req
+                        source = "network"
+                        break
+
                     if (loaded and requests_seen
                             and (time.time() - last_request_at) >= quiet):
                         break
 
+                if not url and fallback_req is not None and fallback_url:
+                    url = fallback_url
+                    winning_req = fallback_req
+                    source = "network"
+
+                headers: Dict[str, str] = {}
+                if url and winning_req is not None:
+                    try:
+                        frame_url = winning_req.frame.url if winning_req.frame else ""
+                        if frame_url and frame_url.startswith(("http://", "https://")):
+                            effective_page_url = frame_url
+                    except Exception:
+                        pass
+                    headers = await _extract_request_headers(winning_req, effective_page_url)
+
                 if not url:
-                    url = await _read_tap(page)
-                    if url:
-                        # The JS tap can hand back a page-relative path.
-                        url = urljoin(page_url, url)
-                        if not url.lower().startswith(("http://", "https://")):
-                            url = ""
-                        else:
+                    tapped_url, frame_url = await _read_tap(page)
+                    if tapped_url:
+                        base_for_tap = (
+                            frame_url
+                            if frame_url and frame_url.startswith(("http://", "https://"))
+                            else effective_page_url
+                        )
+                        tapped_url = urljoin(base_for_tap, tapped_url)
+                        if tapped_url.lower().startswith(("http://", "https://")):
+                            url = tapped_url
                             source = "player-config"
+                            effective_page_url = base_for_tap
+                            headers = default_headers(url, referer=effective_page_url)
 
                 elapsed = time.time() - started
                 if url:
+                    cookies = await _extract_cookies(context, url, effective_page_url)
                     print(f"[HLS] Browser: manifest via {source} after {elapsed:.1f}s "
                           f"({requests_seen} requests)")
                     return BrowserScan(
-                        url=url, source=source, reason="ok", requests=requests_seen,
+                        url=url,
+                        source=source,
+                        reason="ok",
+                        requests=requests_seen,
                         used_proxy=_browser_used_proxy(),
+                        page_url=effective_page_url,
+                        headers=headers,
+                        cookies=cookies,
                     )
                 print(f"[HLS] Browser: no manifest after {elapsed:.1f}s "
                       f"({requests_seen} requests)")
-                return BrowserScan(reason="no-manifest", requests=requests_seen)
+                return BrowserScan(
+                    reason="no-manifest",
+                    requests=requests_seen,
+                    page_url=effective_page_url,
+                )
             except Exception as e:
                 return BrowserScan(
                     reason="error", detail=f"{type(e).__name__}: {e}",
@@ -669,7 +866,6 @@ async def resolve_stream_with_browser(
         finally:
             _active -= 1
             _browser_last_used = time.time()
-
 
 
 # ---------------------------------------------------------------------------
@@ -726,16 +922,35 @@ if __name__ == "__main__":
       });
     </script></body></html>"""
 
+    IFRAME_HLS_PAGE = """<html><body>
+      <iframe src="/embed-player"></iframe>
+    </body></html>"""
+
+    EMBED_PLAYER_HTML = """<html><body><script>
+      window.Hls = function() {};
+      window.Hls.prototype.loadSource = function(u) { fetch(u); };
+      var h = new window.Hls();
+      h.loadSource('/cdn/iframe.m3u8?t=frm');
+    </script></body></html>"""
+
     BARE_PAGE = """<html><body><video id="v"></video><p>nothing here</p></body></html>"""
 
     async def _run_browser_checks() -> None:
         app = web.Application()
 
         async def js_page(request):
-            return web.Response(text=JS_PAGE, content_type="text/html")
+            resp = web.Response(text=JS_PAGE, content_type="text/html")
+            resp.set_cookie("br_tok", "cookie_42", path="/")
+            return resp
 
         async def tap_page(request):
             return web.Response(text=TAP_PAGE, content_type="text/html")
+
+        async def iframe_page(request):
+            return web.Response(text=IFRAME_HLS_PAGE, content_type="text/html")
+
+        async def embed_player(request):
+            return web.Response(text=EMBED_PLAYER_HTML, content_type="text/html")
 
         async def bare_page(request):
             return web.Response(text=BARE_PAGE, content_type="text/html")
@@ -750,10 +965,13 @@ if __name__ == "__main__":
 
         app.router.add_get("/js-only", js_page)
         app.router.add_get("/tap-only", tap_page)
+        app.router.add_get("/iframe-page", iframe_page)
+        app.router.add_get("/embed-player", embed_player)
         app.router.add_get("/bare", bare_page)
         app.router.add_get("/api/config", api)
         app.router.add_get("/cdn/real.m3u8", manifest)
         app.router.add_get("/cdn/tapped.m3u8", manifest)
+        app.router.add_get("/cdn/iframe.m3u8", manifest)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -768,6 +986,13 @@ if __name__ == "__main__":
                    scan.url == f"{base}/cdn/real.m3u8?t=js", f"{scan.reason} {scan.url}")
             _check("source reported as network", scan.source == "network", scan.source)
             _check("page made requests", scan.requests > 0, str(scan.requests))
+            _check("matching UA & Referer captured",
+                   scan.headers.get("User-Agent") == DEFAULT_USER_AGENT
+                   and scan.headers.get("Referer") == f"{base}/js-only",
+                   str(scan.headers))
+            _check("cookies captured from browser context",
+                   scan.cookies.get("br_tok") == "cookie_42",
+                   str(scan.cookies))
 
             scan2 = await resolve_stream_with_browser(f"{base}/tap-only", timeout=6)
             _check("URL built but never requested is tapped",
@@ -775,6 +1000,16 @@ if __name__ == "__main__":
                    f"{scan2.reason} {scan2.url}")
             _check("source reported as player-config",
                    scan2.source == "player-config", scan2.source)
+            _check("tapped scan carries headers",
+                   scan2.headers.get("Referer") == f"{base}/tap-only",
+                   str(scan2.headers))
+
+            scan_frm = await resolve_stream_with_browser(f"{base}/iframe-page", timeout=15)
+            _check("iframe Hls.prototype.loadSource manifest + frame Referer captured",
+                   scan_frm.url == f"{base}/cdn/iframe.m3u8?t=frm"
+                   and scan_frm.page_url == f"{base}/embed-player"
+                   and scan_frm.headers.get("Referer") == f"{base}/embed-player",
+                   str(scan_frm))
 
             scan3 = await resolve_stream_with_browser(f"{base}/bare", timeout=6)
             _check("page without a manifest reports no-manifest",
@@ -794,5 +1029,3 @@ if __name__ == "__main__":
     for name in failures:
         print(f"    FAILED: {name}")
     sys.exit(1 if failures else 0)
-
-    _browser_last_used = 0.0
