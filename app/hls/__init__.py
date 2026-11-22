@@ -31,3 +31,49 @@ imported (and its self-tests run) on its own:
     python -m app.hls.browser
     python -m app.hls.downloader
 """
+from __future__ import annotations
+
+from typing import Any
+
+_DOWNLOADER_EXPORTS = {
+    "HlsResult",
+    "R_DISABLED",
+    "R_DOWNLOAD_FAILED",
+    "R_DRM",
+    "R_LOW_DISK",
+    "R_NO_FFMPEG",
+    "R_NO_SEGMENTS",
+    "R_NOT_HLS",
+    "R_REMUX_FAILED",
+    "cleanup_orphaned_hls_dirs",
+    "download_hls_to_mp4",
+    "reason_message",
+}
+
+_PLAYLIST_EXPORTS = {
+    "HLS_LINK_PATTERN",
+    "MediaPlaylist",
+    "MediaSegment",
+    "Variant",
+    "is_drm",
+    "is_hls_playlist",
+    "is_master_playlist",
+    "parse_master",
+    "parse_media",
+    "rank_variants",
+    "select_audio_track",
+    "select_variant",
+}
+
+__all__ = sorted(_DOWNLOADER_EXPORTS | _PLAYLIST_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    """Lazy package exports (avoids eager submodule/pyrogram import on ``-m`` runs)."""
+    if name in _DOWNLOADER_EXPORTS:
+        from app.hls import downloader
+        return getattr(downloader, name)
+    if name in _PLAYLIST_EXPORTS:
+        from app.hls import playlist
+        return getattr(playlist, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

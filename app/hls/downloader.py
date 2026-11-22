@@ -2,30 +2,31 @@
 hls/downloader.py — HLS download + MP4 remux orchestration.
 
 Turns an m3u8/HLS URL into a local, Telegram-ready MP4 with the SAME method the
-bot already uses for MKV → MP4 (``app/utils/video_compressor.py``): ffmpeg
+bot already uses for MKV -> MP4 (``app/utils/video_compressor.py``): ffmpeg
 **stream copy** (``-c copy``) — no re-encode, no quality loss, ~0 CPU and I/O
 bound wall time, plus a cheap audio-only AAC fallback for streams whose audio
 codec MP4 cannot hold (AC-3/E-AC-3/FLAC are common on HLS).
 
 Two engines, same output recipe
 -------------------------------
-* **Engine A (segments)** — fetch the playlists, download every segment (and the
-  AES-128 key files) in parallel through the same ``proxy.txt`` SOCKS5 tunnel
-  every other download in this bot uses, rewrite a *local* playlist pointing at
-  the downloaded files, then let ffmpeg decrypt (AES-128) and remux in one pass.
-  With a separate ``#EXT-X-MEDIA`` audio group, both playlists are muxed with
-  ``-map 0:v:0 -map 1:a:0`` so the result is never silent.
-* **Engine B (ffmpeg)** — hand the remote playlist straight to ffmpeg. One
-  process, no Python parsing, but ffmpeg cannot use a SOCKS5 proxy and fetches
-  segments sequentially.
+* **Engine A (segments)** — fetch the playlists (preserving post-redirect base
+  URLs and variant fallbacks), download keys, fMP4 init sections, video segments
+  and separate audio segments concurrently with an IDM-style worker pool over
+  the shared HTTP keep-alive/proxy pool, decrypt AES-128 (C-backed in Python
+  when available, or via ffmpeg C crypto otherwise), strip disguised fake image
+  headers, merge in-order via a memory-bounded sink into a contiguous stream
+  file (or local playlist for discontinuities), and remux to faststart MP4.
+* **Engine B (ffmpeg)** — hand the remote playlist straight to ffmpeg when
+  Engine A cannot fetch the playlist/segments (respecting headers, cookies and
+  HTTP proxies, or direct fallback when allowed).
 
 Failure/cleanup policy (identical in spirit to ``video_compressor``)
 -------------------------------------------------------------------
 * ffmpeg always writes a private ``.hls_<rand>.mp4`` scratch file which is only
   published with ``os.replace`` after the output was verified, so a half-written
   MP4 can never be uploaded.
-* Any failure, timeout or cancellation removes the scratch file and the whole
-  per-job download directory — a cancel never leaves multi-GB junk behind.
+* Any failure, timeout or cancellation cancels worker tasks, kills subprocesses,
+  closes file handles and removes the scratch file and per-job download dir.
 * ``cleanup_orphaned_hls_dirs()`` (called once at startup) sweeps leftovers from
   a hard kill (SIGKILL / OOM).
 
@@ -37,14 +38,19 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import inspect
+import json
 import os
 import random
+import re
 import shutil
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
+import app.config as _cfg
+import app.hls.client as _client_mod
 from app.config import (
     HLS_ENABLED,
     HLS_ENGINE,
@@ -62,6 +68,7 @@ from app.hls.client import (
     default_headers,
     ffmpeg_header_args,
     ffmpeg_proxy_args,
+    is_socks_proxy,
 )
 from app.hls.playlist import (
     MediaPlaylist,
@@ -69,10 +76,10 @@ from app.hls.playlist import (
     is_drm,
     is_hls_playlist,
     is_master_playlist,
-    parse_media,
     parse_master,
+    parse_media,
+    rank_variants,
     select_audio_track,
-    select_variant,
 )
 from app.utils.video_compressor import (
     MP4_SAFE_AUDIO,
@@ -81,7 +88,7 @@ from app.utils.video_compressor import (
 )
 
 # ---------------------------------------------------------------------------
-# Outcome reason codes (logging / debugging only)
+# Outcome reason codes
 # ---------------------------------------------------------------------------
 
 R_DISABLED = "disabled"
@@ -93,13 +100,26 @@ R_LOW_DISK = "low-disk"
 R_DOWNLOAD_FAILED = "download-failed"
 R_REMUX_FAILED = "remux-failed"
 
+# Memory caps for the ordered contiguous segment sink (VPS MemoryMax safety).
+_MAX_REORDER_RAM_BYTES = 32 * 1024 * 1024
+_MAX_SINGLE_RAM_BYTES = 12 * 1024 * 1024
+
+_ISO_BMFF_BOXES = (
+    b"ftyp", b"styp", b"moof", b"sidx", b"emsg", b"free", b"mdat", b"moov", b"prft",
+)
+_HTTP_STATUS_RE = re.compile(r"\bHTTP\s+(\d{3})\b", re.IGNORECASE)
+_URL_QUERY_RE = re.compile(r"(https?://[^\s?#\"'<>]+)\?[^\s\"'<>]+")
+_URL_CREDS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^:@\s]+:[^@\s]+@")
+_COOKIE_HDR_RE = re.compile(r"(Cookie|Authorization)\s*:\s*[^\r\n]+", re.IGNORECASE)
+
 
 @dataclass
 class HlsResult:
     """Outcome of an HLS download.
 
-    When ``converted`` is False no usable MP4 exists and ``reason`` explains
-    why; handlers must report the error instead of uploading anything.
+    When ``converted`` is False no usable MP4 exists and ``reason`` (plus
+    optional sanitized ``detail``) explains why; handlers must report the error
+    instead of uploading anything.
     """
     path: str = ""
     name: str = ""
@@ -110,11 +130,12 @@ class HlsResult:
     duration: float = 0.0
     is_live: bool = False
     estimated_size: int = 0
+    detail: str = ""
 
 
 @dataclass
 class _Prepared:
-    """Everything resolved from the playlists before a single byte is fetched."""
+    """Everything resolved from the playlists before media bytes are fetched."""
     video_url: str = ""
     video_text: str = ""
     video_pl: Optional[MediaPlaylist] = None
@@ -127,7 +148,135 @@ class _Prepared:
 
 
 # ---------------------------------------------------------------------------
-# Small helpers (mirrors app/utils/video_compressor.py)
+# Config & client compatibility helpers
+# ---------------------------------------------------------------------------
+
+def _cfg_workers() -> int:
+    val = getattr(_cfg, "HLS_SEGMENT_WORKERS", HLS_SEGMENT_WORKERS)
+    try:
+        return max(1, int(val))
+    except (TypeError, ValueError):
+        return 16
+
+
+def _cfg_retries() -> int:
+    val = getattr(_cfg, "HLS_SEGMENT_RETRIES", HLS_SEGMENT_RETRIES)
+    try:
+        return max(1, int(val))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _cfg_connect_timeout() -> Optional[float]:
+    val = getattr(_cfg, "HLS_CONNECT_TIMEOUT", None)
+    try:
+        return float(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _cfg_segment_timeout() -> Optional[float]:
+    val = getattr(_cfg, "HLS_SEGMENT_TIMEOUT", None)
+    try:
+        return float(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _cfg_proxy_fallback_direct() -> bool:
+    val = getattr(_cfg, "HLS_PROXY_FALLBACK_DIRECT", True)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
+def _merge_cookie_header(headers: Dict[str, str], cookies: Dict[str, str]) -> None:
+    """Merge *cookies* into a ``Cookie`` header without duplicates."""
+    if not cookies:
+        return
+    existing_key = next((k for k in headers if k.lower() == "cookie"), "Cookie")
+    existing = headers.get(existing_key, "").strip()
+    pairs: Dict[str, str] = {}
+    if existing:
+        for item in existing.split(";"):
+            if "=" in item:
+                k, _, v = item.partition("=")
+                pairs[k.strip()] = v.strip()
+    for k, v in cookies.items():
+        if k:
+            pairs[str(k)] = str(v)
+    if pairs:
+        headers[existing_key] = "; ".join(f"{k}={v}" for k, v in pairs.items())
+
+
+def _normalize_headers(url: str, headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Ensure browser-like defaults exist without clobbering caller headers."""
+    defaults = default_headers(url)
+    if not headers:
+        return defaults
+    merged = dict(headers)
+    lower_keys = {k.lower() for k in merged}
+    for key, value in defaults.items():
+        if key.lower() not in lower_keys:
+            merged[key] = value
+    return merged
+
+
+def _make_client(
+    headers: Dict[str, str],
+    proxy_url: Any,
+    cookies: Optional[Dict[str, str]],
+    workers: int,
+) -> HlsClient:
+    """Instantiate HlsClient cleanly across pre/post-upgrade client.py."""
+    params = inspect.signature(HlsClient.__init__).parameters
+    kwargs: Dict[str, Any] = {"proxy_url": proxy_url}
+    hdrs = dict(headers)
+    if cookies:
+        if "cookies" in params:
+            kwargs["cookies"] = dict(cookies)
+        else:
+            _merge_cookie_header(hdrs, cookies)
+    kwargs["headers"] = hdrs
+    if "max_connections" in params:
+        kwargs["max_connections"] = max(32, workers * 2)
+    conn_t = _cfg_connect_timeout()
+    if conn_t is not None and "connect_timeout" in params:
+        kwargs["connect_timeout"] = conn_t
+    seg_t = _cfg_segment_timeout()
+    if seg_t is not None and "segment_timeout" in params:
+        kwargs["segment_timeout"] = seg_t
+    return HlsClient(**kwargs)
+
+
+def _client_ffmpeg_headers(
+    client: HlsClient,
+    base_headers: Dict[str, str],
+    cookies: Optional[Dict[str, str]],
+    url: str,
+) -> List[str]:
+    """Build ffmpeg header args including session cookies when supported."""
+    merged_cookies: Dict[str, str] = dict(cookies or {})
+    export_fn = getattr(client, "export_cookies", None)
+    if callable(export_fn):
+        try:
+            exported = export_fn(url)
+            if isinstance(exported, dict):
+                merged_cookies.update(exported)
+        except Exception:
+            pass
+
+    params = inspect.signature(ffmpeg_header_args).parameters
+    if "cookies" in params:
+        return ffmpeg_header_args(base_headers, cookies=merged_cookies or None)
+    hdrs = dict(base_headers)
+    if merged_cookies:
+        _merge_cookie_header(hdrs, merged_cookies)
+    return ffmpeg_header_args(hdrs)
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
 # ---------------------------------------------------------------------------
 
 def _log(msg: str) -> None:
@@ -143,7 +292,9 @@ async def _notify(status_cb: Optional[Callable[[str], object]], text: str) -> No
     if status_cb is None:
         return
     try:
-        await status_cb(text)
+        res = status_cb(text)
+        if inspect.isawaitable(res):
+            await res
     except Exception as e:
         _log(f"[HLS] status_cb failed: {e}")
 
@@ -176,14 +327,345 @@ def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def _is_m3u8_path(src: str) -> bool:
+    return (src or "").split("?", 1)[0].lower().endswith((".m3u8", ".m3u"))
+
+
+def _extension_of(url: str, default: str = ".ts") -> str:
+    """Return the (safely recognised) extension of *url*, or *default*."""
+    ext = os.path.splitext((url or "").split("?", 1)[0])[1].lower()
+    if 3 <= len(ext) <= 5 and ext[1:].isalnum():
+        return ext
+    return default
+
+
 def _segment_filename(index: int, url: str) -> str:
-    """Local file name for a segment, keeping its original extension."""
-    path = url.split("?", 1)[0]
+    """Local file name for a segment, keeping known media extensions."""
+    path = (url or "").split("?", 1)[0]
     ext = os.path.splitext(path)[1].lower()
     allowed = {".ts", ".m4s", ".mp4", ".aac", ".mp3", ".cmfv", ".cmfa", ".vtt", ".key"}
     if ext not in allowed:
         ext = ".ts"
     return f"seg_{index:05d}{ext}"
+
+
+def _sanitize_detail(text: str, max_len: int = 200) -> str:
+    """Strip query tokens, proxy creds and auth headers from error strings."""
+    if not text:
+        return ""
+    cleaned = _URL_CREDS_RE.sub(r"\1***@", str(text))
+    cleaned = _URL_QUERY_RE.sub(r"\1?...", cleaned)
+    cleaned = _COOKIE_HDR_RE.sub(r"\1: ***", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > max_len:
+        cleaned = cleaned[: max_len - 3].rstrip() + "..."
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Error classification & resilient retries
+# ---------------------------------------------------------------------------
+
+def _extract_http_status(exc: BaseException) -> Optional[int]:
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and status > 0:
+        return status
+    m = _HTTP_STATUS_RE.search(str(exc))
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _is_proxy_error(exc: BaseException) -> bool:
+    proxy_cls = getattr(_client_mod, "HlsProxyError", None)
+    if proxy_cls is not None and isinstance(exc, proxy_cls):
+        return True
+    cur: Optional[BaseException] = exc
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        name = type(cur).__name__.lower()
+        if "proxy" in name:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    msg = str(exc).lower()
+    return "proxy" in msg and ("connect" in msg or "socks" in msg or "timed out" in msg or "refused" in msg)
+
+
+def _is_permanent_error(exc: BaseException) -> bool:
+    if getattr(exc, "is_permanent", False):
+        status = _extract_http_status(exc)
+        if status not in (401, 403):
+            return True
+    status = _extract_http_status(exc)
+    return status in (400, 404, 405, 410, 451)
+
+
+def _max_attempts_for(exc: BaseException, configured_attempts: int, attempt: int) -> bool:
+    """True when another retry should be attempted after *exc*."""
+    if attempt >= configured_attempts:
+        return False
+    if _is_proxy_error(exc):
+        return False
+    if _is_permanent_error(exc):
+        return False
+    status = _extract_http_status(exc)
+    # A 401/403 is usually permanent, but a single short retry catches CDN edge blips.
+    if status in (401, 403) and attempt >= 2:
+        return False
+    return True
+
+
+def _retry_delay(attempt: int, exc: BaseException) -> float:
+    retry_after = getattr(exc, "retry_after", None)
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        return min(float(retry_after), 15.0)
+    status = _extract_http_status(exc)
+    if status in (401, 403):
+        return 0.35
+    if status == 429:
+        return min(1.5 * (2 ** (attempt - 1)), 12.0) + random.uniform(0.0, 0.4)
+    return min(0.35 * (2 ** (attempt - 1)), 6.0) + random.uniform(0.0, 0.25)
+
+
+async def _retry_call(op_name: str, fn: Callable[[], Any]) -> Any:
+    """Run an async fetch operation with smart status-aware backoff."""
+    attempts = _cfg_retries()
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await fn()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if not _max_attempts_for(exc, attempts, attempt):
+                raise
+            delay = _retry_delay(attempt, exc)
+            _log(f"[HLS] {op_name} retry {attempt}/{attempts - 1} in {delay:.2f}s: {_sanitize_detail(str(exc))}")
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _fetch_text_resilient(client: HlsClient, url: str) -> Tuple[str, str]:
+    """Fetch playlist text + final post-redirect URL with retries."""
+    fetch_with_url = getattr(client, "fetch_text_with_url", None)
+
+    async def _do() -> Tuple[str, str]:
+        if callable(fetch_with_url):
+            return await fetch_with_url(url)
+        text = await client.fetch_text(url)
+        return text, url
+
+    return await _retry_call("playlist", _do)
+
+
+async def _fetch_bytes_resilient(
+    client: HlsClient,
+    url: str,
+    *,
+    byte_range: Optional[Tuple[int, int]] = None,
+    on_chunk: Optional[Callable[[int], None]] = None,
+    label: str = "segment",
+) -> bytes:
+    """Fetch binary bytes (segment, key, or init map) with retries & range guard."""
+    download_bytes_fn = getattr(client, "download_bytes", None)
+
+    async def _do() -> bytes:
+        if callable(download_bytes_fn):
+            data = await download_bytes_fn(
+                url, byte_range=byte_range, on_chunk=on_chunk,
+            )
+        else:
+            data = await client.fetch_bytes(url, byte_range=byte_range)
+            if byte_range is not None:
+                offset, length = byte_range
+                if len(data) > length:
+                    data = data[offset:offset + length]
+                if len(data) != length:
+                    raise ValueError(
+                        f"Byte-range segment truncated: got {len(data)} of {length} bytes for {url}"
+                    )
+            if not data:
+                raise ValueError(f"Empty {label} response for {url}")
+            if on_chunk is not None and data:
+                try:
+                    on_chunk(len(data))
+                except Exception as e:
+                    _log(f"[HLS] progress callback failed: {e}")
+        if not data:
+            raise ValueError(f"Empty {label} response for {url}")
+        return data
+
+    return await _retry_call(label, _do)
+
+
+# ---------------------------------------------------------------------------
+# AES-128 decryption & disguised segment sanitization
+# ---------------------------------------------------------------------------
+
+def _detect_aes_backend() -> Optional[str]:
+    """Return C-backed AES-128 library name, or None (never slow pure-Python pyaes)."""
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # noqa: F401
+        return "cryptography"
+    except Exception:
+        pass
+    try:
+        from Crypto.Cipher import AES  # noqa: F401
+        return "pycryptodome"
+    except Exception:
+        pass
+    return None
+
+
+def _compute_aes_iv(iv_attr: str, sequence: int) -> bytes:
+    if iv_attr:
+        cleaned = iv_attr.strip().lower()
+        if cleaned.startswith("0x"):
+            cleaned = cleaned[2:]
+        try:
+            raw = bytes.fromhex(cleaned.zfill(32))
+            return raw[-16:]
+        except ValueError:
+            pass
+    return int(max(0, sequence)).to_bytes(16, "big")
+
+
+def _pkcs7_unpad(data: bytes) -> bytes:
+    if not data:
+        return data
+    pad = data[-1]
+    if 1 <= pad <= 16 and len(data) >= pad and data[-pad:] == bytes([pad]) * pad:
+        return data[:-pad]
+    return data
+
+
+def _decrypt_aes128_cbc(data: bytes, key: bytes, iv: bytes, backend: str) -> bytes:
+    """Decrypt AES-128-CBC bytes using a C-accelerated backend."""
+    if not data:
+        return data
+    if len(data) % 16 != 0:
+        raise ValueError(f"Encrypted segment length {len(data)} is not a multiple of 16")
+    if backend == "cryptography":
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+        out = decryptor.update(data) + decryptor.finalize()
+        return _pkcs7_unpad(out)
+    if backend == "pycryptodome":
+        from Crypto.Cipher import AES
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        return _pkcs7_unpad(cipher.decrypt(data))
+    raise RuntimeError(f"Unsupported AES backend: {backend}")
+
+
+def _find_ts_sync_offset(data: bytes, max_scan: int = 8192) -> Optional[int]:
+    """Locate MPEG-TS 188-byte packet alignment (``0x47`` sync bytes)."""
+    n = len(data)
+    limit = min(n, max_scan)
+    for pos in range(limit):
+        if data[pos] != 0x47:
+            continue
+        if pos + 376 < n:
+            if data[pos + 188] == 0x47 and data[pos + 376] == 0x47:
+                return pos
+        elif pos + 188 < n:
+            if data[pos + 188] == 0x47:
+                return pos
+        elif n - pos == 188 and pos == 0:
+            return 0
+    return None
+
+
+def _find_bmff_offset(data: bytes, max_scan: int = 1024) -> Optional[int]:
+    """Locate ISO-BMFF box start (``ftyp``/``styp``/``moof``/``sidx``)."""
+    n = len(data)
+    if n < 8:
+        return None
+    if data[4:8] in _ISO_BMFF_BOXES:
+        return 0
+    head = data[:min(n, max_scan)]
+    best: Optional[int] = None
+    for tag in (b"ftyp", b"styp", b"moof", b"sidx"):
+        idx = head.find(tag)
+        if idx >= 4:
+            box_start = idx - 4
+            box_size = int.from_bytes(data[box_start:idx], "big")
+            if 8 <= box_size <= n - box_start:
+                if best is None or box_start < best:
+                    best = box_start
+    return best
+
+
+def _is_probably_error_page(data: bytes) -> bool:
+    """Detect HTTP 200 HTML/WAF/JSON error pages masquerading as media segments."""
+    if not data:
+        return True
+    head = data[:512].lstrip().lower()
+    if not head.startswith((b"<!doctype", b"<html", b"<head", b"<?xml", b"{")):
+        return False
+    # A disguised TS/fMP4 payload that happens to start with '<' would still
+    # reveal TS packet syncs or BMFF boxes nearby.
+    if _find_ts_sync_offset(data, max_scan=4096) is not None:
+        return False
+    if _find_bmff_offset(data, max_scan=1024) is not None:
+        return False
+    return True
+
+
+def _sanitize_segment_bytes(
+    data: bytes, *, is_fmp4: bool = False,
+) -> Tuple[bytes, str]:
+    """Strip fake image/junk prefixes from disguised segments and detect format.
+
+    Many HLS CDNs disguise MPEG-TS or fMP4 segments as ``.png``/``.jpg``/``.gif``
+    and prepend a dummy image header before the real media stream, which causes
+    ffmpeg's demuxer to abort with ``detected format png_pipe``.
+    """
+    if not data:
+        return data, ".m4s" if is_fmp4 else ".ts"
+
+    # 1. Clean ISO-BMFF / fMP4 box at byte 0.
+    if len(data) >= 8 and data[4:8] in _ISO_BMFF_BOXES:
+        return data, ".m4s"
+
+    # 2. Clean MPEG-TS at byte 0.
+    if data[0] == 0x47 and (len(data) < 189 or data[188] == 0x47):
+        return data, ".ts"
+
+    # 3. Raw ADTS AAC / ID3 audio segment (used by audio-only HLS groups).
+    if data[:3] == b"ID3":
+        return data, ".aac"
+    if len(data) >= 4 and data[0] == 0xFF and (data[1] & 0xF6) in (0xF0, 0xF2):
+        # Verify it's not a JPEG (FF D8 FF) or accidental match before a TS header.
+        ts_pos = _find_ts_sync_offset(data)
+        if ts_pos is None:
+            return data, ".aac"
+
+    # 4. Strip disguised prefix before MPEG-TS sync alignment.
+    ts_pos = _find_ts_sync_offset(data)
+    if ts_pos is not None:
+        return (data[ts_pos:] if ts_pos > 0 else data), ".ts"
+
+    # 5. Strip disguised prefix before ISO-BMFF fMP4 boxes.
+    bmff_pos = _find_bmff_offset(data)
+    if bmff_pos is not None:
+        return (data[bmff_pos:] if bmff_pos > 0 else data), ".m4s"
+
+    return data, ".m4s" if is_fmp4 else ".ts"
+
+
+def _validate_aes_key(data: bytes, url: str) -> bytes:
+    """Ensure a fetched AES-128 key is 16 raw bytes, not an HTML error page."""
+    if len(data) == 16:
+        return data
+    if _is_probably_error_page(data):
+        raise ValueError(f"AES-128 key URL returned HTML/JSON error page for {url}")
+    raise ValueError(f"Invalid AES-128 key length ({len(data)} bytes) for {url}")
 
 
 # ---------------------------------------------------------------------------
@@ -198,48 +680,50 @@ def _build_remux_args(
     mode: str = "copy",
     extra_input_args: Optional[List[str]] = None,
     limit_seconds: int = 0,
+    with_progress: bool = False,
 ) -> List[str]:
-    """Build the ffmpeg argv for the HLS → MP4 remux.
+    """Build the ffmpeg argv for the HLS -> MP4 remux.
 
     Deliberately mirrors ``app/utils/video_compressor.py::_build_ffmpeg_args``:
     ``-c copy`` (never a video re-encode unless *mode* asks for it), the same
     timestamp normalisation and the same ``+faststart`` so Telegram can stream
     and seek immediately.
 
-    ``mode`` is ``"copy"``, ``"audio-aac"`` (video copied, audio re-encoded —
-    the cheap rescue pass for AC-3/E-AC-3/FLAC audio) or ``"reencode"``.
+    ``mode`` is ``"copy"``, ``"copy-adtstoasc"``, ``"audio-aac"`` (video copied,
+    audio re-encoded — the cheap rescue pass for AC-3/E-AC-3/FLAC audio) or
+    ``"reencode"``.
     """
     args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-
-    if local:
-        # Reading our own rewritten playlists: only local files, the key files
-        # (crypto) and in-playlist data URIs are allowed.
-        args += [
-            "-allowed_extensions", "ALL",
-            "-protocol_whitelist", "file,crypto,data",
-        ]
-    else:
-        # ffmpeg fetches everything itself: network protocols + reconnect logic.
-        args += [
-            "-allowed_extensions", "ALL",
-            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-            "-reconnect", "1", "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "10",
-        ]
-
-    if extra_input_args:
-        args += list(extra_input_args)
+    if with_progress:
+        args += ["-progress", "pipe:1", "-nostats"]
 
     for src in inputs:
+        if local:
+            # -allowed_extensions is private to the hls demuxer: passing it for
+            # a merged .ts/.mp4 input fails with "Option allowed_extensions not found".
+            if _is_m3u8_path(src):
+                args += [
+                    "-allowed_extensions", "ALL",
+                    "-protocol_whitelist", "file,crypto,data",
+                ]
+        else:
+            args += [
+                "-allowed_extensions", "ALL",
+                "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                "-reconnect", "1", "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "10",
+            ]
+            if extra_input_args:
+                args += list(extra_input_args)
         args += ["-i", src]
 
-    # Only the first video stream + all audio streams: drops attachment and
-    # subtitle streams the MP4 muxer could choke on. The "?" makes audio
-    # optional. With split audio groups the audio comes from input 2.
+    # Only the first video stream + audio stream: drops attachment/subtitle
+    # streams the MP4 muxer could choke on. "?" tolerates audio-only or
+    # video-only inputs safely.
     if len(inputs) > 1:
-        args += ["-map", "0:v:0", "-map", "1:a:0"]
+        args += ["-map", "0:v:0?", "-map", "1:a:0?"]
     else:
-        args += ["-map", "0:v:0", "-map", "0:a?"]
+        args += ["-map", "0:v:0?", "-map", "0:a?"]
     args += ["-sn", "-map_chapters", "-1"]
 
     if mode == "audio-aac":
@@ -249,24 +733,21 @@ def _build_remux_args(
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-c:a", "aac", "-b:a", "192k",
         ]
+    elif mode == "copy-adtstoasc":
+        args += ["-c", "copy", "-bsf:a", "aac_adtstoasc"]
     else:
         args += ["-c", "copy"]
 
     if limit_seconds and limit_seconds > 0:
-        # Output option: stop muxing after N seconds (live cap / long VOD cap).
         args += ["-t", str(int(limit_seconds))]
 
     args += [
-        # HLS timestamps can start negative or be non-monotonic; normalise them
-        # so players don't freeze/desync after the container change.
         "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
         "-max_muxing_queue_size", "1024",
-        # Move the moov atom to the front so Telegram can stream/seek instantly.
         "-movflags", "+faststart",
         dst,
     ]
     return args
-
 
 
 async def _read_progress(proc: asyncio.subprocess.Process, on_chunk) -> None:
@@ -300,15 +781,38 @@ async def _read_progress(proc: asyncio.subprocess.Process, on_chunk) -> None:
         _log(f"[HLS] progress reader error: {e}")
 
 
-async def _run_ffmpeg(
+async def _read_stderr_capped(
+    proc: asyncio.subprocess.Process, limit: int = 8192,
+) -> str:
+    """Drain stderr without risking pipe buffer deadlock; keep last *limit* bytes."""
+    if proc.stderr is None:
+        return ""
+    buf = bytearray()
+    try:
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) > limit * 2:
+                del buf[:-limit]
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    return bytes(buf[-limit:]).decode("utf-8", "replace").strip()
+
+
+async def _run_ffmpeg_detailed(
     args: List[str],
     dst: str,
     timeout: int,
     on_progress=None,
-) -> bool:
-    """Run ffmpeg, returning True only when a usable output file was produced."""
+) -> Tuple[bool, str]:
+    """Run ffmpeg, returning ``(ok, error_detail)``."""
     proc = None
     reader = None
+    stderr_task = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -316,12 +820,11 @@ async def _run_ffmpeg(
                 asyncio.subprocess.PIPE if on_progress is not None
                 else asyncio.subprocess.DEVNULL
             ),
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         if on_progress is not None:
-            # Must run concurrently with wait(), otherwise a full stdout pipe
-            # would deadlock ffmpeg.
             reader = asyncio.create_task(_read_progress(proc, on_progress))
+        stderr_task = asyncio.create_task(_read_stderr_capped(proc))
 
         await asyncio.wait_for(proc.wait(), timeout=max(60, timeout))
 
@@ -331,26 +834,33 @@ async def _run_ffmpeg(
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 reader.cancel()
 
+        stderr_text = ""
+        if stderr_task is not None:
+            try:
+                stderr_text = await asyncio.wait_for(stderr_task, timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                stderr_task.cancel()
+
         if proc.returncode != 0:
-            _log(f"[HLS] ffmpeg exited with code {proc.returncode}")
-            return False
+            err_line = stderr_text.splitlines()[-1] if stderr_text else f"exit code {proc.returncode}"
+            _log(f"[HLS] ffmpeg exited with code {proc.returncode}: {err_line}")
+            return False, err_line
         if not os.path.exists(dst) or os.path.getsize(dst) < 1024:
             _log("[HLS] ffmpeg produced no usable output")
-            return False
-        return True
+            return False, "ffmpeg produced empty output"
+        return True, ""
     except asyncio.TimeoutError:
         _log(f"[HLS] ffmpeg timed out after {timeout}s - killing process")
-        return False
+        return False, f"ffmpeg timed out after {timeout}s"
     except asyncio.CancelledError:
-        # Kill the child before letting cancellation propagate so we never
-        # leave an orphaned ffmpeg writing to disk.
         raise
     except Exception as e:
         _log(f"[HLS] ffmpeg error: {e}")
-        return False
+        return False, str(e)
     finally:
-        if reader is not None and not reader.done():
-            reader.cancel()
+        for task in (reader, stderr_task):
+            if task is not None and not task.done():
+                task.cancel()
         if proc is not None and proc.returncode is None:
             try:
                 proc.kill()
@@ -359,10 +869,24 @@ async def _run_ffmpeg(
             try:
                 await asyncio.wait_for(proc.wait(), timeout=10)
             except BaseException:
-                # Already cancelled / refusing to die — the caller removes the
-                # scratch file anyway.
                 pass
+        for task in (reader, stderr_task):
+            if task is not None:
+                try:
+                    await task
+                except BaseException:
+                    pass
 
+
+async def _run_ffmpeg(
+    args: List[str],
+    dst: str,
+    timeout: int,
+    on_progress=None,
+) -> bool:
+    """Run ffmpeg, returning True only when a usable output file was produced."""
+    ok, _ = await _run_ffmpeg_detailed(args, dst, timeout, on_progress=on_progress)
+    return ok
 
 
 async def _remux_with_fallbacks(
@@ -375,15 +899,9 @@ async def _remux_with_fallbacks(
     limit_seconds: int = 0,
     on_progress=None,
     modes: Optional[List[str]] = None,
+    error_out: Optional[List[str]] = None,
 ) -> bool:
-    """Remux with ``-c copy``, then retry with progressively safer modes.
-
-    The default chain is ``copy`` → ``audio-aac`` (video copied, audio re-encoded
-    to AAC — cheap, and the only fallback allowed on a small VPS) and, when
-    ``HLS_REENCODE_FALLBACK`` is enabled, a final full re-encode. Callers may pass
-    a reordered *modes* list derived from a codec probe so the first attempt is
-    already the right one.
-    """
+    """Remux with ``-c copy``, then retry with progressively safer modes."""
     if not modes:
         attempts = ["copy", "audio-aac"]
     else:
@@ -391,32 +909,39 @@ async def _remux_with_fallbacks(
     if HLS_REENCODE_FALLBACK and "reencode" not in attempts:
         attempts.append("reencode")
 
+    last_err = ""
     for mode in attempts:
         args = _build_remux_args(
             inputs, dst, local=local, mode=mode,
             extra_input_args=extra_input_args, limit_seconds=limit_seconds,
+            with_progress=(on_progress is not None),
         )
-        if await _run_ffmpeg(args, dst, timeout, on_progress=on_progress):
-            if mode != "copy":
+        ok, err = await _run_ffmpeg_detailed(args, dst, timeout, on_progress=on_progress)
+        if ok:
+            if mode not in ("copy", "copy-adtstoasc"):
                 _log(f"[HLS] Remux succeeded with mode '{mode}'")
             return True
+        if err:
+            last_err = err
         _log(f"[HLS] Remux mode '{mode}' failed")
+        # Remove partial output from a failed attempt before retrying.
+        if os.path.exists(dst):
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
+    if error_out is not None and last_err:
+        error_out.append(last_err)
     return False
 
 
 async def _probe_streams(inputs: List[str], local: bool) -> Dict[str, List[str]]:
-    """Best-effort ffprobe of the remux inputs → ``{"video": [...], "audio": [...]}``.
-
-    Local playlists are probeable exactly like a downloaded file, so the same
-    "decide before muxing" idea as ``video_compressor._decide_mode`` applies
-    here. Any failure simply returns empty lists (the caller then keeps the
-    default copy-first chain).
-    """
+    """Best-effort ffprobe of the remux inputs -> ``{"video": [...], "audio": [...]}``."""
     video: List[str] = []
     audio: List[str] = []
     for src in inputs:
         args = ["ffprobe", "-v", "error"]
-        if local:
+        if local and _is_m3u8_path(src):
             args += [
                 "-allowed_extensions", "ALL",
                 "-protocol_whitelist", "file,crypto,data",
@@ -435,8 +960,7 @@ async def _probe_streams(inputs: List[str], local: bool) -> Dict[str, List[str]]
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
             if proc.returncode != 0 or not stdout:
                 continue
-            import json as _json
-            data = _json.loads(stdout.decode("utf-8", "replace"))
+            data = json.loads(stdout.decode("utf-8", "replace"))
             for stream in data.get("streams") or []:
                 name = (stream.get("codec_name") or "").lower()
                 kind = (stream.get("codec_type") or "").lower()
@@ -449,16 +973,24 @@ async def _probe_streams(inputs: List[str], local: bool) -> Dict[str, List[str]]
         except asyncio.CancelledError:
             if proc is not None and proc.returncode is None:
                 proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except BaseException:
+                    pass
             raise
         except Exception as e:
             _log(f"[HLS] probe failed for {src}: {e}")
             if proc is not None and proc.returncode is None:
                 proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except BaseException:
+                    pass
     return {"video": video, "audio": audio}
 
 
 async def _choose_remux_modes(
-    inputs: List[str], local: bool
+    inputs: List[str], local: bool,
 ) -> Optional[List[str]]:
     """Order the remux modes so the first attempt matches the actual codecs."""
     probe = await _probe_streams(inputs, local)
@@ -468,33 +1000,32 @@ async def _choose_remux_modes(
 
     default = ["copy", "audio-aac"]
 
-    # Unsupported video codec: only a re-encode can produce a playable MP4, and
-    # only when the operator explicitly allowed it.
     if video and video[0] not in MP4_SAFE_VIDEO:
         if HLS_REENCODE_FALLBACK:
             return ["reencode"] + default
         _log(f"[HLS] Video codec {video[0]} may not be MP4-safe; keeping -c copy")
 
-    # Audio MP4 cannot hold (AC-3/E-AC-3/FLAC/...): skip the doomed copy pass and
-    # transcode the audio straight away. This is what stops silent/unplayable
-    # audio on the many HLS masters whose default track is AC-3.
     if audio and any(codec not in MP4_SAFE_AUDIO for codec in audio):
         _log(f"[HLS] Audio codecs {audio} need an AAC transcode")
-        return ["audio-aac"] + [m for m in default if m != "audio-aac"]
+        return ["audio-aac", "copy"]
 
-    return None
+    # Apply aac_adtstoasc only when AAC audio is present (passing it on MP3 fails
+    # ffmpeg), while keeping plain copy as immediate fallback.
+    if audio and all(codec == "aac" for codec in audio):
+        return ["copy-adtstoasc", "copy", "audio-aac"]
 
+    return default
 
 
 # ---------------------------------------------------------------------------
-# Engine A — local segment downloader (proxy aware, parallel)
+# Engine A — fast parallel segment downloader + contiguous merge / playlist
 # ---------------------------------------------------------------------------
 
 def _truncate(pl: MediaPlaylist, limit_seconds: int) -> MediaPlaylist:
     """Return *pl* limited to *limit_seconds* (a no-op when unset/already short).
 
     Segments are only ever dropped from the END, so the media sequence — and
-    therefore ffmpeg's implicit AES-128 IV derivation — stays valid.
+    therefore implicit AES-128 IV derivation — stays valid.
     """
     if not limit_seconds or limit_seconds <= 0:
         return pl
@@ -504,7 +1035,7 @@ def _truncate(pl: MediaPlaylist, limit_seconds: int) -> MediaPlaylist:
     kept: List[MediaSegment] = []
     total = 0.0
     for seg in pl.segments:
-        if total >= limit_seconds:
+        if kept and total >= limit_seconds:
             break
         kept.append(seg)
         total += seg.duration
@@ -515,35 +1046,11 @@ def _truncate(pl: MediaPlaylist, limit_seconds: int) -> MediaPlaylist:
         init_byte_range=pl.init_byte_range,
         media_sequence=pl.media_sequence,
         target_duration=pl.target_duration,
+        version=pl.version,
         is_live=False,
         is_fmp4=pl.is_fmp4,
         total_duration=total,
     )
-
-
-async def _download_segment(
-    client: HlsClient,
-    url: str,
-    path: str,
-    byte_range=None,
-    on_chunk=None,
-) -> int:
-    """Download one segment with retries (always from a clean file)."""
-    attempts = max(1, HLS_SEGMENT_RETRIES)
-    last_error: Optional[Exception] = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return await client.download_to(
-                url, path, on_chunk=on_chunk, byte_range=byte_range,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            last_error = e
-            if attempt < attempts:
-                _log(f"[HLS] Segment retry {attempt}/{attempts - 1}: {e}")
-                await asyncio.sleep(min(2 * attempt, 6))
-    raise ValueError(f"Failed to download segment {url}: {last_error}")
 
 
 def _write_local_playlist(
@@ -551,14 +1058,21 @@ def _write_local_playlist(
     dst_path: str,
     filenames: List[str],
     key_files: Dict[str, str],
-    init_name: str = "",
+    init_name: Union[str, Dict[Tuple[str, Optional[Tuple[int, int]]], str]] = "",
+    *,
+    already_decrypted: bool = False,
 ) -> None:
-    """Write a self-contained playlist pointing at the local segment files.
+    """Write a self-contained local playlist pointing at downloaded files."""
+    init_map: Dict[Tuple[str, Optional[Tuple[int, int]]], str]
+    default_init = ""
+    if isinstance(init_name, dict):
+        init_map = init_name
+    else:
+        init_map = {}
+        default_init = init_name
 
-    ffmpeg then performs AES-128 decryption AND the remux in the same stream-copy
-    pass, which is why this module needs no crypto library at all.
-    """
-    version = 7 if (pl.is_fmp4 or init_name) else 3
+    has_init = bool(default_init or init_map)
+    version = max(pl.version or 3, 7 if (pl.is_fmp4 or has_init) else 3)
     lines = [
         "#EXTM3U",
         f"#EXT-X-VERSION:{version}",
@@ -567,12 +1081,21 @@ def _write_local_playlist(
     if pl.media_sequence:
         lines.append(f"#EXT-X-MEDIA-SEQUENCE:{pl.media_sequence}")
     lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
-    if init_name:
-        lines.append(f'#EXT-X-MAP:URI="{init_name}"')
+    if default_init:
+        lines.append(f'#EXT-X-MAP:URI="{default_init}"')
 
-    current_key = None
+    current_key: Optional[int] = None
+    current_init_name = default_init
     for seg, filename in zip(pl.segments, filenames):
-        if seg.key_index != current_key:
+        if seg.discontinuity:
+            lines.append("#EXT-X-DISCONTINUITY")
+            current_init_name = ""
+        if init_map and seg.init_url:
+            mapped = init_map.get((seg.init_url, seg.init_byte_range), "")
+            if mapped and mapped != current_init_name:
+                lines.append(f'#EXT-X-MAP:URI="{mapped}"')
+                current_init_name = mapped
+        if not already_decrypted and seg.key_index != current_key:
             key = pl.keys[seg.key_index] if seg.key_index < len(pl.keys) else None
             if key is not None and key.is_aes128:
                 local_key = key_files.get(key.url)
@@ -591,13 +1114,100 @@ def _write_local_playlist(
         fh.write("\n".join(lines) + "\n")
 
 
+def _write_bytes_sync(path: str, data: bytes) -> None:
+    with open(path, "wb") as fh:
+        fh.write(data)
 
-def _extension_of(url: str, default: str = ".ts") -> str:
-    """Return the (safely recognised) extension of *url*, or *default*."""
-    ext = os.path.splitext(url.split("?", 1)[0])[1].lower()
-    if 3 <= len(ext) <= 5 and ext[1:].isalnum():
-        return ext
-    return default
+
+def _read_head_sync(path: str, n: int = 8192) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read(n)
+
+
+def _copy_and_unlink_sync(src_path: str, dst_fh) -> None:
+    try:
+        with open(src_path, "rb") as src_fh:
+            shutil.copyfileobj(src_fh, dst_fh, 1024 * 1024)
+    finally:
+        try:
+            os.remove(src_path)
+        except OSError:
+            pass
+
+
+def _infer_merged_ext(
+    first_chunk: bytes, init_bytes: Optional[bytes], is_fmp4: bool,
+) -> str:
+    if init_bytes and _find_bmff_offset(init_bytes) is not None:
+        return ".mp4"
+    _, ext = _sanitize_segment_bytes(first_chunk, is_fmp4=is_fmp4)
+    if ext == ".m4s":
+        return ".mp4"
+    return ext
+
+
+async def _fetch_keys_and_inits(
+    client: HlsClient,
+    pl: MediaPlaylist,
+    *,
+    sem: asyncio.Semaphore,
+    on_chunk=None,
+) -> Tuple[Dict[str, bytes], Dict[Tuple[str, Optional[Tuple[int, int]]], bytes]]:
+    """Fetch all distinct AES-128 keys and #EXT-X-MAP init sections concurrently."""
+    for key in pl.keys:
+        if key.method and key.method not in ("NONE", "AES-128"):
+            raise _HlsError(R_DRM, f"Unsupported encryption method: {key.method}")
+        if key.is_aes128 and not key.url:
+            raise ValueError("AES-128 key missing URI")
+
+    unique_key_urls: List[str] = []
+    for key in pl.keys:
+        if key.is_aes128 and key.url and key.url not in unique_key_urls:
+            unique_key_urls.append(key.url)
+
+    unique_inits: List[Tuple[str, Optional[Tuple[int, int]]]] = []
+    for spec in pl.init_sections:
+        if spec not in unique_inits:
+            unique_inits.append(spec)
+    if pl.init_url and (pl.init_url, pl.init_byte_range) not in unique_inits:
+        unique_inits.append((pl.init_url, pl.init_byte_range))
+
+    raw_keys: Dict[str, bytes] = {}
+    raw_inits: Dict[Tuple[str, Optional[Tuple[int, int]]], bytes] = {}
+
+    async def _get_key(url: str) -> None:
+        async with sem:
+            data = await _fetch_bytes_resilient(client, url, label="AES-128 key")
+            raw_keys[url] = _validate_aes_key(data, url)
+
+    async def _get_init(spec: Tuple[str, Optional[Tuple[int, int]]]) -> None:
+        init_url, init_range = spec
+        async with sem:
+            data = await _fetch_bytes_resilient(
+                client, init_url, byte_range=init_range,
+                on_chunk=on_chunk, label="init segment",
+            )
+            if _is_probably_error_page(data):
+                raise ValueError(f"Init segment returned HTML/error page for {init_url}")
+            bmff_pos = _find_bmff_offset(data)
+            if bmff_pos is not None and bmff_pos > 0:
+                data = data[bmff_pos:]
+            raw_inits[spec] = data
+
+    tasks = [asyncio.create_task(_get_key(u)) for u in unique_key_urls] + [
+        asyncio.create_task(_get_init(s)) for s in unique_inits
+    ]
+    if tasks:
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    return raw_keys, raw_inits
 
 
 async def _localize_playlist(
@@ -605,59 +1215,242 @@ async def _localize_playlist(
     pl: MediaPlaylist,
     work_dir: str,
     on_chunk=None,
+    *,
+    sem: Optional[asyncio.Semaphore] = None,
 ) -> str:
-    """Download every segment/key of *pl* into *work_dir*; return the playlist.
+    """Download every segment/key/init of *pl* into *work_dir*.
 
-    Nothing here talks to Telegram — this only produces a local, self-contained
-    playlist that ffmpeg can consume in a single stream-copy pass.
+    When possible (unencrypted or C-backed Python AES-128 decryption, no
+    discontinuities, <=1 init map), segments are sanitized and merged in exact
+    index order into a single contiguous file (``stream.ts`` / ``stream.mp4`` /
+    ``stream.aac``) via a memory-bounded sink — eliminating thousands of
+    per-segment open/write/close cycles and speeding up ffmpeg remuxing.
+
+    Otherwise, writes clean local segment files + ``index.m3u8`` (with C-speed
+    ffmpeg decryption if no Python C-AES backend is installed).
     """
     os.makedirs(work_dir, exist_ok=True)
+    if not pl.segments:
+        raise ValueError("playlist has no segments")
 
-    # Refuse anything that is not plain AES-128/NONE: an unsupported method
-    # would otherwise be written as METHOD=NONE and produce a corrupt MP4.
-    for key in pl.keys:
-        if key.method and key.method not in ("NONE", "AES-128"):
-            raise ValueError(f"Unsupported encryption method: {key.method}")
+    worker_count = _cfg_workers()
+    if sem is None:
+        sem = asyncio.Semaphore(worker_count)
 
-    # --- fMP4 init segment (#EXT-X-MAP) -------------------------------------
-    init_name = ""
-    if pl.init_url:
-        init_name = "init_0" + _extension_of(pl.init_url, default=".mp4")
-        await _download_segment(
-            client, pl.init_url, os.path.join(work_dir, init_name),
-            byte_range=pl.init_byte_range, on_chunk=on_chunk,
-        )
+    raw_keys, raw_inits = await _fetch_keys_and_inits(
+        client, pl, sem=sem, on_chunk=on_chunk,
+    )
 
-    # --- AES-128 key files --------------------------------------------------
+    aes_backend = _detect_aes_backend() if pl.is_encrypted else None
+    can_python_decrypt = (not pl.is_encrypted) or (aes_backend is not None)
+    has_discontinuity = any(s.discontinuity for s in pl.segments)
+    use_contiguous = (
+        can_python_decrypt and not has_discontinuity and len(raw_inits) <= 1
+    )
+
+    loop = asyncio.get_running_loop()
+    total = len(pl.segments)
+    cursor = 0
+    first_error: Optional[BaseException] = None
+
+    def _decrypt_and_clean(idx: int, seg: MediaSegment, data: bytes) -> Tuple[bytes, str]:
+        key = pl.keys[seg.key_index] if seg.key_index < len(pl.keys) else None
+        is_seg_enc = key is not None and key.is_aes128
+        if is_seg_enc:
+            if not can_python_decrypt:
+                return data, (".m4s" if (pl.is_fmp4 or seg.init_url) else ".ts")
+            iv = _compute_aes_iv(key.iv, seg.sequence)
+            data = _decrypt_aes128_cbc(data, raw_keys[key.url], iv, aes_backend)
+        if _is_probably_error_page(data):
+            raise ValueError(f"Segment {idx} returned HTML/JSON error page for {seg.url}")
+        return _sanitize_segment_bytes(data, is_fmp4=(pl.is_fmp4 or bool(seg.init_url)))
+
+    if use_contiguous:
+        init_bytes = next(iter(raw_inits.values()), b"")
+        pending: Dict[int, Union[bytes, str]] = {}
+        pending_ram = 0
+        next_write = 0
+        drain_lock = asyncio.Lock()
+        out_path: Optional[str] = None
+        out_fh = None
+        active_io: Optional[asyncio.Future] = None
+
+        async def _run_io(fn, *args) -> Any:
+            nonlocal active_io
+            fut = loop.run_in_executor(None, fn, *args)
+            active_io = fut
+            try:
+                return await fut
+            finally:
+                if active_io is fut:
+                    active_io = None
+
+        async def _worker_contiguous() -> None:
+            nonlocal cursor, first_error, pending_ram, next_write, out_path, out_fh
+            while first_error is None:
+                if cursor >= total:
+                    return
+                idx = cursor
+                cursor += 1
+                seg = pl.segments[idx]
+                try:
+                    async with sem:
+                        if first_error is not None:
+                            return
+                        raw = await _fetch_bytes_resilient(
+                            client, seg.url, byte_range=seg.byte_range,
+                            on_chunk=on_chunk, label=f"segment {idx}",
+                        )
+                    if aes_backend is not None and pl.keys[seg.key_index].is_aes128:
+                        data, _ = await loop.run_in_executor(
+                            None, _decrypt_and_clean, idx, seg, raw,
+                        )
+                    else:
+                        data, _ = _decrypt_and_clean(idx, seg, raw)
+
+                    if idx != next_write and (
+                        pending_ram + len(data) > _MAX_REORDER_RAM_BYTES
+                        or len(data) > _MAX_SINGLE_RAM_BYTES
+                    ):
+                        spill_path = os.path.join(work_dir, f"spill_{idx:05d}.part")
+                        await loop.run_in_executor(None, _write_bytes_sync, spill_path, data)
+                        pending[idx] = spill_path
+                    else:
+                        pending[idx] = data
+                        pending_ram += len(data)
+
+                    async with drain_lock:
+                        while next_write in pending:
+                            item = pending.pop(next_write)
+                            if isinstance(item, bytes):
+                                pending_ram -= len(item)
+                            if out_fh is None:
+                                sample = (
+                                    item if isinstance(item, bytes)
+                                    else await _run_io(_read_head_sync, item, 8192)
+                                )
+                                ext = _infer_merged_ext(sample, init_bytes, pl.is_fmp4)
+                                out_path = os.path.join(work_dir, f"stream{ext}")
+                                out_fh = open(out_path, "wb", buffering=1024 * 1024)
+                                if init_bytes:
+                                    await _run_io(out_fh.write, init_bytes)
+                            if isinstance(item, bytes):
+                                await _run_io(out_fh.write, item)
+                            else:
+                                await _run_io(_copy_and_unlink_sync, item, out_fh)
+                            next_write += 1
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    return
+
+        num_workers = min(worker_count, total)
+        tasks = [asyncio.create_task(_worker_contiguous()) for _ in range(num_workers)]
+        try:
+            await asyncio.gather(*tasks)
+            if first_error is not None:
+                raise first_error
+        except BaseException:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            if active_io is not None and not active_io.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(active_io), timeout=5)
+                except BaseException:
+                    pass
+            if out_fh is not None:
+                try:
+                    out_fh.flush()
+                except Exception:
+                    pass
+                try:
+                    out_fh.close()
+                except Exception:
+                    pass
+            pending.clear()
+
+        if not out_path or _safe_size(out_path) == 0:
+            raise ValueError("Downloaded stream is empty")
+        return out_path
+
+    # ---- Fallback path: local segment files + index.m3u8 -----------------
     key_files: Dict[str, str] = {}
-    for key in pl.keys:
-        if not key.is_aes128 or not key.url or key.url in key_files:
-            continue
-        name = f"key_{len(key_files)}.bin"
-        data = await client.fetch_bytes(key.url)
-        if len(data) < 16:
-            raise ValueError(f"AES-128 key too short ({len(data)} bytes) for {key.url}")
-        with open(os.path.join(work_dir, name), "wb") as fh:
-            fh.write(data)
-        key_files[key.url] = name
+    for idx_k, (key_url, key_bytes) in enumerate(raw_keys.items()):
+        name = f"key_{idx_k}.bin"
+        _write_bytes_sync(os.path.join(work_dir, name), key_bytes)
+        key_files[key_url] = name
 
-    # --- segments (parallel, bounded by HLS_SEGMENT_WORKERS) ----------------
-    filenames: List[str] = [""] * len(pl.segments)
-    sem = asyncio.Semaphore(max(1, HLS_SEGMENT_WORKERS))
+    init_files: Dict[Tuple[str, Optional[Tuple[int, int]]], str] = {}
+    for idx_m, (spec, init_bytes) in enumerate(raw_inits.items()):
+        name = f"init_{idx_m}" + _extension_of(spec[0], default=".mp4")
+        _write_bytes_sync(os.path.join(work_dir, name), init_bytes)
+        init_files[spec] = name
 
-    async def _worker(idx: int, seg: MediaSegment) -> None:
-        async with sem:
-            name = _segment_filename(idx, seg.url)
-            await _download_segment(
-                client, seg.url, os.path.join(work_dir, name),
-                byte_range=seg.byte_range, on_chunk=on_chunk,
-            )
-            filenames[idx] = name
+    filenames: List[str] = [""] * total
 
-    await asyncio.gather(*(_worker(i, seg) for i, seg in enumerate(pl.segments)))
+    async def _worker_files() -> None:
+        nonlocal cursor, first_error
+        while first_error is None:
+            if cursor >= total:
+                return
+            idx = cursor
+            cursor += 1
+            seg = pl.segments[idx]
+            try:
+                async with sem:
+                    if first_error is not None:
+                        return
+                    raw = await _fetch_bytes_resilient(
+                        client, seg.url, byte_range=seg.byte_range,
+                        on_chunk=on_chunk, label=f"segment {idx}",
+                    )
+                if can_python_decrypt:
+                    if aes_backend is not None and pl.keys[seg.key_index].is_aes128:
+                        data, ext = await loop.run_in_executor(
+                            None, _decrypt_and_clean, idx, seg, raw,
+                        )
+                    else:
+                        data, ext = _decrypt_and_clean(idx, seg, raw)
+                    name = f"seg_{idx:05d}{ext}"
+                else:
+                    # Encrypted without Python C-AES: keep raw ciphertext for ffmpeg.
+                    data = raw
+                    name = f"seg_{idx:05d}" + (".m4s" if (pl.is_fmp4 or seg.init_url) else ".ts")
+                await loop.run_in_executor(
+                    None, _write_bytes_sync, os.path.join(work_dir, name), data,
+                )
+                filenames[idx] = name
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                return
+
+    num_workers = min(worker_count, total)
+    tasks = [asyncio.create_task(_worker_files()) for _ in range(num_workers)]
+    try:
+        await asyncio.gather(*tasks)
+        if first_error is not None:
+            raise first_error
+    except BaseException:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
     playlist_path = os.path.join(work_dir, "index.m3u8")
-    _write_local_playlist(pl, playlist_path, filenames, key_files, init_name)
+    _write_local_playlist(
+        pl, playlist_path, filenames, key_files, init_files,
+        already_decrypted=can_python_decrypt,
+    )
     return playlist_path
 
 
@@ -668,28 +1461,54 @@ async def _engine_segments(
     limit_seconds: int,
     on_chunk=None,
 ) -> List[str]:
-    """Engine A: localize the playlists and return the ffmpeg input paths."""
+    """Engine A: download video (and audio concurrently) and return ffmpeg inputs."""
     video_pl = _truncate(prep.video_pl, limit_seconds)
     if not video_pl.segments:
-        raise ValueError("video playlist has no segments")
+        raise _HlsError(R_NO_SEGMENTS, "video playlist has no segments")
 
-    video_playlist = await _localize_playlist(
-        client, video_pl, os.path.join(temp_dir, "video"), on_chunk=on_chunk,
-    )
-    inputs = [video_playlist]
+    shared_sem = asyncio.Semaphore(_cfg_workers())
+    video_dir = os.path.join(temp_dir, "video")
 
-    # Separate audio group (fMP4/CMAF masters): mux it as the second input so
-    # the delivered MP4 is never silent.
+    audio_pl: Optional[MediaPlaylist] = None
     if prep.audio_pl and prep.audio_pl.segments:
-        audio_pl = _truncate(prep.audio_pl, limit_seconds)
-        if audio_pl.segments:
-            audio_playlist = await _localize_playlist(
-                client, audio_pl, os.path.join(temp_dir, "audio"), on_chunk=on_chunk,
+        candidate_audio = _truncate(prep.audio_pl, limit_seconds)
+        if candidate_audio.segments:
+            audio_pl = candidate_audio
+
+    if audio_pl is None:
+        video_input = await _localize_playlist(
+            client, video_pl, video_dir, on_chunk=on_chunk, sem=shared_sem,
+        )
+        return [video_input]
+
+    audio_dir = os.path.join(temp_dir, "audio")
+
+    async def _download_audio_safe() -> Optional[str]:
+        try:
+            return await _localize_playlist(
+                client, audio_pl, audio_dir, on_chunk=on_chunk, sem=shared_sem,
             )
-            inputs.append(audio_playlist)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log(f"[HLS] Audio track download failed (continuing video-only): {_sanitize_detail(str(exc))}")
+            return None
 
-    return inputs
+    video_task = asyncio.create_task(
+        _localize_playlist(client, video_pl, video_dir, on_chunk=on_chunk, sem=shared_sem)
+    )
+    audio_task = asyncio.create_task(_download_audio_safe())
 
+    try:
+        video_input = await video_task
+    except BaseException:
+        if not audio_task.done():
+            audio_task.cancel()
+        await asyncio.gather(audio_task, return_exceptions=True)
+        raise
+
+    audio_input = await audio_task
+    return [video_input, audio_input] if audio_input else [video_input]
 
 
 # ---------------------------------------------------------------------------
@@ -716,45 +1535,85 @@ _REASON_MESSAGES = {
 }
 
 
-def reason_message(reason: str) -> str:
+def reason_message(reason: str, detail: str = "") -> str:
     """User-facing (Malay) explanation for a failed HLS download."""
-    return _REASON_MESSAGES.get(reason, f"❌ Ralat HLS ({reason}).")
+    base = _REASON_MESSAGES.get(reason, f"❌ Ralat HLS ({reason}).")
+    clean = _sanitize_detail(detail)
+    if clean:
+        return f"{base}\nℹ️ `{clean}`"
+    return base
 
 
 async def _prepare(
-    client: HlsClient, url: str, max_height: int
+    client: HlsClient, url: str, max_height: int,
 ) -> _Prepared:
-    """Resolve a master/media playlist into the playlists we will download."""
+    """Resolve a master/media playlist (with variant fallback & redirect base URL)."""
     prep = _Prepared(video_url=url)
 
-    text = await client.fetch_text(url)
+    text, current_url = await _fetch_text_resilient(client, url)
+    prep.video_url = current_url
+
     if not is_hls_playlist(text):
-        raise _HlsError(R_NOT_HLS, "not an m3u8 playlist")
+        raise _HlsError(R_NOT_HLS, "response does not start with #EXTM3U")
     if is_drm(text):
-        raise _HlsError(R_DRM)
+        raise _HlsError(R_DRM, "playlist uses unsupported DRM key method")
 
-    if is_master_playlist(text):
-        variants, audios = parse_master(text, url)
-        variant = select_variant(variants, max_height)
-        if variant is not None and variant.url:
-            prep.video_url = variant.url
+    # Resolve master playlist (up to 2 hops for rare nested masters), trying
+    # lower-ranked variants if the top edge returns 403/404.
+    media_text = text
+    media_url = current_url
+    audios = []
+    chosen_audio_group = ""
+
+    for _hop in range(2):
+        if not is_master_playlist(media_text):
+            break
+        variants, hop_audios = parse_master(media_text, media_url)
+        if hop_audios:
+            audios = hop_audios
+        ordered = rank_variants(variants, max_height)
+        if not ordered:
+            break
+
+        last_exc: Optional[Exception] = None
+        picked = False
+        for variant in ordered:
+            try:
+                v_text, v_final_url = await _fetch_text_resilient(client, variant.url)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                _log(f"[HLS] Variant failed ({_sanitize_detail(variant.url)}): {_sanitize_detail(str(exc))}")
+                continue
+            if not is_hls_playlist(v_text):
+                last_exc = ValueError("variant is not an m3u8 playlist")
+                continue
+            if is_drm(v_text):
+                raise _HlsError(R_DRM, "variant playlist uses DRM")
+            media_text = v_text
+            media_url = v_final_url
+            prep.video_url = v_final_url
             prep.bandwidth = variant.rank_bandwidth
-            track = select_audio_track(audios, variant.audio_group)
-            if track is not None and track.url:
-                prep.audio_url = track.url
+            chosen_audio_group = variant.audio_group
+            picked = True
+            break
 
-    if prep.video_url == url:
-        media_text = text
-    else:
-        media_text = await client.fetch_text(prep.video_url)
+        if not picked:
+            if last_exc is not None:
+                raise last_exc
+            break
+
+    if chosen_audio_group and audios:
+        track = select_audio_track(audios, chosen_audio_group)
+        if track is not None and track.url:
+            prep.audio_url = track.url
 
     if is_drm(media_text):
-        raise _HlsError(R_DRM)
+        raise _HlsError(R_DRM, "media playlist uses DRM")
 
     prep.video_text = media_text
     if is_master_playlist(media_text):
-        # Nested master (rare): localization would need a second hop, so leave
-        # video_pl unset and let Engine B hand the playlist to ffmpeg.
         return prep
 
     prep.video_pl = parse_media(media_text, prep.video_url)
@@ -765,21 +1624,20 @@ async def _prepare(
         return prep
 
     try:
-        audio_text = await client.fetch_text(prep.audio_url)
+        audio_text, audio_final_url = await _fetch_text_resilient(client, prep.audio_url)
+        prep.audio_url = audio_final_url
         if is_drm(audio_text):
-            raise _HlsError(R_DRM)
+            raise _HlsError(R_DRM, "audio playlist uses DRM")
         prep.audio_text = audio_text
         if not is_master_playlist(audio_text):
-            prep.audio_pl = parse_media(audio_text, prep.audio_url)
+            prep.audio_pl = parse_media(audio_text, audio_final_url)
     except _HlsError:
         raise
     except Exception as e:
-        # Missing audio must never fail the whole job: the video still uploads.
-        _log(f"[HLS] Could not read audio playlist {prep.audio_url}: {e}")
+        _log(f"[HLS] Could not read audio playlist {_sanitize_detail(prep.audio_url)}: {_sanitize_detail(str(e))}")
         prep.audio_url = ""
 
     return prep
-
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +1649,7 @@ async def download_hls_to_mp4(
     file_name: str,
     *,
     headers: Optional[Dict[str, str]] = None,
+    cookies: Optional[Dict[str, str]] = None,
     status_cb: Optional[Callable[[str], object]] = None,
     on_chunk: Optional[Callable[[int], None]] = None,
     on_meta: Optional[Callable[[int], None]] = None,
@@ -799,44 +1658,7 @@ async def download_hls_to_mp4(
     max_duration: Optional[int] = None,
     proxy_url: Any = AUTO_PROXY,
 ) -> HlsResult:
-    """Download an HLS stream and remux it into a local MP4.
-
-    Parameters
-    ----------
-    url : str
-        The m3u8/m3u URL (master or media playlist).
-    file_name : str
-        Display name of the result; only the base name is kept and ``.mp4`` is
-        appended (e.g. ``"my_show.m3u8"`` → ``"my_show.mp4"``).
-    headers : dict | None
-        Request headers. Defaults to a browser UA plus a ``Referer`` derived
-        from the URL origin, which many HLS CDNs require.
-    status_cb : callable(str) -> awaitable | None
-        Async callback used to surface status text (e.g. ``safe_edit``).
-    on_chunk : callable(int) | None
-        Called with downloaded byte counts to drive a progress bar. Works for
-        both engines (segments while downloading, remux output for ffmpeg).
-    on_meta : callable(int) | None
-        Called once with the estimated total size in bytes (0 when unknown),
-        right before the download starts — the point at which a progress bar can
-        finally be sized.
-    out_dir : str | None
-        Where the MP4 is written. Defaults to ``HLS_TEMP_DIR`` or the system
-        temp directory.
-    max_height, max_duration : int | None
-        Per-job overrides of ``HLS_MAX_HEIGHT`` / ``HLS_MAX_DURATION``.
-    proxy_url : str | None
-        ``AUTO_PROXY`` (default) follows ``proxy.txt``; ``None`` forces a direct
-        connection for this job, which is what a page resolved by the headless
-        browser needs when that browser could not use the proxy (the token it
-        minted is bound to the address that asked for it).
-
-    Returns
-    -------
-    HlsResult
-        ``converted=False`` (with a ``reason``) means nothing usable was
-        produced; callers must report the error instead of uploading.
-    """
+    """Download an HLS stream and remux it into a local MP4."""
     result = HlsResult(name=_mp4_name(file_name))
 
     if not HLS_ENABLED:
@@ -846,8 +1668,9 @@ async def download_hls_to_mp4(
         result.reason = R_NO_FFMPEG
         return result
 
-    base_headers = dict(headers) if headers else default_headers(url)
-    client = HlsClient(headers=base_headers, proxy_url=proxy_url)
+    workers = _cfg_workers()
+    base_headers = _normalize_headers(url, headers)
+    client = _make_client(base_headers, proxy_url, cookies, workers)
 
     height_cap = HLS_MAX_HEIGHT if max_height is None else max_height
     duration_cap = HLS_MAX_DURATION if max_duration is None else max_duration
@@ -857,34 +1680,66 @@ async def download_hls_to_mp4(
     scratch: Optional[str] = None
     published = False
 
+    async def _switch_client_direct() -> None:
+        nonlocal client
+        switcher = getattr(client, "switch_to_direct", None)
+        if callable(switcher):
+            await switcher()
+        else:
+            await client.close()
+            client = _make_client(base_headers, None, cookies, workers)
+
     try:
-        # ---- 1. Parse the playlists (cheap: text only) --------------------
+        # ---- 1. Parse the playlists --------------------------------------
         prep: Optional[_Prepared] = None
         prep_error: str = ""
+        prep_detail: str = ""
         if engine in ("auto", "segments"):
-            try:
-                await _notify(status_cb, "🔍 Membaca playlist HLS…")
-                prep = await _prepare(client, url, height_cap)
-            except _HlsError as e:
-                # DRM and "not a playlist" cannot be rescued by ffmpeg either,
-                # so fail fast with the precise reason.
-                if e.reason in (R_DRM, R_NOT_HLS):
-                    result.reason = e.reason
-                    return result
-                prep_error = e.reason or R_DOWNLOAD_FAILED
-                _log(f"[HLS] Prepare failed: {e}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # Network/proxy/parse problem: still worth letting ffmpeg try.
-                prep_error = R_DOWNLOAD_FAILED
-                _log(f"[HLS] Prepare failed: {e}")
+            await _notify(status_cb, "🔍 Membaca playlist HLS…")
+            for proxy_try in (0, 1):
+                try:
+                    prep = await _prepare(client, url, height_cap)
+                    prep_error = ""
+                    prep_detail = ""
+                    break
+                except _HlsError as e:
+                    if e.reason in (R_DRM, R_NOT_HLS):
+                        result.reason = e.reason
+                        result.detail = _sanitize_detail(str(e))
+                        return result
+                    prep_error = e.reason or R_DOWNLOAD_FAILED
+                    prep_detail = _sanitize_detail(str(e))
+                    _log(f"[HLS] Prepare failed: {prep_detail}")
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    if (
+                        proxy_try == 0
+                        and _is_proxy_error(e)
+                        and client.proxy_url is not None
+                        and _cfg_proxy_fallback_direct()
+                    ):
+                        _log(
+                            f"[HLS] Proxy unreachable ({_sanitize_detail(str(e))}) "
+                            "— switching to direct connection"
+                        )
+                        await _switch_client_direct()
+                        continue
+                    prep_error = R_DOWNLOAD_FAILED
+                    prep_detail = _sanitize_detail(str(e))
+                    _log(f"[HLS] Prepare failed: {prep_detail}")
+                    break
 
         if prep is not None:
             result.duration = prep.duration
             result.is_live = prep.is_live
             if prep.bandwidth and prep.duration:
                 result.estimated_size = int(prep.bandwidth * prep.duration / 8)
+            if prep.video_pl is not None and not prep.video_pl.segments:
+                result.reason = R_NO_SEGMENTS
+                result.detail = "playlist has 0 segments"
+                return result
 
         # ---- 2. Workspace + guards ---------------------------------------
         dest_dir = out_dir or HLS_TEMP_DIR or tempfile.gettempdir()
@@ -893,6 +1748,7 @@ async def download_hls_to_mp4(
         except OSError as e:
             _log(f"[HLS] Cannot create output dir {dest_dir}: {e}")
             result.reason = R_REMUX_FAILED
+            result.detail = _sanitize_detail(str(e))
             return result
 
         temp_dir = tempfile.mkdtemp(prefix="hls_", dir=dest_dir)
@@ -908,7 +1764,6 @@ async def download_hls_to_mp4(
             dest_dir, f".hls_{random.randint(10 ** 9, 10 ** 10)}.mp4"
         )
 
-        # Live streams never end by themselves; a long VOD can also be capped.
         limit_seconds = 0
         if duration_cap and duration_cap > 0:
             if prep is None or prep.is_live or (
@@ -916,41 +1771,69 @@ async def download_hls_to_mp4(
             ):
                 limit_seconds = int(duration_cap)
 
-        # The caller can now size its progress bar (0 = size still unknown).
         if on_meta is not None:
             try:
                 on_meta(result.estimated_size or 0)
             except Exception as e:
                 _log(f"[HLS] on_meta callback failed: {e}")
 
-
         # ---- 3. Engine A: local segment downloader -----------------------
         local_inputs: List[str] = []
+        download_error = ""
+        download_detail = ""
+        segments_downloaded = False
+        remux_errors: List[str] = []
+
         if engine in ("auto", "segments") and prep is not None and (
             prep.video_pl is not None and prep.video_pl.segments
         ):
-            try:
-                await _notify(status_cb, "⬇️ Memuat turun segmen HLS…")
-                local_inputs = await _engine_segments(
-                    client, prep, temp_dir, limit_seconds, on_chunk=on_chunk,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                _log(f"[HLS] Engine A failed, trying ffmpeg: {e}")
-                local_inputs = []
+            for seg_try in (0, 1):
+                try:
+                    await _notify(status_cb, "⬇️ Memuat turun segmen HLS…")
+                    local_inputs = await _engine_segments(
+                        client, prep, temp_dir, limit_seconds, on_chunk=on_chunk,
+                    )
+                    segments_downloaded = bool(local_inputs)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except _HlsError as e:
+                    if e.reason in (R_DRM, R_NO_SEGMENTS):
+                        result.reason = e.reason
+                        result.detail = _sanitize_detail(str(e))
+                        return result
+                    download_error = e.reason or R_DOWNLOAD_FAILED
+                    download_detail = _sanitize_detail(str(e))
+                    _log(f"[HLS] Engine A failed: {download_detail}")
+                    break
+                except Exception as e:
+                    if (
+                        seg_try == 0
+                        and _is_proxy_error(e)
+                        and client.proxy_url is not None
+                        and _cfg_proxy_fallback_direct()
+                    ):
+                        _log(
+                            f"[HLS] Proxy failed during segment download ({_sanitize_detail(str(e))}) "
+                            "— switching to direct connection"
+                        )
+                        await _switch_client_direct()
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        os.makedirs(temp_dir, exist_ok=True)
+                        continue
+                    download_error = R_DOWNLOAD_FAILED
+                    download_detail = _sanitize_detail(str(e))
+                    _log(f"[HLS] Engine A failed: {download_detail}")
+                    break
 
         if local_inputs:
             await _notify(status_cb, "🔄 Menukar ke MP4 (stream copy)…")
-            # Probe the downloaded segments first so an unplayable audio codec
-            # (AC-3/E-AC-3/...) is transcoded on the first pass instead of
-            # shipping a silent MP4 — same idea as the MKV→MP4 codec decision.
             modes = await _choose_remux_modes(local_inputs, local=True)
             async with convert_semaphore():
                 ok = await _remux_with_fallbacks(
                     local_inputs, scratch, local=True,
                     timeout=HLS_TIMEOUT, limit_seconds=limit_seconds,
-                    modes=modes,
+                    modes=modes, error_out=remux_errors,
                 )
             if ok:
                 os.replace(scratch, final_path)
@@ -961,23 +1844,33 @@ async def download_hls_to_mp4(
                 result.engine = "segments"
                 _log(f"[HLS] OK {result.name} ({result.size} bytes) via segments")
                 return result
-            _log("[HLS] Engine A remux failed — falling back to ffmpeg")
+            _log(f"[HLS] Engine A remux failed: {remux_errors[-1] if remux_errors else 'unknown'}")
 
         # ---- 4. Engine B: let ffmpeg fetch and remux ---------------------
-        if engine in ("auto", "ffmpeg"):
+        can_run_ffmpeg = (
+            engine == "ffmpeg"
+            or (
+                engine == "auto"
+                and not segments_downloaded
+                and (not is_socks_proxy(client.proxy_url) or _cfg_proxy_fallback_direct())
+            )
+        )
+        if can_run_ffmpeg:
             await _notify(status_cb, "⬇️ Memuat turun & menukar ke MP4 (ffmpeg)…")
-            inputs: List[str] = [prep.video_url if prep and prep.video_url else url]
+            target_url = prep.video_url if prep and prep.video_url else url
+            inputs: List[str] = [target_url]
             if prep is not None and prep.audio_url:
                 inputs.append(prep.audio_url)
             extra = (
-                ffmpeg_header_args(base_headers)
+                _client_ffmpeg_headers(client, base_headers, cookies, target_url)
                 + ffmpeg_proxy_args(client.proxy_url)
             )
-            ok = await _remux_with_fallbacks(
-                inputs, scratch, local=False, timeout=HLS_TIMEOUT,
-                extra_input_args=extra, limit_seconds=limit_seconds,
-                on_progress=on_chunk,
-            )
+            async with convert_semaphore():
+                ok = await _remux_with_fallbacks(
+                    inputs, scratch, local=False, timeout=HLS_TIMEOUT,
+                    extra_input_args=extra, limit_seconds=limit_seconds,
+                    on_progress=on_chunk, error_out=remux_errors,
+                )
             if ok:
                 os.replace(scratch, final_path)
                 published = True
@@ -988,14 +1881,23 @@ async def download_hls_to_mp4(
                 _log(f"[HLS] OK {result.name} ({result.size} bytes) via ffmpeg")
                 return result
 
-        result.reason = R_NO_SEGMENTS if (
-            prep is not None and prep.video_pl is not None
-            and not prep.video_pl.segments
-        ) else (prep_error or R_DOWNLOAD_FAILED)
+        # ---- 5. Accurate failure classification --------------------------
+        if segments_downloaded:
+            result.reason = R_REMUX_FAILED
+            result.detail = _sanitize_detail(remux_errors[-1] if remux_errors else "")
+        elif prep is not None and prep.video_pl is not None and not prep.video_pl.segments:
+            result.reason = R_NO_SEGMENTS
+        elif download_error:
+            result.reason = download_error
+            result.detail = download_detail
+        elif prep_error:
+            result.reason = prep_error
+            result.detail = prep_detail
+        else:
+            result.reason = R_DOWNLOAD_FAILED
+            result.detail = _sanitize_detail(remux_errors[-1] if remux_errors else "")
         return result
     finally:
-        # Always release the HTTP session and the per-job download directory —
-        # on success, failure, timeout and cancellation alike.
         try:
             await client.close()
         except Exception:
@@ -1009,23 +1911,12 @@ async def download_hls_to_mp4(
                 pass
 
 
-
 # ---------------------------------------------------------------------------
 # Startup housekeeping
 # ---------------------------------------------------------------------------
 
 def cleanup_orphaned_hls_dirs() -> None:
-    """Remove leftover HLS scratch from a previous crash.
-
-    Called once at bot startup (synchronous, before the event loop is busy). A
-    🚫 cancel removes its own temp directory and scratch file (see the job's
-    ``finally`` block), but a hard kill (SIGKILL / OOM) cannot: this sweep
-    reclaims those leftovers.
-
-    A generous age gate keeps it safe even if a second bot process happens to be
-    running (in which case its in-flight downloads are far younger than the
-    cutoff).
-    """
+    """Remove leftover HLS scratch from a previous crash."""
     removed = 0
     cutoff = time.time() - 6 * 3600
 
@@ -1057,16 +1948,11 @@ def cleanup_orphaned_hls_dirs() -> None:
         _log(f"[HLS] Cleaned up {removed} orphaned temp item(s)")
 
 
-
 # ---------------------------------------------------------------------------
 # Self-test / manual smoke check
 # ---------------------------------------------------------------------------
-# No test framework is used in this project, so this block (run with
-# ``python -m app.hls.downloader``) performs a real download + remux of a public
-# HLS test stream and asserts the container/cleanup invariants.
 
 if __name__ == "__main__":
-    import json
     import subprocess
     import sys
 
@@ -1103,7 +1989,7 @@ if __name__ == "__main__":
         res = await download_hls_to_mp4(
             TEST_URL, "selftest.m3u8", out_dir=work, max_duration=20,
         )
-        _check("converted", res.converted, f"reason={res.reason!r}")
+        _check("converted", res.converted, f"reason={res.reason!r} detail={res.detail!r}")
         if not res.converted:
             shutil.rmtree(work, ignore_errors=True)
             return
@@ -1164,4 +2050,3 @@ if __name__ == "__main__":
     for name in failures:
         print(f"    FAILED: {name}")
     sys.exit(1 if failures else 0)
-

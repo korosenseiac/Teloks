@@ -52,27 +52,44 @@ _NON_MP4_AUDIO_TOKENS = (
 )
 
 
+def strip_bom(text: str) -> str:
+    """Drop a leading UTF-8 byte-order mark (``\\ufeff``) and surrounding blanks.
+
+    Plenty of CDNs (and Windows-based packagers) prepend a BOM to the playlist;
+    ``"\\ufeff#EXTM3U".startswith("#EXTM3U")`` is False, which used to reject a
+    perfectly valid playlist as "not HLS".
+    """
+    return (text or "").lstrip("\ufeff \t\r\n")
+
+
 def is_hls_playlist(text: str) -> bool:
-    """True when *text* looks like an M3U8 playlist at all."""
-    return text.lstrip().startswith("#EXTM3U")
+    """True when *text* looks like an M3U8 playlist at all (BOM tolerant)."""
+    return strip_bom(text).startswith("#EXTM3U")
 
 
 def is_master_playlist(text: str) -> bool:
     """True when the playlist lists variants (a master) instead of segments."""
-    return "#EXT-X-STREAM-INF" in text
+    return "#EXT-X-STREAM-INF" in (text or "")
 
 
 def is_drm(text: str) -> bool:
     """True when the playlist is DRM protected (cannot be downloaded here)."""
-    for line in text.splitlines():
+    for line in (text or "").splitlines():
         stripped = line.strip()
         if not stripped.startswith(("#EXT-X-KEY", "#EXT-X-SESSION-KEY")):
             continue
         attrs = parse_attributes(stripped.split(":", 1)[1] if ":" in stripped else "")
-        if (attrs.get("METHOD") or "").upper() in _UNSUPPORTED_KEY_METHODS:
+        method = (attrs.get("METHOD") or "").upper()
+        if method in _UNSUPPORTED_KEY_METHODS:
             return True
+        if method == "NONE":
+            continue
         # A data: URI carries a PSSH/licence blob, not a bare AES key.
         if (attrs.get("URI") or "").lower().startswith("data:"):
+            return True
+        # FairPlay/Widevine/PlayReady key systems: the URI is a licence, not a key.
+        keyformat = (attrs.get("KEYFORMAT") or "").strip().lower()
+        if keyformat and keyformat != "identity":
             return True
     return False
 
@@ -144,11 +161,29 @@ def _parse_resolution(value: str) -> Tuple[int, int]:
 
 def _parse_byte_range(value: str) -> Optional[Tuple[int, int]]:
     """Parse ``length[@offset]`` into ``(offset, length)`` (offset defaults 0)."""
-    value = value.strip().strip('"')
+    parsed = _parse_byte_range_raw(value)
+    if parsed is None:
+        return None
+    offset, length = parsed
+    return (offset or 0), length
+
+
+def _parse_byte_range_raw(value: str) -> Optional[Tuple[Optional[int], int]]:
+    """Parse ``length[@offset]`` into ``(offset | None, length)``.
+
+    ``None`` as offset means "not given": RFC 8216 §4.3.2.2 then says the
+    sub-range starts right after the previous segment's sub-range, which the
+    media parser resolves (the old parser silently restarted at byte 0, so every
+    such segment re-downloaded the head of the file).
+    """
+    value = (value or "").strip().strip('"')
     if not value:
         return None
-    length_str, _, offset_str = value.partition("@")
-    return _int(offset_str), _int(length_str)
+    length_str, sep, offset_str = value.partition("@")
+    length = _int(length_str)
+    if length <= 0:
+        return None
+    return (_int(offset_str) if sep else None), length
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +227,7 @@ class EncryptionKey:
     uri: str = ""
     url: str = ""
     iv: str = ""
+    keyformat: str = ""
 
     @property
     def is_aes128(self) -> bool:
@@ -205,6 +241,13 @@ class MediaSegment:
     duration: float = 0.0
     byte_range: Optional[Tuple[int, int]] = None   # (offset, length)
     key_index: int = 0                             # index into MediaPlaylist.keys
+    #: Media sequence number (drives the implicit AES-128 IV).
+    sequence: int = 0
+    #: The ``#EXT-X-MAP`` in force for this segment ("" = none / TS).
+    init_url: str = ""
+    init_byte_range: Optional[Tuple[int, int]] = None
+    #: An ``#EXT-X-DISCONTINUITY`` precedes this segment.
+    discontinuity: bool = False
 
 
 @dataclass
@@ -212,7 +255,7 @@ class MediaPlaylist:
     """Parsed media playlist (the file that actually lists segments)."""
     segments: List[MediaSegment] = field(default_factory=list)
     keys: List[EncryptionKey] = field(default_factory=lambda: [EncryptionKey()])
-    init_url: str = ""                              # #EXT-X-MAP URI (fMP4)
+    init_url: str = ""                              # first #EXT-X-MAP URI (fMP4)
     init_byte_range: Optional[Tuple[int, int]] = None
     media_sequence: int = 0
     target_duration: int = 0
@@ -226,6 +269,15 @@ class MediaPlaylist:
         """True when at least one segment is AES-128 encrypted."""
         return any(k.is_aes128 for k in self.keys)
 
+    @property
+    def init_sections(self) -> List[Tuple[str, Optional[Tuple[int, int]]]]:
+        """Distinct ``(init_url, init_byte_range)`` pairs, in playlist order."""
+        seen: List[Tuple[str, Optional[Tuple[int, int]]]] = []
+        for seg in self.segments:
+            if seg.init_url and (seg.init_url, seg.init_byte_range) not in seen:
+                seen.append((seg.init_url, seg.init_byte_range))
+        return seen
+
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +290,7 @@ def parse_master(text: str, base_url: str) -> Tuple[List[Variant], List[AudioTra
     audios: List[AudioTrack] = []
     pending: Optional[Dict[str, str]] = None
 
-    for raw in text.splitlines():
+    for raw in strip_bom(text).splitlines():
         line = raw.strip()
         if not line:
             continue
@@ -342,6 +394,36 @@ def select_variant(variants: List[Variant], max_height: int = 0) -> Optional[Var
     return best
 
 
+def rank_variants(variants: List[Variant], max_height: int = 0) -> List[Variant]:
+    """All variants, best first: :func:`select_variant`'s pick, then fallbacks.
+
+    The downloader walks this list when the preferred variant's playlist cannot
+    be fetched (a dead CDN edge, a 403 on one rendition only, ...), instead of
+    failing the whole job on the first variant. Variants within the height cap
+    come before the ones above it; duplicates (same URL) are listed once.
+    """
+    if not variants:
+        return []
+    first = select_variant(variants, max_height)
+    capped = [
+        v for v in variants
+        if max_height <= 0 or (0 < v.height <= max_height) or v.height == 0
+    ]
+    rest_in_cap = sorted(capped, key=lambda v: (v.rank_bandwidth, v.height), reverse=True)
+    rest_over = sorted(
+        (v for v in variants if v not in capped),
+        key=lambda v: (v.rank_bandwidth, v.height),
+    )
+    ordered: List[Variant] = []
+    seen = set()
+    for v in [first] + rest_in_cap + rest_over:
+        if v is None or not v.url or v.url in seen:
+            continue
+        seen.add(v.url)
+        ordered.append(v)
+    return ordered
+
+
 def select_audio_track(
     audios: List[AudioTrack], group_id: str
 ) -> Optional[AudioTrack]:
@@ -358,6 +440,9 @@ def select_audio_track(
     for track in group:
         if track.default:
             return track
+    for track in group:
+        if track.autoselect:
+            return track
     return group[0]
 
 
@@ -366,12 +451,24 @@ def select_audio_track(
 # ---------------------------------------------------------------------------
 
 def parse_media(text: str, base_url: str) -> MediaPlaylist:
-    """Parse a media playlist into segments, keys and fMP4 init info."""
+    """Parse a media playlist into segments, keys and fMP4 init info.
+
+    Besides the basics this tracks, per segment: its media sequence number (the
+    implicit AES-128 IV), the ``#EXT-X-MAP`` in force (a playlist may switch
+    init sections mid-stream), ``#EXT-X-DISCONTINUITY`` markers, and the RFC
+    8216 running offset of ``#EXT-X-BYTERANGE`` entries without ``@offset``.
+    """
+    text = strip_bom(text)
     pl = MediaPlaylist()
     pl.is_live = "#EXT-X-ENDLIST" not in text
     current_key = 0
     pending_duration = 0.0
-    pending_range: Optional[Tuple[int, int]] = None
+    pending_range: Optional[Tuple[Optional[int], int]] = None
+    pending_discontinuity = False
+    current_init = ""
+    current_init_range: Optional[Tuple[int, int]] = None
+    last_range_end: Dict[str, int] = {}
+    sequence_base: Optional[int] = None
 
     for raw in text.splitlines():
         line = raw.strip()
@@ -381,7 +478,7 @@ def parse_media(text: str, base_url: str) -> MediaPlaylist:
         if line.startswith("#EXTINF:"):
             pending_duration = _float(line.split(":", 1)[1].split(",")[0])
         elif line.startswith("#EXT-X-BYTERANGE:"):
-            pending_range = _parse_byte_range(line.split(":", 1)[1])
+            pending_range = _parse_byte_range_raw(line.split(":", 1)[1])
         elif line.startswith("#EXT-X-KEY:"):
             attrs = parse_attributes(line.split(":", 1)[1])
             key = EncryptionKey(
@@ -389,6 +486,7 @@ def parse_media(text: str, base_url: str) -> MediaPlaylist:
                 uri=attrs.get("URI", ""),
                 url=urljoin(base_url, attrs["URI"]) if attrs.get("URI") else "",
                 iv=attrs.get("IV", ""),
+                keyformat=attrs.get("KEYFORMAT", ""),
             )
             pl.keys.append(key)
             current_key = len(pl.keys) - 1
@@ -396,32 +494,58 @@ def parse_media(text: str, base_url: str) -> MediaPlaylist:
             attrs = parse_attributes(line.split(":", 1)[1])
             uri = attrs.get("URI", "")
             if uri:
-                pl.init_url = urljoin(base_url, uri)
-                if attrs.get("BYTERANGE"):
-                    pl.init_byte_range = _parse_byte_range(attrs["BYTERANGE"])
+                current_init = urljoin(base_url, uri)
+                current_init_range = (
+                    _parse_byte_range(attrs["BYTERANGE"]) if attrs.get("BYTERANGE") else None
+                )
+                if not pl.init_url:
+                    pl.init_url = current_init
+                    pl.init_byte_range = current_init_range
             pl.is_fmp4 = True
+        elif line.startswith("#EXT-X-DISCONTINUITY") and not line.startswith(
+            "#EXT-X-DISCONTINUITY-SEQUENCE"
+        ):
+            pending_discontinuity = True
         elif line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
             pl.media_sequence = _int(line.split(":", 1)[1])
         elif line.startswith("#EXT-X-TARGETDURATION:"):
             pl.target_duration = _int(line.split(":", 1)[1])
         elif line.startswith("#EXT-X-VERSION:"):
             pl.version = _int(line.split(":", 1)[1]) or 3
+        elif line.startswith("#EXT-X-PLAYLIST-TYPE:"):
+            if line.split(":", 1)[1].strip().upper() == "VOD":
+                pl.is_live = False
         elif line.startswith("#"):
             continue
         else:
             # A URI line: the segment itself.
+            if sequence_base is None:
+                sequence_base = pl.media_sequence
+            url = urljoin(base_url, line)
+            byte_range: Optional[Tuple[int, int]] = None
+            if pending_range is not None:
+                offset, length = pending_range
+                if offset is None:
+                    offset = last_range_end.get(url, 0)
+                byte_range = (offset, length)
+                last_range_end[url] = offset + length
             pl.segments.append(MediaSegment(
-                url=urljoin(base_url, line),
+                url=url,
                 duration=pending_duration,
-                byte_range=pending_range,
+                byte_range=byte_range,
                 key_index=current_key,
+                sequence=sequence_base + len(pl.segments),
+                init_url=current_init,
+                init_byte_range=current_init_range,
+                discontinuity=pending_discontinuity,
             ))
             pl.total_duration += pending_duration
             path = line.split("?", 1)[0].lower()
-            if path.endswith((".m4s", ".mp4", ".cmfv", ".cmfa")):
+            if path.endswith((".m4s", ".mp4", ".cmfv", ".cmfa", ".m4v", ".m4a")):
                 pl.is_fmp4 = True
             pending_duration = 0.0
             pending_range = None
+            pending_discontinuity = False
 
     return pl
 
@@ -539,13 +663,43 @@ seg1.m4s
     _check("init byterange parsed", fmp4.init_byte_range == (0, 1024), str(fmp4.init_byte_range))
     _check("2 m4s segments", len(fmp4.segments) == 2, str(len(fmp4.segments)))
 
-    print("--- DRM ---")
+    print("--- DRM & edge cases ---")
     _check("SAMPLE-AES rejected", is_drm(
         '#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://x"\nseg.ts\n'))
     _check("data: key rejected", is_drm(
         '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="data:text/plain;base64,AAAA"\nseg.ts\n'))
+    _check("FairPlay KEYFORMAT rejected", is_drm(
+        '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="skd://x",KEYFORMAT="com.apple.streamingkeydelivery"\nseg.ts\n'))
     _check("AES-128 key allowed", not is_drm(_MEDIA))
     _check("no key at all allowed", not is_drm("#EXTM3U\n#EXTINF:9,\nseg.ts\n#EXT-X-ENDLIST\n"))
+    _check("UTF-8 BOM tolerated", is_hls_playlist("\ufeff#EXTM3U\n#EXTINF:5,\ns.ts\n#EXT-X-ENDLIST\n"))
+
+    _BYTERANGE_CONT = """#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-TARGETDURATION:6
+#EXT-X-MAP:URI="media.mp4",BYTERANGE="800@0"
+#EXTINF:5.0,
+#EXT-X-BYTERANGE:1200@800
+media.mp4
+#EXTINF:5.0,
+#EXT-X-BYTERANGE:1500
+media.mp4
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init2.mp4"
+#EXTINF:4.0,
+seg2.m4s
+#EXT-X-ENDLIST
+"""
+    _br = parse_media(_BYTERANGE_CONT, _MASTER_URL)
+    _check("running byterange offset computed",
+           _br.segments[1].byte_range == (2000, 1500), str(_br.segments[1].byte_range))
+    _check("discontinuity flag preserved", _br.segments[2].discontinuity is True)
+    _check("per-segment #EXT-X-MAP preserved",
+           _br.segments[0].init_url.endswith("media.mp4")
+           and _br.segments[2].init_url.endswith("init2.mp4"),
+           str([s.init_url for s in _br.segments]))
+    _check("rank_variants lists fallback variants",
+           len(rank_variants(variants)) == 2)
 
     print("---", "ALL PASSED" if not _failed else f"{len(_failed)} FAILURE(S)")
     for name in _failed:
