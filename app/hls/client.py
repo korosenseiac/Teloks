@@ -21,7 +21,9 @@ import asyncio
 import datetime
 import email.utils
 import http.cookies
+import importlib.util
 import os
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 from urllib.parse import quote, urlparse
 
@@ -60,19 +62,128 @@ _FLUSH_THRESHOLD = 1024 * 1024
 _CHUNK_READ_SIZE = 256 * 1024
 _MAX_IGNORED_RANGE_SKIP = 32 * 1024 * 1024
 
-# Headers for a *page* fetch (manifest extraction): a browser asks for HTML and
-# accepts the JSON/script wrappers some players use instead of plain markup.
+# Headers for a *page* fetch (manifest extraction): authentic browser document
+# navigation headers (no Origin on GET — real browsers never send Origin on
+# top-level document navigations).
 _PAGE_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,"
-              "text/plain;q=0.8,*/*;q=0.5",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "application/json;q=0.8,image/avif,image/webp,*/*;q=0.5",
     "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
 }
 _PAGE_CONTENT_TYPES = {
     "application/xhtml+xml", "application/json", "application/ld+json",
     "application/javascript", "application/x-javascript",
+    "application/xml", "text/xml",
 }
+_DIRECT_VIDEO_CONTENT_TYPES = {
+    "video/mp4", "video/webm", "video/quicktime", "video/x-matroska",
+    "video/x-flv", "video/ogg", "video/3gpp", "video/x-msvideo", "video/mpeg",
+}
+_SNIFF_HEAD_BYTES = 64 * 1024
 
 _PERMANENT_HTTP_STATUSES = frozenset({401, 403, 404, 410, 451})
+_CURL_CFFI_RETRY_STATUSES = frozenset({403, 503})
+_CURL_CFFI_SPEC_CACHE: Optional[bool] = None
+
+
+def curl_cffi_available() -> bool:
+    """True when ``curl_cffi`` is enabled in config and importable."""
+    global _CURL_CFFI_SPEC_CACHE
+    if not bool(getattr(_app_config, "HLS_CURL_CFFI_ENABLED", True)):
+        return False
+    if _CURL_CFFI_SPEC_CACHE is None:
+        _CURL_CFFI_SPEC_CACHE = importlib.util.find_spec("curl_cffi") is not None
+    return _CURL_CFFI_SPEC_CACHE
+
+
+def _looks_like_video_magic(head: bytes) -> bool:
+    """True when *head* starts with a known progressive video container signature."""
+    if len(head) < 12:
+        return False
+    # ISO BMFF / MP4 / MOV: 4-byte big-endian size + 'ftyp'/'moov'/'wide'/'mdat'
+    if head[4:8] in (b"ftyp", b"moov", b"wide", b"free"):
+        box_size = int.from_bytes(head[0:4], "big")
+        if 8 <= box_size <= 64 * 1024 * 1024 or box_size in (0, 1):
+            return True
+    # EBML / WebM / MKV
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return True
+    # FLV
+    if head.startswith(b"FLV\x01"):
+        return True
+    # AVI
+    if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+        return True
+    # Ogg
+    if head.startswith(b"OggS"):
+        return True
+    return False
+
+
+def sniff_stream_bytes(head: bytes, content_type: str = "") -> str:
+    """Classify a response from its leading bytes and Content-Type.
+
+    Returns ``"hls"`` | ``"dash"`` | ``"direct"`` | ``""``.
+    """
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    stripped = (head or b"").lstrip(b"\xef\xbb\xbf \t\r\n")
+    upper_prefix = stripped[:7].upper()
+    if upper_prefix == b"#EXTM3U":
+        return "hls"
+    if "mpegurl" in ctype:
+        # Guard against 200 OK HTML error pages mis-labelled as mpegurl.
+        low_head = stripped[:64].lower()
+        if low_head.startswith((b"<!doctype", b"<html", b"<head", b"<body", b"{")):
+            return ""
+        if not stripped or upper_prefix.startswith(b"#"):
+            return "hls"
+    if "dash+xml" in ctype or (
+        stripped[:5].upper() in (b"<MPD ", b"<MPD>", b"<?XML")
+        and b"<MPD" in stripped[:2048].upper()
+    ):
+        return "dash"
+    if ctype in _DIRECT_VIDEO_CONTENT_TYPES or (
+        ctype.startswith("video/") and ctype != "video/mp2t"
+    ):
+        # Guard against HTML error pages served with a bogus video/* Content-Type.
+        low_head = stripped[:64].lower()
+        if low_head.startswith((b"<!doctype", b"<html", b"<head", b"<body")):
+            return ""
+        return "direct"
+    if _looks_like_video_magic(head or b""):
+        return "direct"
+    return ""
+
+
+@dataclass
+class PageFetchResult:
+    """Structured outcome of :meth:`HlsClient.fetch_page_probe`."""
+
+    #: "page" | "hls" | "dash" | "direct" | "not-a-page"
+    kind: str = "not-a-page"
+    text: str = ""
+    final_url: str = ""
+    content_type: str = ""
+    content_length: Optional[int] = None
+    headers: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class MediaProbe:
+    """Lightweight probe result for validating a candidate stream URL."""
+
+    url: str = ""
+    status: int = 0
+    #: "hls" | "dash" | "direct" | ""
+    stream_type: str = ""
+    content_type: str = ""
+    content_length: Optional[int] = None
+    text_preview: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +546,7 @@ class HlsClient:
         proxy_url: Any = AUTO_PROXY,
         *,
         cookies: Optional[Union[Dict[str, str], Iterable[Dict[str, Any]]]] = None,
+        cookie_entries: Optional[Iterable[Dict[str, Any]]] = None,
         max_connections: Optional[int] = None,
         connect_timeout: Optional[float] = None,
         segment_timeout: Optional[float] = None,
@@ -460,8 +572,13 @@ class HlsClient:
 
         if cookies:
             self._ingest_cookies(cookies)
+        if cookie_entries:
+            self._ingest_cookies(cookie_entries)
 
         self._session: Optional[aiohttp.ClientSession] = None
+        self._curl_session: Any = None
+        self._curl_proxy_key: Optional[tuple] = None
+        self._curl_cffi_hosts: set[str] = set()
         # AUTO_PROXY (the default) uses WARP when ON, falling back to proxy.txt;
         # explicit values (e.g. None for direct) bypass WARP/proxy.txt.
         self._proxy_mode: str = "auto" if proxy_url is AUTO_PROXY else "explicit"
@@ -684,6 +801,105 @@ class HlsClient:
                 out[str(name)] = str(item.get("value") or "")
         return out
 
+    def export_cookie_entries(self, url: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Return domain/path-scoped cookie dicts suitable for ``HlsClient(cookie_entries=...)``."""
+        entries: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str, str]] = set()
+
+        def _add(entry: Dict[str, Any]) -> None:
+            name = str(entry.get("name") or "")
+            if not name:
+                return
+            domain = str(entry.get("domain") or "")
+            path = str(entry.get("path") or "/")
+            key = (domain.lower(), path, name)
+            if key in seen:
+                return
+            seen.add(key)
+            entries.append(entry)
+
+        if self._session is not None and not self._session.closed:
+            jar = getattr(self._session, "cookie_jar", None)
+            if jar is not None:
+                host_only = set(getattr(jar, "host_only_cookies", ()) or ())
+                expirations = getattr(jar, "_expirations", {}) or {}
+                try:
+                    morsels = list(jar)
+                except Exception:
+                    morsels = []
+                for morsel in morsels:
+                    if not isinstance(morsel, http.cookies.Morsel):
+                        continue
+                    domain = str(morsel["domain"] or "")
+                    path = str(morsel["path"] or "/")
+                    name = str(morsel.key)
+                    if url and domain:
+                        try:
+                            req_host = (urlparse(url).hostname or "").lower()
+                            dlow = domain.lstrip(".").lower()
+                            if req_host and req_host != dlow and not req_host.endswith("." + dlow):
+                                continue
+                        except ValueError:
+                            pass
+                    entry: Dict[str, Any] = {
+                        "name": name,
+                        "value": morsel.value,
+                        "domain": domain,
+                        "path": path,
+                        "host_only": (domain, name) in host_only,
+                        "secure": bool(morsel.get("secure")),
+                        "httpOnly": bool(morsel.get("httponly")),
+                    }
+                    exp = expirations.get((domain, path.rstrip("/"), name))
+                    if exp is not None:
+                        entry["expires"] = exp
+                    _add(entry)
+                if entries:
+                    return entries
+
+        for item in self._pending_morsels.values():
+            _add({
+                "name": str(item.get("name") or ""),
+                "value": str(item.get("value") or ""),
+                "domain": str(item.get("domain") or ""),
+                "path": str(item.get("path") or "/"),
+                "host_only": bool(item.get("host_only")),
+                "secure": bool((item.get("attrs") or {}).get("secure")),
+                "httpOnly": bool((item.get("attrs") or {}).get("httponly")),
+                **({"expires": item["expires_ts"]} if "expires_ts" in item else {}),
+            })
+        for item in self._pending_cookie_entries:
+            _add(dict(item))
+        if self._pending_cookies:
+            host = ""
+            if url:
+                try:
+                    host = (urlparse(url).hostname or "").lower()
+                except ValueError:
+                    host = ""
+            for k, v in self._pending_cookies.items():
+                _add({
+                    "name": str(k),
+                    "value": str(v),
+                    "domain": host,
+                    "path": "/",
+                    "host_only": bool(host),
+                })
+        return entries
+
+    def cookie_header_for_url(self, url: str) -> str:
+        """Build an HTTP ``Cookie`` header string scoped to *url*."""
+        cookies = self.export_cookies(url)
+        if not cookies:
+            return ""
+        parts = []
+        for k, v in cookies.items():
+            sk = _sanitize_header_part(str(k)).strip()
+            sv = _sanitize_header_part(str(v)).strip()
+            if sk:
+                parts.append(f"{sk}={sv}")
+        return "; ".join(parts)
+
     # ------------------------------------------------------------- session
 
     def _effective_connect_timeout(self) -> float:
@@ -849,11 +1065,22 @@ class HlsClient:
         self._session_proxy_key = desired_key
         return self._session
 
+    async def _close_curl_session(self) -> None:
+        curl_sess = self._curl_session
+        self._curl_session = None
+        self._curl_proxy_key = None
+        if curl_sess is not None:
+            try:
+                await curl_sess.close()
+            except Exception:
+                pass
+
     async def switch_to_direct(self) -> None:
         """Drop the configured proxy and reconnect directly (keeping cookies)."""
         if self._session is not None and not self._session.closed:
             self._save_session_cookies()
             await self._session.close()
+        await self._close_curl_session()
         self._session = None
         self._session_proxy_key = None
         self._proxy_mode = "explicit"
@@ -873,6 +1100,455 @@ class HlsClient:
         self._warp_cfg = None
         if session is not None and not session.closed:
             await session.close()
+        await self._close_curl_session()
+
+    def _curl_proxy_map(self) -> Optional[Dict[str, str]]:
+        proxy = self._proxy_url
+        if not proxy:
+            return None
+        if proxy.lower().startswith("socks5://"):
+            proxy = "socks5h://" + proxy[len("socks5://"):]
+        return {"http": proxy, "https": proxy}
+
+    def _host_of(self, url: str) -> str:
+        try:
+            return (urlparse(url).hostname or "").lower()
+        except ValueError:
+            return ""
+
+    def _should_try_curl_cffi(self, url: str, status: Optional[int] = None) -> bool:
+        if not curl_cffi_available():
+            return False
+        if not url.lower().startswith("https://"):
+            return False
+        if status is not None:
+            return int(status) in _CURL_CFFI_RETRY_STATUSES
+        host = self._host_of(url)
+        return bool(host and host in self._curl_cffi_hosts)
+
+    async def _get_curl_session(self) -> Any:
+        from curl_cffi.requests import AsyncSession
+
+        desired_key = self._session_proxy_key or ("proxy", self._proxy_url)
+        if self._curl_session is not None and self._curl_proxy_key == desired_key:
+            return self._curl_session
+        await self._close_curl_session()
+        proxies = self._curl_proxy_map()
+        kwargs: Dict[str, Any] = {
+            "impersonate": "chrome",
+            "verify": False,
+        }
+        if proxies:
+            kwargs["proxies"] = proxies
+        self._curl_session = AsyncSession(**kwargs)
+        self._curl_proxy_key = desired_key
+        return self._curl_session
+
+    def _prepare_curl_headers(
+        self, url: str, req_headers: Dict[str, str]
+    ) -> Dict[str, str]:
+        hdrs = dict(req_headers)
+        if "cookie" not in {k.lower() for k in hdrs}:
+            cookie_hdr = self.cookie_header_for_url(url)
+            if cookie_hdr:
+                hdrs["Cookie"] = cookie_hdr
+        return hdrs
+
+    def _sync_curl_cookies(self, resp: Any, final_url: str) -> None:
+        try:
+            rc = getattr(resp, "cookies", None)
+            if not rc:
+                return
+            if hasattr(rc, "items"):
+                cookie_map = {str(k): str(v) for k, v in rc.items() if k and v is not None}
+                if cookie_map:
+                    self.update_cookies(cookie_map, url=final_url)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _curl_header(resp: Any, name: str) -> str:
+        hdrs = getattr(resp, "headers", None)
+        if not hdrs:
+            return ""
+        val = hdrs.get(name)
+        if val is not None:
+            return str(val)
+        low = name.lower()
+        for k, v in hdrs.items():
+            if str(k).lower() == low and v is not None:
+                return str(v)
+        return ""
+
+    @staticmethod
+    def _parse_content_length(raw: str) -> Optional[int]:
+        if not raw:
+            return None
+        try:
+            val = int(raw.strip())
+            return val if val >= 0 else None
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_content_range_total(raw: str) -> Optional[int]:
+        if not raw or "/" not in raw:
+            return None
+        total_part = raw.rsplit("/", 1)[-1].strip()
+        if not total_part or total_part == "*":
+            return None
+        try:
+            val = int(total_part)
+            return val if val >= 0 else None
+        except ValueError:
+            return None
+
+    async def _curl_fetch_text_with_url(
+        self,
+        url: str,
+        req_headers: Dict[str, str],
+        *,
+        max_bytes: int = 8 * 1024 * 1024,
+    ) -> Tuple[str, str]:
+        curl_sess = await self._get_curl_session()
+        hdrs = self._prepare_curl_headers(url, req_headers)
+        resp = await curl_sess.get(
+            url,
+            headers=hdrs,
+            timeout=45.0,
+            allow_redirects=True,
+            verify=False,
+            stream=True,
+        )
+        try:
+            final_url = str(getattr(resp, "url", "") or url)
+            self._sync_curl_cookies(resp, final_url)
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if status >= 400:
+                retry_after = _parse_retry_after(self._curl_header(resp, "Retry-After"))
+                raise HlsHttpError(status, final_url, retry_after=retry_after)
+            ctype = self._curl_header(resp, "Content-Type").split(";", 1)[0].strip().lower()
+            cl = self._parse_content_length(self._curl_header(resp, "Content-Length"))
+            if cl is not None and cl > max_bytes:
+                raise ValueError(
+                    f"Playlist response too large ({cl} > {max_bytes} bytes) for {redact_url(url)}"
+                )
+            needs_sniff = bool(
+                ctype
+                and "mpegurl" not in ctype
+                and (ctype == "application/octet-stream" or ctype.startswith(("video/", "audio/", "image/")))
+            )
+            checked = False
+            body = bytearray()
+            async for chunk in resp.aiter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    raise ValueError(
+                        f"Playlist response exceeded {max_bytes} bytes for {redact_url(url)}"
+                    )
+                if needs_sniff and not checked:
+                    head = bytes(body).lstrip(b"\xef\xbb\xbf \t\r\n")
+                    if not head:
+                        if len(body) >= 64:
+                            raise ValueError(f"Non-playlist Content-Type ({ctype}) for {redact_url(url)}")
+                        continue
+                    if len(head) < 7 and b"#EXTM3U".startswith(head.upper()):
+                        continue
+                    if head[:7].upper() != b"#EXTM3U":
+                        raise ValueError(f"Non-playlist Content-Type ({ctype}) for {redact_url(url)}")
+                    checked = True
+            if needs_sniff and not checked:
+                head = bytes(body).lstrip(b"\xef\xbb\xbf \t\r\n")
+                if head[:7].upper() != b"#EXTM3U":
+                    raise ValueError(f"Non-playlist Content-Type ({ctype}) for {redact_url(url)}")
+            host = self._host_of(final_url) or self._host_of(url)
+            if host:
+                self._curl_cffi_hosts.add(host)
+            charset = getattr(resp, "charset", None) or getattr(resp, "encoding", None)
+            return decode_text(bytes(body), charset), final_url
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+
+    async def _curl_fetch_bytes(
+        self,
+        url: str,
+        req_headers: Dict[str, str],
+        *,
+        byte_range: Optional[Tuple[int, int]] = None,
+        on_chunk: Optional[Callable[[int], None]] = None,
+        timeout: float = 120.0,
+    ) -> bytes:
+        curl_sess = await self._get_curl_session()
+        hdrs = self._prepare_curl_headers(url, req_headers)
+        resp = await curl_sess.get(
+            url,
+            headers=hdrs,
+            timeout=timeout,
+            allow_redirects=True,
+            verify=False,
+            stream=True,
+        )
+        try:
+            final_url = str(getattr(resp, "url", "") or url)
+            self._sync_curl_cookies(resp, final_url)
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if status >= 400:
+                retry_after = _parse_retry_after(self._curl_header(resp, "Retry-After"))
+                raise HlsHttpError(status, final_url, retry_after=retry_after)
+            expected: Optional[int] = None
+            offset = 0
+            if byte_range is not None:
+                offset, expected = int(byte_range[0]), int(byte_range[1])
+            cl = self._parse_content_length(self._curl_header(resp, "Content-Length"))
+            content_range = self._curl_header(resp, "Content-Range")
+            content_enc = self._curl_header(resp, "Content-Encoding")
+            buf = bytearray()
+            total_written = 0
+            if (
+                byte_range is not None
+                and status == 200
+                and not content_range
+                and not (offset == 0 and cl is not None and cl == expected)
+            ):
+                if offset > _MAX_IGNORED_RANGE_SKIP:
+                    raise ValueError(
+                        f"Server ignored Range header (200 OK) at offset {offset} for {redact_url(url)}"
+                    )
+                end = offset + (expected or 0)
+                pos = 0
+                async for chunk in resp.aiter_content(chunk_size=_CHUNK_READ_SIZE):
+                    if not chunk:
+                        continue
+                    chunk_end = pos + len(chunk)
+                    if chunk_end > offset and pos < end:
+                        piece = chunk[max(0, offset - pos):min(len(chunk), end - pos)]
+                        if piece:
+                            buf.extend(piece)
+                            total_written += len(piece)
+                            if on_chunk is not None:
+                                try:
+                                    on_chunk(len(piece))
+                                except Exception as e:
+                                    print(f"[HLS] progress callback failed: {e}")
+                    pos = chunk_end
+                    if pos >= end:
+                        break
+            else:
+                async for chunk in resp.aiter_content(chunk_size=_CHUNK_READ_SIZE):
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    total_written += len(chunk)
+                    if on_chunk is not None:
+                        try:
+                            on_chunk(len(chunk))
+                        except Exception as e:
+                            print(f"[HLS] progress callback failed: {e}")
+
+            if expected is not None:
+                if total_written != expected:
+                    raise ValueError(
+                        f"Byte-range segment truncated: got {total_written} of {expected} "
+                        f"bytes for {redact_url(url)}"
+                    )
+            else:
+                if total_written == 0:
+                    raise ValueError(f"Empty response (0 bytes) for {redact_url(url)}")
+                if cl is not None and cl > 0 and not content_enc and total_written < cl:
+                    raise ValueError(
+                        f"Segment truncated: got {total_written} of {cl} bytes for {redact_url(url)}"
+                    )
+            host = self._host_of(final_url) or self._host_of(url)
+            if host:
+                self._curl_cffi_hosts.add(host)
+            return bytes(buf)
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+
+    async def _curl_fetch_page_probe(
+        self,
+        url: str,
+        req_headers: Dict[str, str],
+        *,
+        max_bytes: int = 4 * 1024 * 1024,
+    ) -> PageFetchResult:
+        curl_sess = await self._get_curl_session()
+        hdrs = self._prepare_curl_headers(url, req_headers)
+        resp = await curl_sess.get(
+            url,
+            headers=hdrs,
+            timeout=45.0,
+            allow_redirects=True,
+            verify=False,
+            stream=True,
+        )
+        try:
+            final_url = str(getattr(resp, "url", "") or url)
+            self._sync_curl_cookies(resp, final_url)
+            status = int(getattr(resp, "status_code", 0) or 0)
+            if status >= 400:
+                retry_after = _parse_retry_after(self._curl_header(resp, "Retry-After"))
+                raise HlsHttpError(status, final_url, retry_after=retry_after)
+            disp = self._curl_header(resp, "Content-Disposition").lower()
+            ctype = self._curl_header(resp, "Content-Type").split(";", 1)[0].strip().lower()
+            cl = self._parse_content_length(self._curl_header(resp, "Content-Length"))
+            if "attachment" in disp:
+                return PageFetchResult(
+                    kind="not-a-page",
+                    final_url=final_url,
+                    content_type=ctype,
+                    content_length=cl,
+                )
+            host = self._host_of(final_url) or self._host_of(url)
+            if host:
+                self._curl_cffi_hosts.add(host)
+            return await self._classify_and_read_page_stream(
+                resp.aiter_content(chunk_size=64 * 1024),
+                final_url=final_url,
+                ctype=ctype,
+                content_length=cl,
+                charset=getattr(resp, "charset", None) or getattr(resp, "encoding", None),
+                max_bytes=max_bytes,
+            )
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:
+                pass
+
+    async def _classify_and_read_page_stream(
+        self,
+        chunk_iter: Any,
+        *,
+        final_url: str,
+        ctype: str,
+        content_length: Optional[int],
+        charset: Optional[str],
+        max_bytes: int,
+    ) -> PageFetchResult:
+        # Fast-path direct inline video without reading the full video body.
+        if ctype in _DIRECT_VIDEO_CONTENT_TYPES or (
+            ctype.startswith("video/") and ctype != "video/mp2t"
+        ):
+            head = bytearray()
+            async for chunk in chunk_iter:
+                if not chunk:
+                    continue
+                head.extend(chunk)
+                if len(head) >= 512:
+                    break
+            kind = sniff_stream_bytes(bytes(head), ctype)
+            if kind == "direct":
+                return PageFetchResult(
+                    kind="direct",
+                    final_url=final_url,
+                    content_type=ctype,
+                    content_length=content_length,
+                )
+            if not kind:
+                # Bogus video/* serving HTML — fall through to read as page!
+                body = head
+                async for chunk in chunk_iter:
+                    if not chunk:
+                        continue
+                    body.extend(chunk)
+                    if len(body) >= max_bytes:
+                        break
+                return PageFetchResult(
+                    kind="page",
+                    text=decode_text(bytes(body), charset),
+                    final_url=final_url,
+                    content_type=ctype,
+                    content_length=content_length,
+                )
+
+        is_text_like = (
+            not ctype
+            or ctype.startswith("text/")
+            or ctype in _PAGE_CONTENT_TYPES
+            or ctype.endswith(("+json", "+xml"))
+            or "mpegurl" in ctype
+            or "dash+xml" in ctype
+        )
+        head = bytearray()
+        body = bytearray()
+        if not is_text_like:
+            # Sniff only the leading bytes: catches disguised #EXTM3U / <MPD / inline video
+            # without pulling down a big .zip/.bin file.
+            async for chunk in chunk_iter:
+                if not chunk:
+                    continue
+                head.extend(chunk)
+                if len(head) >= _SNIFF_HEAD_BYTES:
+                    break
+            sniffed = sniff_stream_bytes(bytes(head), ctype)
+            if sniffed == "direct":
+                return PageFetchResult(
+                    kind="direct",
+                    final_url=final_url,
+                    content_type=ctype,
+                    content_length=content_length,
+                )
+            if sniffed not in ("hls", "dash"):
+                return PageFetchResult(
+                    kind="not-a-page",
+                    final_url=final_url,
+                    content_type=ctype,
+                    content_length=content_length,
+                )
+            body.extend(head)
+            async for chunk in chunk_iter:
+                if not chunk:
+                    continue
+                body.extend(chunk)
+                if len(body) >= max_bytes:
+                    break
+            return PageFetchResult(
+                kind=sniffed,
+                text=decode_text(bytes(body), charset),
+                final_url=final_url,
+                content_type=ctype,
+                content_length=content_length,
+            )
+
+        async for chunk in chunk_iter:
+            if not chunk:
+                continue
+            body.extend(chunk)
+            if len(body) >= max_bytes:
+                break
+        raw = bytes(body)
+        sniffed = sniff_stream_bytes(raw[:_SNIFF_HEAD_BYTES], ctype)
+        if sniffed in ("hls", "dash"):
+            return PageFetchResult(
+                kind=sniffed,
+                text=decode_text(raw, charset),
+                final_url=final_url,
+                content_type=ctype,
+                content_length=content_length,
+            )
+        if sniffed == "direct":
+            return PageFetchResult(
+                kind="direct",
+                final_url=final_url,
+                content_type=ctype,
+                content_length=content_length,
+            )
+        return PageFetchResult(
+            kind="page",
+            text=decode_text(raw, charset),
+            final_url=final_url,
+            content_type=ctype,
+            content_length=content_length,
+        )
 
     @property
     def using_warp(self) -> bool:
@@ -956,9 +1632,24 @@ class HlsClient:
         headers: Optional[Dict[str, Optional[str]]] = None,
         max_bytes: int = 8 * 1024 * 1024,
     ) -> Tuple[str, str]:
-        """Fetch a playlist document and return ``(text, final_url)``."""
+        """Fetch a playlist document and return ``(text, final_url)``.
+
+        Sniffs the leading bytes for ``#EXTM3U`` (case-insensitive) before
+        rejecting ``image/*``, ``video/*``, ``audio/*`` or
+        ``application/octet-stream`` so disguised playlists work. Falls back to
+        ``curl_cffi`` Chrome TLS impersonation on HTTPS 403/503 when available.
+        """
         session = await self._get_session()
         req_headers = self._merged_headers(headers)
+        if self._should_try_curl_cffi(url):
+            try:
+                return await self._curl_fetch_text_with_url(
+                    url, req_headers, max_bytes=max_bytes
+                )
+            except (HlsHttpError, HlsProxyError, WarpProxyError, ValueError):
+                raise
+            except Exception:
+                pass
         try:
             async with session.get(
                 url,
@@ -969,15 +1660,20 @@ class HlsClient:
             ) as resp:
                 self._raise_for_status(resp, url)
                 ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-                if ctype and "mpegurl" not in ctype and ctype.startswith(("video/", "audio/", "image/")):
-                    raise ValueError(f"Non-playlist Content-Type ({ctype}) for {redact_url(url)}")
                 cl = resp.content_length
                 if cl is not None and cl > max_bytes:
                     raise ValueError(
                         f"Playlist response too large ({cl} > {max_bytes} bytes) for {redact_url(url)}"
                     )
-                is_octet_stream = (ctype == "application/octet-stream")
-                checked_octet = False
+                needs_sniff = bool(
+                    ctype
+                    and "mpegurl" not in ctype
+                    and (
+                        ctype == "application/octet-stream"
+                        or ctype.startswith(("video/", "audio/", "image/"))
+                    )
+                )
+                checked = False
                 body = bytearray()
                 async for chunk in resp.content.iter_chunked(64 * 1024):
                     if not chunk:
@@ -987,7 +1683,7 @@ class HlsClient:
                         raise ValueError(
                             f"Playlist response exceeded {max_bytes} bytes for {redact_url(url)}"
                         )
-                    if is_octet_stream and not checked_octet:
+                    if needs_sniff and not checked:
                         head = bytes(body).lstrip(b"\xef\xbb\xbf \t\r\n")
                         if not head:
                             if len(body) >= 64:
@@ -997,14 +1693,25 @@ class HlsClient:
                             continue
                         if head[:7].upper() != b"#EXTM3U":
                             raise ValueError(f"Non-playlist Content-Type ({ctype}) for {redact_url(url)}")
-                        checked_octet = True
-                if is_octet_stream and not checked_octet:
+                        checked = True
+                if needs_sniff and not checked:
                     head = bytes(body).lstrip(b"\xef\xbb\xbf \t\r\n")
                     if head[:7].upper() != b"#EXTM3U":
                         raise ValueError(f"Non-playlist Content-Type ({ctype}) for {redact_url(url)}")
                 final_url = str(resp.url or url)
                 return decode_text(bytes(body), resp.charset), final_url
-        except (HlsHttpError, HlsProxyError, WarpProxyError):
+        except HlsHttpError as http_err:
+            if self._should_try_curl_cffi(url, status=http_err.status):
+                try:
+                    return await self._curl_fetch_text_with_url(
+                        url, req_headers, max_bytes=max_bytes
+                    )
+                except WarpProxyError:
+                    raise
+                except Exception:
+                    raise http_err
+            raise
+        except (HlsProxyError, WarpProxyError):
             raise
         except Exception as exc:
             self._raise_if_proxy_error(exc)
@@ -1115,6 +1822,17 @@ class HlsClient:
             offset, length = int(byte_range[0]), int(byte_range[1])
             extra["Range"] = f"bytes={offset}-{offset + length - 1}"
         req_headers = self._merged_headers(extra)
+        curl_to = 45.0 if byte_range is None and on_chunk is None else self._effective_segment_timeout()
+
+        if self._should_try_curl_cffi(url):
+            try:
+                return await self._curl_fetch_bytes(
+                    url, req_headers, byte_range=byte_range, on_chunk=on_chunk, timeout=curl_to
+                )
+            except (HlsHttpError, HlsProxyError, WarpProxyError, ValueError):
+                raise
+            except Exception:
+                pass
 
         try:
             async with session.get(
@@ -1139,7 +1857,18 @@ class HlsClient:
 
                 await self._read_segment_response(resp, url, byte_range, _collect)
                 return bytes(buf)
-        except (HlsHttpError, HlsProxyError, WarpProxyError):
+        except HlsHttpError as http_err:
+            if self._should_try_curl_cffi(url, status=http_err.status):
+                try:
+                    return await self._curl_fetch_bytes(
+                        url, req_headers, byte_range=byte_range, on_chunk=on_chunk, timeout=curl_to
+                    )
+                except WarpProxyError:
+                    raise
+                except Exception:
+                    raise http_err
+            raise
+        except (HlsProxyError, WarpProxyError):
             raise
         except Exception as exc:
             self._raise_if_proxy_error(exc)
@@ -1160,6 +1889,17 @@ class HlsClient:
             offset, length = int(byte_range[0]), int(byte_range[1])
             extra["Range"] = f"bytes={offset}-{offset + length - 1}"
         req_headers = self._merged_headers(extra)
+        curl_to = self._effective_segment_timeout()
+
+        if self._should_try_curl_cffi(url):
+            try:
+                return await self._curl_fetch_bytes(
+                    url, req_headers, byte_range=byte_range, on_chunk=on_chunk, timeout=curl_to
+                )
+            except (HlsHttpError, HlsProxyError, WarpProxyError, ValueError):
+                raise
+            except Exception:
+                pass
 
         try:
             async with session.get(
@@ -1182,7 +1922,106 @@ class HlsClient:
 
                 await self._read_segment_response(resp, url, byte_range, _collect)
                 return bytes(buf)
-        except (HlsHttpError, HlsProxyError, WarpProxyError):
+        except HlsHttpError as http_err:
+            if self._should_try_curl_cffi(url, status=http_err.status):
+                try:
+                    return await self._curl_fetch_bytes(
+                        url, req_headers, byte_range=byte_range, on_chunk=on_chunk, timeout=curl_to
+                    )
+                except WarpProxyError:
+                    raise
+                except Exception:
+                    raise http_err
+            raise
+        except (HlsProxyError, WarpProxyError):
+            raise
+        except Exception as exc:
+            self._raise_if_proxy_error(exc)
+            raise
+
+    def _build_page_headers(
+        self, headers: Optional[Dict[str, Optional[str]]] = None
+    ) -> Dict[str, str]:
+        extra: Dict[str, Optional[str]] = dict(_PAGE_HEADERS)
+        # Real browsers NEVER send Origin on top-level GET document navigations.
+        extra["Origin"] = None
+        if headers:
+            has_ref = any(
+                k.lower() == "referer" and v for k, v in headers.items() if k
+            )
+            if has_ref and not any(
+                k.lower() == "sec-fetch-site" for k in headers if k
+            ):
+                extra["Sec-Fetch-Site"] = "cross-site"
+            extra.update(headers)
+        return self._merged_headers(extra)
+
+    async def fetch_page_probe(
+        self,
+        url: str,
+        max_bytes: int = 4 * 1024 * 1024,
+        *,
+        headers: Optional[Dict[str, Optional[str]]] = None,
+    ) -> PageFetchResult:
+        """Fetch *url* with browser navigation headers and classify the response.
+
+        Detects direct stream responses (``hls`` via ``#EXTM3U``/mpegurl,
+        ``dash`` via ``<MPD``/dash+xml, inline ``direct`` ``video/*``) in a
+        single request so shortlinks/extensionless endpoints are not dropped as
+        ``not-a-page``. Falls back to ``curl_cffi`` on HTTPS 403/503.
+        """
+        session = await self._get_session()
+        req_headers = self._build_page_headers(headers)
+
+        if self._should_try_curl_cffi(url):
+            try:
+                return await self._curl_fetch_page_probe(
+                    url, req_headers, max_bytes=max_bytes
+                )
+            except (HlsHttpError, HlsProxyError, WarpProxyError):
+                raise
+            except Exception:
+                pass
+
+        try:
+            async with session.get(
+                url,
+                headers=req_headers,
+                timeout=self._meta_timeout(),
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                self._raise_for_status(resp, url)
+                final_url = str(resp.url or url)
+                ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                cl = resp.content_length
+                if "attachment" in (resp.headers.get("Content-Disposition") or "").lower():
+                    return PageFetchResult(
+                        kind="not-a-page",
+                        final_url=final_url,
+                        content_type=ctype,
+                        content_length=cl,
+                    )
+                return await self._classify_and_read_page_stream(
+                    resp.content.iter_chunked(64 * 1024),
+                    final_url=final_url,
+                    ctype=ctype,
+                    content_length=cl,
+                    charset=resp.charset,
+                    max_bytes=max_bytes,
+                )
+        except HlsHttpError as http_err:
+            if self._should_try_curl_cffi(url, status=http_err.status):
+                try:
+                    return await self._curl_fetch_page_probe(
+                        url, req_headers, max_bytes=max_bytes
+                    )
+                except WarpProxyError:
+                    raise
+                except Exception:
+                    raise http_err
+            raise
+        except (HlsProxyError, WarpProxyError):
             raise
         except Exception as exc:
             self._raise_if_proxy_error(exc)
@@ -1202,42 +2041,10 @@ class HlsClient:
         aside and let the normal handlers deal with the link. The body is read
         up to *max_bytes*, so a huge page can never stall a job.
         """
-        session = await self._get_session()
-        extra: Dict[str, Optional[str]] = dict(_PAGE_HEADERS)
-        if headers:
-            extra.update(headers)
-        req_headers = self._merged_headers(extra)
-        try:
-            async with session.get(
-                url,
-                headers=req_headers,
-                timeout=self._meta_timeout(),
-                allow_redirects=True,
-                ssl=False,
-            ) as resp:
-                self._raise_for_status(resp, url)
-                if "attachment" in (resp.headers.get("Content-Disposition") or "").lower():
-                    return None
-                ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-                if ctype and not (
-                    ctype.startswith("text/")
-                    or ctype in _PAGE_CONTENT_TYPES
-                    or ctype.endswith(("+json", "+xml"))
-                ):
-                    return None
-
-                body = bytearray()
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    body.extend(chunk)
-                    if len(body) >= max_bytes:
-                        break
-                final_url = str(resp.url or url)
-                return decode_text(bytes(body), resp.charset), final_url
-        except (HlsHttpError, HlsProxyError, WarpProxyError):
-            raise
-        except Exception as exc:
-            self._raise_if_proxy_error(exc)
-            raise
+        probe = await self.fetch_page_probe(url, max_bytes=max_bytes, headers=headers)
+        if probe.kind == "page":
+            return probe.text, probe.final_url
+        return None
 
     async def fetch_page_text(
         self,
@@ -1249,6 +2056,141 @@ class HlsClient:
         """Fetch an HTML/JSON *page* for manifest extraction (text only)."""
         res = await self.fetch_page(url, max_bytes=max_bytes, headers=headers)
         return res[0] if res is not None else None
+
+    async def probe_media(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, Optional[str]]] = None,
+    ) -> MediaProbe:
+        """Lightweight Range-GET probe to classify an unknown stream URL.
+
+        Reads at most 64 KB for binary media (or up to 1 MB when the response
+        sniffs as HLS/DASH so callers can reuse ``text_preview`` without a
+        second fetch).
+        """
+        session = await self._get_session()
+        extra: Dict[str, Optional[str]] = dict(headers or {})
+        extra.setdefault("Range", f"bytes=0-{_SNIFF_HEAD_BYTES - 1}")
+        req_headers = self._merged_headers(extra)
+
+        async def _probe_via_curl() -> MediaProbe:
+            curl_sess = await self._get_curl_session()
+            hdrs = self._prepare_curl_headers(url, req_headers)
+            resp = await curl_sess.get(
+                url,
+                headers=hdrs,
+                timeout=30.0,
+                allow_redirects=True,
+                verify=False,
+                stream=True,
+            )
+            try:
+                final_url = str(getattr(resp, "url", "") or url)
+                self._sync_curl_cookies(resp, final_url)
+                status = int(getattr(resp, "status_code", 0) or 0)
+                if status >= 400:
+                    retry_after = _parse_retry_after(self._curl_header(resp, "Retry-After"))
+                    raise HlsHttpError(status, final_url, retry_after=retry_after)
+                ctype = self._curl_header(resp, "Content-Type").split(";", 1)[0].strip().lower()
+                total_len = self._parse_content_range_total(
+                    self._curl_header(resp, "Content-Range")
+                )
+                if total_len is None:
+                    total_len = self._parse_content_length(
+                        self._curl_header(resp, "Content-Length")
+                    )
+                buf = bytearray()
+                async for chunk in resp.aiter_content(chunk_size=32 * 1024):
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    if len(buf) >= _SNIFF_HEAD_BYTES:
+                        break
+                head = bytes(buf)
+                stype = sniff_stream_bytes(head, ctype)
+                text_prev = ""
+                if stype in ("hls", "dash"):
+                    if status == 200 or (total_len is not None and len(head) >= total_len):
+                        charset = getattr(resp, "charset", None) or getattr(resp, "encoding", None)
+                        text_prev = decode_text(head, charset)
+                host = self._host_of(final_url) or self._host_of(url)
+                if host:
+                    self._curl_cffi_hosts.add(host)
+                return MediaProbe(
+                    url=final_url,
+                    status=status,
+                    stream_type=stype,
+                    content_type=ctype,
+                    content_length=total_len,
+                    text_preview=text_prev,
+                )
+            finally:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+
+        if self._should_try_curl_cffi(url):
+            try:
+                return await _probe_via_curl()
+            except (HlsHttpError, HlsProxyError, WarpProxyError):
+                raise
+            except Exception:
+                pass
+
+        try:
+            async with session.get(
+                url,
+                headers=req_headers,
+                timeout=self._meta_timeout(),
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                self._raise_for_status(resp, url)
+                final_url = str(resp.url or url)
+                ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                total_len = self._parse_content_range_total(
+                    resp.headers.get("Content-Range") or ""
+                )
+                if total_len is None:
+                    total_len = resp.content_length
+                buf = bytearray()
+                async for chunk in resp.content.iter_chunked(32 * 1024):
+                    if not chunk:
+                        continue
+                    buf.extend(chunk)
+                    if len(buf) >= _SNIFF_HEAD_BYTES:
+                        break
+                head = bytes(buf)
+                stype = sniff_stream_bytes(head, ctype)
+                text_prev = ""
+                if stype in ("hls", "dash") and (
+                    resp.status == 200 or (total_len is not None and len(head) >= total_len)
+                ):
+                    text_prev = decode_text(head, resp.charset)
+                return MediaProbe(
+                    url=final_url,
+                    status=resp.status,
+                    stream_type=stype,
+                    content_type=ctype,
+                    content_length=total_len,
+                    text_preview=text_prev,
+                )
+        except HlsHttpError as http_err:
+            if self._should_try_curl_cffi(url, status=http_err.status):
+                try:
+                    return await _probe_via_curl()
+                except WarpProxyError:
+                    raise
+                except Exception:
+                    raise http_err
+            raise
+        except (HlsProxyError, WarpProxyError):
+            raise
+        except Exception as exc:
+            self._raise_if_proxy_error(exc)
+            raise
 
     async def download_to(
         self,
@@ -1273,6 +2215,25 @@ class HlsClient:
             offset, length = int(byte_range[0]), int(byte_range[1])
             extra["Range"] = f"bytes={offset}-{offset + length - 1}"
         req_headers = self._merged_headers(extra)
+
+        async def _curl_download_to() -> int:
+            data = await self._curl_fetch_bytes(
+                url,
+                req_headers,
+                byte_range=byte_range,
+                on_chunk=on_chunk,
+                timeout=self._effective_segment_timeout(),
+            )
+            await loop.run_in_executor(None, _write_bytes, path, data, False)
+            return len(data)
+
+        if self._should_try_curl_cffi(url):
+            try:
+                return await _curl_download_to()
+            except (HlsHttpError, HlsProxyError, WarpProxyError, ValueError):
+                raise
+            except Exception:
+                pass
 
         written = 0
         has_flushed = False
@@ -1310,15 +2271,209 @@ class HlsClient:
                 await self._read_segment_response(resp, url, byte_range, _on_piece)
                 await _flush()
             return written
-        except Exception as exc:
+        except HlsHttpError as http_err:
             if has_flushed and os.path.exists(path):
                 try:
                     os.remove(path)
                 except OSError:
                     pass
-            if isinstance(exc, (HlsHttpError, HlsProxyError, WarpProxyError)):
+            if self._should_try_curl_cffi(url, status=http_err.status):
+                try:
+                    return await _curl_download_to()
+                except WarpProxyError:
+                    raise
+                except Exception:
+                    raise http_err
+            raise
+        except BaseException as exc:
+            if has_flushed and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if isinstance(exc, (asyncio.CancelledError, HlsProxyError, WarpProxyError)):
                 raise
-            self._raise_if_proxy_error(exc)
+            if isinstance(exc, Exception):
+                self._raise_if_proxy_error(exc)
+            raise
+
+    async def download_stream_to_file(
+        self,
+        url: str,
+        path: str,
+        *,
+        on_chunk: Optional[Callable[[int], None]] = None,
+        on_total: Optional[Callable[[int], None]] = None,
+        headers: Optional[Dict[str, Optional[str]]] = None,
+        timeout: Optional[float] = None,
+    ) -> Tuple[int, str]:
+        """Stream a progressive direct media URL (MP4/WebM/etc.) to *path*.
+
+        Returns ``(bytes_written, content_type)``. Supports ``on_total(size)``,
+        ``on_chunk(delta)``, non-blocking executor disk writes, and ``curl_cffi``
+        Chrome TLS impersonation fallback on HTTPS 403/503.
+        """
+        session = await self._get_session()
+        loop = asyncio.get_running_loop()
+        req_headers = self._merged_headers(headers)
+        connect_to = self._effective_connect_timeout()
+        read_to = max(60.0, float(timeout or getattr(_app_config, "HLS_TIMEOUT", 1800)))
+        stream_timeout = aiohttp.ClientTimeout(
+            total=read_to,
+            sock_connect=connect_to,
+            sock_read=min(120.0, read_to),
+        )
+
+        async def _curl_stream() -> Tuple[int, str]:
+            curl_sess = await self._get_curl_session()
+            hdrs = self._prepare_curl_headers(url, req_headers)
+            resp = await curl_sess.get(
+                url,
+                headers=hdrs,
+                timeout=read_to,
+                allow_redirects=True,
+                verify=False,
+                stream=True,
+            )
+            written_c = 0
+            flushed_c = False
+            buf_c = bytearray()
+
+            async def _flush_c() -> None:
+                nonlocal written_c, flushed_c
+                if not buf_c:
+                    return
+                data = bytes(buf_c)
+                buf_c.clear()
+                await loop.run_in_executor(None, _write_bytes, path, data, flushed_c)
+                flushed_c = True
+                written_c += len(data)
+                if on_chunk is not None:
+                    try:
+                        on_chunk(len(data))
+                    except Exception as e:
+                        print(f"[HLS] progress callback failed: {e}")
+
+            try:
+                final_url = str(getattr(resp, "url", "") or url)
+                self._sync_curl_cookies(resp, final_url)
+                status = int(getattr(resp, "status_code", 0) or 0)
+                if status >= 400:
+                    retry_after = _parse_retry_after(self._curl_header(resp, "Retry-After"))
+                    raise HlsHttpError(status, final_url, retry_after=retry_after)
+                ctype = self._curl_header(resp, "Content-Type").split(";", 1)[0].strip().lower()
+                cl = self._parse_content_length(self._curl_header(resp, "Content-Length"))
+                content_enc = self._curl_header(resp, "Content-Encoding")
+                if on_total is not None and cl is not None and cl > 0:
+                    try:
+                        on_total(cl)
+                    except Exception as e:
+                        print(f"[HLS] total callback failed: {e}")
+                async for chunk in resp.aiter_content(chunk_size=_CHUNK_READ_SIZE):
+                    if not chunk:
+                        continue
+                    buf_c.extend(chunk)
+                    if len(buf_c) >= _FLUSH_THRESHOLD:
+                        await _flush_c()
+                await _flush_c()
+                if written_c == 0:
+                    raise ValueError(f"Empty response (0 bytes) for {redact_url(url)}")
+                if cl is not None and cl > 0 and not content_enc and written_c < cl:
+                    raise ValueError(
+                        f"Stream truncated: got {written_c} of {cl} bytes for {redact_url(url)}"
+                    )
+                host = self._host_of(final_url) or self._host_of(url)
+                if host:
+                    self._curl_cffi_hosts.add(host)
+                return written_c, ctype
+            except BaseException:
+                if flushed_c and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+
+        if self._should_try_curl_cffi(url):
+            try:
+                return await _curl_stream()
+            except (HlsHttpError, HlsProxyError, WarpProxyError, ValueError):
+                raise
+            except Exception:
+                pass
+
+        written = 0
+        has_flushed = False
+        buf = bytearray()
+
+        async def _flush() -> None:
+            nonlocal written, has_flushed
+            if not buf:
+                return
+            data = bytes(buf)
+            buf.clear()
+            await loop.run_in_executor(None, _write_bytes, path, data, has_flushed)
+            has_flushed = True
+            written += len(data)
+            if on_chunk is not None:
+                try:
+                    on_chunk(len(data))
+                except Exception as e:
+                    print(f"[HLS] progress callback failed: {e}")
+
+        async def _on_piece(piece: bytes) -> None:
+            buf.extend(piece)
+            if len(buf) >= _FLUSH_THRESHOLD:
+                await _flush()
+
+        try:
+            async with session.get(
+                url,
+                headers=req_headers,
+                timeout=stream_timeout,
+                allow_redirects=True,
+                ssl=False,
+            ) as resp:
+                self._raise_for_status(resp, url)
+                ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                cl = resp.content_length
+                if on_total is not None and cl is not None and cl > 0:
+                    try:
+                        on_total(cl)
+                    except Exception as e:
+                        print(f"[HLS] total callback failed: {e}")
+                await self._read_segment_response(resp, url, None, _on_piece)
+                await _flush()
+            return written, ctype
+        except HlsHttpError as http_err:
+            if has_flushed and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if self._should_try_curl_cffi(url, status=http_err.status):
+                try:
+                    return await _curl_stream()
+                except WarpProxyError:
+                    raise
+                except Exception:
+                    raise http_err
+            raise
+        except BaseException as exc:
+            if has_flushed and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if isinstance(exc, (asyncio.CancelledError, HlsProxyError, WarpProxyError)):
+                raise
+            if isinstance(exc, Exception):
+                self._raise_if_proxy_error(exc)
             raise
 
 
@@ -1394,6 +2549,104 @@ if __name__ == "__main__":
     _check("binary body survives decoding",
            not is_hls_playlist(decode_text(binary_body, "utf-8")),
            repr(decode_text(binary_body, "utf-8")[:24]))
+
+    print("--- loopback: disguised #EXTM3U, cookie_entries, Origin strip, direct stream ---")
+    import tempfile
+    from aiohttp import web
+
+    async def _run_client_loopback() -> None:
+        seen_page_origin: List[Optional[str]] = []
+
+        async def disguised_m3u8(request):
+            return web.Response(
+                body=b"\xef\xbb\xbf#extm3u\n#EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST\n",
+                content_type="image/png",
+            )
+
+        async def real_png(request):
+            return web.Response(
+                body=b"\x89PNG\r\n\x1a\n" + (b"\x00" * 128),
+                content_type="image/png",
+            )
+
+        async def page_ep(request):
+            seen_page_origin.append(request.headers.get("Origin"))
+            return web.Response(text="<html><body>ok</body></html>", content_type="text/html")
+
+        async def mp4_ep(request):
+            data = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + (b"A" * 4096)
+            return web.Response(body=data, content_type="video/mp4")
+
+        app = web.Application()
+        app.router.add_get("/fake.png", disguised_m3u8)
+        app.router.add_get("/real.png", real_png)
+        app.router.add_get("/page", page_ep)
+        app.router.add_get("/clip.mp4", mp4_ep)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        base = f"http://127.0.0.1:{port}"
+        HLS_DISABLE_PROXY_ORIG = _app_config.HLS_DISABLE_PROXY
+        client = HlsClient(
+            headers={"Origin": "https://should-be-stripped.example"},
+            proxy_url=None,
+            cookie_entries=[
+                {"name": "scoped", "value": "v1", "domain": "127.0.0.1", "path": "/", "host_only": True},
+                {"name": "other", "value": "v2", "domain": "other.example", "path": "/", "host_only": True},
+            ],
+        )
+        try:
+            chdr = client.cookie_header_for_url(f"{base}/page")
+            _check("cookie_header_for_url scopes domain accurately",
+                   "scoped=v1" in chdr and "other=v2" not in chdr, chdr)
+
+            txt, _ = await client.fetch_text_with_url(f"{base}/fake.png")
+            _check("fetch_text_with_url accepts disguised image/png #extm3u",
+                   txt.lstrip("\ufeff").lower().startswith("#extm3u"), repr(txt[:32]))
+
+            rejected_png = False
+            try:
+                await client.fetch_text_with_url(f"{base}/real.png")
+            except ValueError:
+                rejected_png = True
+            _check("fetch_text_with_url still rejects genuine binary image/png", rejected_png)
+
+            probe_page = await client.fetch_page_probe(f"{base}/page")
+            _check("fetch_page_probe classifies HTML page & strips Origin on GET",
+                   probe_page.kind == "page" and seen_page_origin == [None],
+                   f"{probe_page.kind} origin={seen_page_origin}")
+
+            probe_hls = await client.fetch_page_probe(f"{base}/fake.png")
+            _check("fetch_page_probe detects direct disguised HLS",
+                   probe_hls.kind == "hls" and "#extm3u" in probe_hls.text.lower(),
+                   str(probe_hls))
+
+            probe_vid = await client.probe_media(f"{base}/clip.mp4")
+            _check("probe_media classifies direct MP4",
+                   probe_vid.stream_type == "direct" and probe_vid.content_type == "video/mp4",
+                   str(probe_vid))
+
+            fd, out_p = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd)
+            try:
+                totals: List[int] = []
+                written, ct = await client.download_stream_to_file(
+                    f"{base}/clip.mp4", out_p, on_total=totals.append
+                )
+                _check("download_stream_to_file streams direct MP4 with on_total",
+                       written == 4120 and ct == "video/mp4" and totals == [4120] and os.path.getsize(out_p) == 4120,
+                       f"written={written} ct={ct} totals={totals}")
+            finally:
+                if os.path.exists(out_p):
+                    os.remove(out_p)
+        finally:
+            _app_config.HLS_DISABLE_PROXY = HLS_DISABLE_PROXY_ORIG
+            await client.close()
+            await runner.cleanup()
+
+    asyncio.run(_run_client_loopback())
 
     print("---", "ALL PASSED" if not failures else f"{len(failures)} FAILURE(S)")
     for name in failures:

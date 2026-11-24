@@ -2495,5 +2495,753 @@ class TestHls403FixesAndStealth(unittest.IsolatedAsyncioTestCase):
                 await runner.cleanup()
 
 
+class TestUniversalHlsUpgrade(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.work = tempfile.mkdtemp(prefix="hls_univ_test_")
+        self._orig_disable_proxy = _client_mod.HLS_DISABLE_PROXY
+        _client_mod.HLS_DISABLE_PROXY = True
+
+    async def asyncTearDown(self):
+        _client_mod.HLS_DISABLE_PROXY = self._orig_disable_proxy
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    async def _start_server(self, app: web.Application):
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        return runner, f"http://127.0.0.1:{port}"
+
+    def _assert_valid_mp4(self, res: HlsResult, *, expect_audio: bool = True):
+        self.assertTrue(res.converted, f"expected converted=True, got reason={res.reason!r} detail={res.detail!r}")
+        self.assertTrue(os.path.exists(res.path))
+        self.assertGreater(res.size, 1024)
+        meta = _probe_media(res.path)
+        fmt = (meta.get("format") or {}).get("format_name", "")
+        self.assertIn("mp4", fmt)
+        streams = meta.get("streams") or []
+        vcodecs = [s.get("codec_name") for s in streams if s.get("codec_type") == "video"]
+        acodecs = [s.get("codec_name") for s in streams if s.get("codec_type") == "audio"]
+        self.assertTrue(vcodecs, f"no video stream in {meta}")
+        if expect_audio:
+            self.assertTrue(acodecs, f"expected audio stream in {meta}")
+        self.assertTrue(_faststart_ok(res.path), "moov atom must precede mdat")
+
+    async def test_playlist_inline_data_key_multikey_audio_only_and_init_key(self):
+        import base64
+        from app.hls import playlist as pl_mod
+
+        key_raw = b"0123456789abcdef"
+        key_b64 = base64.b64encode(key_raw).decode("ascii")
+        data_uri = f"data:application/octet-stream;base64,{key_b64}"
+
+        self.assertEqual(pl_mod.decode_data_key_uri(data_uri), key_raw)
+        self.assertIsNone(pl_mod.decode_data_key_uri("data:text/plain;base64,AAAA"))
+
+        # Inline 16-byte data: key is NOT DRM; short PSSH data: key IS DRM.
+        inline_pl = f'#extm3u\n#EXT-X-KEY:METHOD=AES-128,URI="{data_uri}"\n#EXTINF:5,\nseg0.ts\n#EXT-X-ENDLIST\n'
+        self.assertTrue(is_hls_playlist(inline_pl))
+        self.assertFalse(is_drm(inline_pl))
+
+        # Multi-key playlist with AES-128 + FairPlay SAMPLE-AES for the same segment -> NOT DRM, picks AES-128.
+        multikey_pl = (
+            "#EXTM3U\n"
+            '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+            '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://fp",KEYFORMAT="com.apple.streamingkeydelivery"\n'
+            '#EXT-X-MAP:URI="init.mp4"\n'
+            "#EXTINF:4.0,\nseg0.m4s\n#EXT-X-ENDLIST\n"
+        )
+        self.assertFalse(is_drm(multikey_pl))
+        parsed_mk = parse_media(multikey_pl, "https://cdn.example.com/hls/index.m3u8")
+        self.assertEqual(parsed_mk.keys[parsed_mk.segments[0].key_index].method, "AES-128")
+        self.assertEqual(parsed_mk.init_key_index, parsed_mk.segments[0].key_index)
+        self.assertEqual(
+            parsed_mk.init_section_keys.get(("https://cdn.example.com/hls/init.mp4", None)),
+            parsed_mk.segments[0].key_index,
+        )
+
+        # Audio-only STREAM-INF deprioritized even when max_height caps out.
+        master_ao = (
+            "#EXTM3U\n"
+            '#EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS="mp4a.40.2"\n'
+            "audio_only.m3u8\n"
+            '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"\n'
+            "1080p.m3u8\n"
+        )
+        variants, _ = parse_master(master_ao, "https://cdn.example.com/master.m3u8")
+        picked = select_variant(variants, max_height=720)
+        self.assertIsNotNone(picked)
+        self.assertTrue(picked.url.endswith("1080p.m3u8"))
+        ranked = rank_variants(variants, max_height=720)
+        self.assertTrue(ranked[0].url.endswith("1080p.m3u8"))
+        self.assertTrue(ranked[-1].url.endswith("audio_only.m3u8"))
+
+    async def test_large_disguised_preambles_tail_align_and_query_merge(self):
+        # 40 KB PNG preamble + 3 TS packets + 7 trailing junk bytes
+        png_blob = b"\x89PNG\r\n\x1a\n" + (b"\x01" * 40000) + b"IEND\xae\x42\x60\x82"
+        ts_packets = (b"\x47" + b"\x22" * 187) * 3
+        clean_ts, ext_ts = dl_mod._sanitize_segment_bytes(png_blob + ts_packets + b"JUNK123", is_fmp4=False)
+        self.assertEqual(ext_ts, ".ts")
+        self.assertEqual(clean_ts, ts_packets)
+
+        # 20 KB JPEG preamble before fMP4 moof box
+        moof_box = (32).to_bytes(4, "big") + b"moof" + (b"\x00" * 24)
+        jpg_blob = b"\xff\xd8\xff\xe0" + (b"\x11" * 20000) + b"\xff\xd9"
+        clean_fmp4, ext_fmp4 = dl_mod._sanitize_segment_bytes(jpg_blob + moof_box, is_fmp4=False)
+        self.assertEqual(ext_fmp4, ".m4s")
+        self.assertEqual(clean_fmp4, moof_box)
+
+        # _merge_missing_query keeps child's existing params and appends missing parent auth params
+        merged = dl_mod._merge_missing_query(
+            "https://cdn.example.com/seg0.ts?part=1",
+            "https://cdn.example.com/index.m3u8?part=99&token=abc&sig=xyz",
+        )
+        self.assertIsNotNone(merged)
+        self.assertIn("part=1", merged)
+        self.assertNotIn("part=99", merged)
+        self.assertIn("token=abc", merged)
+        self.assertIn("sig=xyz", merged)
+
+    async def test_inline_data_aes_disguised_playlist_audio_fallback_and_dead_seg(self):
+        if not _ffmpeg_ok():
+            return
+        import base64
+
+        key = b"fedcba9876543210"
+        key_b64 = base64.b64encode(key).decode("ascii")
+        pl_text, enc_files = _make_hls_ts_segments(self.work, duration=2.0, seg_time=1.0, aes_key=key)
+        # Rewrite key URI to inline data: URI
+        pl_inline = pl_text.replace('URI="key.bin"', f'URI="data:application/octet-stream;base64,{key_b64}"')
+
+        # Build video-only & audio-only TS for silent-video audio recovery + audio fallback
+        v_path = os.path.join(self.work, "v_silent.ts")
+        a_path = os.path.join(self.work, "a_only2.ts")
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=160x120:rate=24",
+                "-t", "1.0", "-c:v", "libx264", "-pix_fmt", "yuv420p", v_path,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", "1.0", "-c:a", "aac", a_path,
+            ],
+            check=True,
+        )
+        with open(v_path, "rb") as fh:
+            v_bytes = fh.read()
+        with open(a_path, "rb") as fh:
+            a_bytes = fh.read()
+        ts_full = _make_ts_fixture(self.work, duration=0.5)
+
+        async def inline_aes_ep(request: web.Request):
+            # Disguised Content-Type: image/png on playlist!
+            return web.Response(text=pl_inline, content_type="image/png")
+
+        async def enc_html_m3u8(request: web.Request):
+            return web.Response(text=pl_inline, content_type="application/vnd.apple.mpegurl")
+
+        async def enc_seg(request: web.Request):
+            name = request.match_info["name"]
+            if name in enc_files:
+                return web.Response(body=enc_files[name], content_type="video/mp2t")
+            return web.Response(status=404)
+
+        async def enc_html_seg(request: web.Request):
+            return web.Response(status=200, text="<html><body>WAF block</body></html>")
+
+        async def silent_master(request: web.Request):
+            # Deliberately omits AUDIO="..." on STREAM-INF even though standalone AUDIO exists
+            return web.Response(
+                text=(
+                    "#EXTM3U\n"
+                    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Dead",DEFAULT=YES,URI="dead_audio.m3u8"\n'
+                    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Backup",AUTOSELECT=YES,URI="good_audio.m3u8"\n'
+                    "#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=160x120\n"
+                    "silent_video.m3u8\n"
+                ),
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def dead_audio(request: web.Request):
+            return web.Response(status=404)
+
+        async def good_audio(request: web.Request):
+            return web.Response(text="#EXTM3U\n#EXTINF:1.0,\na0.ts\n#EXT-X-ENDLIST\n")
+
+        async def silent_video(request: web.Request):
+            return web.Response(text="#EXTM3U\n#EXTINF:1.0,\nv0.ts\n#EXT-X-ENDLIST\n")
+
+        async def dead_tail_m3u8(request: web.Request):
+            lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:1"]
+            for i in range(32):
+                lines.append("#EXTINF:0.5,")
+                lines.append(f"dt_{i}.ts")
+            lines.append("#EXT-X-ENDLIST")
+            return web.Response(text="\n".join(lines) + "\n")
+
+        async def dead_tail_seg(request: web.Request):
+            idx = int(request.match_info["idx"])
+            if idx == 31:
+                return web.Response(status=404, text="missing trailing segment")
+            return web.Response(body=ts_full, content_type="video/mp2t")
+
+        async def serve_v0(request: web.Request):
+            return web.Response(body=v_bytes)
+
+        async def serve_a0(request: web.Request):
+            return web.Response(body=a_bytes)
+
+        app = web.Application()
+        app.router.add_get("/inline_aes.png", inline_aes_ep)
+        app.router.add_get("/enc_html/index.m3u8", enc_html_m3u8)
+        app.router.add_get("/enc_html/{name}", enc_html_seg)
+        app.router.add_get("/silent_master.m3u8", silent_master)
+        app.router.add_get("/dead_audio.m3u8", dead_audio)
+        app.router.add_get("/good_audio.m3u8", good_audio)
+        app.router.add_get("/silent_video.m3u8", silent_video)
+        app.router.add_get("/v0.ts", serve_v0)
+        app.router.add_get("/a0.ts", serve_a0)
+        app.router.add_get("/dead_tail.m3u8", dead_tail_m3u8)
+        app.router.add_get("/dt_{idx:\\d+}.ts", dead_tail_seg)
+        app.router.add_get("/{name}", enc_seg)
+
+        runner, base = await self._start_server(app)
+        try:
+            # 1. Inline data: AES-128 key + disguised Content-Type: image/png playlist
+            res_inline = await download_hls_to_mp4(
+                f"{base}/inline_aes.png", "inline_aes.m3u8", out_dir=self.work, proxy_url=None,
+            )
+            self._assert_valid_mp4(res_inline)
+
+            # 2. Encrypted segment returning HTTP 200 HTML error page fails as R_DOWNLOAD_FAILED even without C-AES
+            with patch.object(dl_mod, "_detect_aes_backend", return_value=None), \
+                 patch.object(_cfg, "HLS_SEGMENT_RETRIES", 1, create=True):
+                res_html = await download_hls_to_mp4(
+                    f"{base}/enc_html/index.m3u8", "enc_html.m3u8", out_dir=self.work, proxy_url=None,
+                )
+            self.assertFalse(res_html.converted)
+            self.assertEqual(res_html.reason, R_DOWNLOAD_FAILED)
+            self.assertIn("HTML", res_html.detail)
+
+            # 3. Silent video recovers audio from fallback audio rendition
+            res_rec = await download_hls_to_mp4(
+                f"{base}/silent_master.m3u8", "recovered.m3u8", out_dir=self.work, proxy_url=None,
+            )
+            self._assert_valid_mp4(res_rec, expect_audio=True)
+
+            # 4. Large VOD (32 segments) survives 1 persistent 404 trailing segment
+            with patch.object(_cfg, "HLS_SEGMENT_RETRIES", 1, create=True):
+                res_dt = await download_hls_to_mp4(
+                    f"{base}/dead_tail.m3u8", "dead_tail.m3u8", out_dir=self.work, proxy_url=None,
+                )
+            self._assert_valid_mp4(res_dt)
+        finally:
+            await runner.cleanup()
+
+    async def test_direct_video_split_audio_fallbacks_and_initial_playlist(self):
+        if not _ffmpeg_ok():
+            return
+
+        # Build valid MP4, video-only MP4, and audio-only M4A fixtures
+        mp4_path = os.path.join(self.work, "direct_src.mp4")
+        v_mp4_path = os.path.join(self.work, "split_v.mp4")
+        a_m4a_path = os.path.join(self.work, "split_a.m4a")
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=160x120:rate=24",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", "1.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-movflags", "+faststart", mp4_path,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=160x120:rate=24",
+                "-t", "1.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", v_mp4_path,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", "1.5", "-c:a", "aac", a_m4a_path,
+            ],
+            check=True,
+        )
+        with open(mp4_path, "rb") as fh:
+            mp4_bytes = fh.read()
+        with open(v_mp4_path, "rb") as fh:
+            v_mp4_bytes = fh.read()
+        with open(a_m4a_path, "rb") as fh:
+            a_m4a_bytes = fh.read()
+        ts_bytes = _make_ts_fixture(self.work, duration=1.0)
+
+        async def mp4_ep(request: web.Request):
+            if request.headers.get("Referer") != "https://watch.example/v/1":
+                return web.Response(status=403)
+            return web.Response(body=mp4_bytes, content_type="video/mp4")
+
+        async def split_v_ep(request: web.Request):
+            return web.Response(body=v_mp4_bytes, content_type="video/mp4")
+
+        async def split_a_ep(request: web.Request):
+            if request.headers.get("X-Audio-Token") != "ok":
+                return web.Response(status=403)
+            return web.Response(body=a_m4a_bytes, content_type="audio/mp4")
+
+        async def dead_hls_ep(request: web.Request):
+            return web.Response(status=403, text="blocked")
+
+        async def one_time_m3u8(request: web.Request):
+            return web.Response(status=403, text="token already consumed")
+
+        async def once_seg(request: web.Request):
+            return web.Response(body=ts_bytes, content_type="video/mp2t")
+
+        app = web.Application()
+        app.router.add_get("/video.mp4", mp4_ep)
+        app.router.add_get("/split_v.mp4", split_v_ep)
+        app.router.add_get("/split_a.m4a", split_a_ep)
+        app.router.add_get("/dead.m3u8", dead_hls_ep)
+        app.router.add_get("/once/index.m3u8", one_time_m3u8)
+        app.router.add_get("/once/seg0.ts", once_seg)
+
+        runner, base = await self._start_server(app)
+        try:
+            # 1. Direct progressive MP4 with headers + faststart pass-through
+            res_direct = await dl_mod.download_stream_to_mp4(
+                f"{base}/video.mp4", "My Movie.mp4",
+                stream_type="direct",
+                headers={"Referer": "https://watch.example/v/1"},
+                out_dir=self.work, proxy_url=None,
+            )
+            self._assert_valid_mp4(res_direct)
+            self.assertEqual(res_direct.engine, "direct")
+
+            # 2. Split direct video + separate audio with distinct audio_headers
+            res_split = await dl_mod.download_stream_to_mp4(
+                f"{base}/split_v.mp4", "Split.mp4",
+                stream_type="direct",
+                audio_url=f"{base}/split_a.m4a",
+                audio_headers={"X-Audio-Token": "ok"},
+                out_dir=self.work, proxy_url=None,
+            )
+            self._assert_valid_mp4(res_split, expect_audio=True)
+
+            # 3. Fallback candidate: dead HLS -> falls back to direct MP4
+            res_fb = await dl_mod.download_stream_to_mp4(
+                f"{base}/dead.m3u8", "Fallback.m3u8",
+                stream_type="hls",
+                fallback_urls=[f"{base}/video.mp4"],
+                headers={"Referer": "https://watch.example/v/1"},
+                out_dir=self.work, proxy_url=None,
+            )
+            self._assert_valid_mp4(res_fb)
+            self.assertEqual(res_fb.engine, "direct")
+
+            # 4. Pre-fetched initial_playlist_text avoids re-fetching a single-use playlist URL
+            res_once = await dl_mod.download_stream_to_mp4(
+                f"{base}/once/index.m3u8", "Once.m3u8",
+                stream_type="hls",
+                initial_playlist_text="#EXTM3U\n#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n",
+                out_dir=self.work, proxy_url=None,
+            )
+            self._assert_valid_mp4(res_once)
+        finally:
+            await runner.cleanup()
+
+    async def test_handler_tier2_ytdlp_metadata_store_and_broadened_reextract(self):
+        from app.bot import main as bot_main
+
+        # 1. _resolve_page_manifest falls through Tier 1 -> Tier 2 (yt-dlp) and skips Chromium
+        msg = MagicMock()
+        msg.from_user = MagicMock(id=303, username="tester", is_premium=False)
+        msg.text = "https://video.example.com/watch/cool-ep"
+        msg.caption = None
+        msg.reply_text = AsyncMock()
+        msg.photo = None
+        msg.document = None
+
+        miss_scan = extract_mod.PageScan(page_url="https://video.example.com/watch/cool-ep", reason="no-manifest")
+        yt_hit = handler_mod._ResolvedPage(
+            url="https://cdn.example.com/vid.mp4",
+            page_url="https://video.example.com/watch/cool-ep",
+            stream_type="direct",
+            title="Cool Episode 1080p",
+            audio_url="https://cdn.example.com/aud.m4a",
+            headers={"Referer": "https://video.example.com/"},
+            cookies={"s": "1"},
+            cookie_entries=[{"name": "s", "value": "1", "domain": ".example.com", "path": "/"}],
+            fallback_urls=["https://cdn.example.com/alt.m3u8"],
+            extractor="yt-dlp",
+        )
+        with patch.object(handler_mod, "_scan_page_with_client", new=AsyncMock(return_value=(miss_scan, {}, {}))), \
+             patch.object(handler_mod, "_ytdlp_stage", new=AsyncMock(return_value=yt_hit)) as mock_yt, \
+             patch.object(handler_mod, "_browser_stage_resolved", new=AsyncMock()) as mock_br:
+            resolved = await handler_mod._resolve_page_manifest(msg, "https://video.example.com/watch/cool-ep")
+        mock_yt.assert_awaited_once()
+        mock_br.assert_not_awaited()
+        self.assertEqual(resolved.stream_type, "direct")
+        self.assertEqual(resolved.title, "Cool Episode 1080p")
+        self.assertEqual(resolved.audio_url, "https://cdn.example.com/aud.m4a")
+
+        # 2. _store_stream_meta / _pop_stream_meta forwards rich metadata into process_hls_download
+        handler_mod._store_stream_meta(
+            "sid_meta_1",
+            {
+                "stream_type": "direct",
+                "title": "Cool.Episode.1080p",
+                "audio_url": "https://cdn.example.com/aud.m4a",
+                "cookie_entries": [{"name": "s", "value": "1", "domain": ".example.com"}],
+                "fallback_urls": ["https://cdn.example.com/alt.m3u8"],
+                "orig_page_url": "https://video.example.com/watch/cool-ep",
+            },
+        )
+        out_mp4 = os.path.join(self.work, "Cool.Episode.1080p.mp4")
+        with open(out_mp4, "wb") as fh:
+            fh.write(b"\x00" * 4096)
+
+        captured_dl: list[dict] = []
+
+        async def fake_dl(url, file_name, **kw):
+            captured_dl.append({"url": url, "file_name": file_name, **kw})
+            if len(captured_dl) == 1:
+                # Simulate caption-delay token expiry returning 200 HTML -> R_NOT_HLS
+                return HlsResult(converted=False, reason=R_NOT_HLS, detail="response does not start with #EXTM3U")
+            return HlsResult(path=out_mp4, name="Cool.Episode.1080p.mp4", size=4096, converted=True, engine="direct", duration=2.0)
+
+        status_msg = MagicMock()
+        status_msg.edit_text = AsyncMock()
+        status_msg.delete = AsyncMock()
+        fake_slot = MagicMock(sid="sid_meta_1")
+
+        with patch.object(handler_mod.manager, "get_client", new=AsyncMock(return_value=MagicMock())), \
+             patch.object(bot_main, "begin_process", return_value=fake_slot), \
+             patch.object(bot_main, "release_process"), \
+             patch.object(bot_main, "is_cancelled", return_value=False), \
+             patch.object(handler_mod, "_load_custom_thumb", new=AsyncMock(return_value=None)), \
+             patch.object(handler_mod, "_get_backup_group_peer", new=AsyncMock(return_value=MagicMock())), \
+             patch.object(handler_mod, "_call_download_hls", side_effect=fake_dl), \
+             patch.object(handler_mod, "_resolve_page_manifest", new=AsyncMock(return_value=yt_hit)) as mock_re, \
+             patch.object(handler_mod, "_get_video_metadata", new=AsyncMock(return_value={"duration": 2, "width": 160, "height": 120})), \
+             patch.object(handler_mod, "_generate_video_thumb", new=AsyncMock(return_value=None)), \
+             patch.object(handler_mod, "_upload_file_to_backup", new=AsyncMock(return_value=(77, False))), \
+             patch.object(handler_mod, "_send_to_user", new=AsyncMock(return_value=True)), \
+             patch.object(handler_mod, "log_forward", new=AsyncMock()), \
+             patch.object(handler_mod, "safe_edit", new=AsyncMock()), \
+             patch.object(handler_mod, "clear_reply_markup", new=AsyncMock()):
+            await handler_mod.process_hls_download(
+                MagicMock(), 303, msg, status_msg,
+                url="https://cdn.example.com/expired.m3u8",
+                page_url="https://video.example.com/watch/cool-ep",
+                slot_sid="sid_meta_1",
+            )
+        mock_re.assert_awaited_once()
+        self.assertEqual(len(captured_dl), 2)
+        self.assertEqual(captured_dl[0]["file_name"], "Cool.Episode.1080p.m3u8")
+        self.assertEqual(captured_dl[0].get("stream_type"), "direct")
+        self.assertEqual(captured_dl[0].get("audio_url"), "https://cdn.example.com/aud.m4a")
+        self.assertEqual(captured_dl[1]["url"], "https://cdn.example.com/vid.mp4")
+
+        # 3. _should_reextract triggers on HTTP 410 playlist expiry and R_NOT_HLS
+        self.assertTrue(handler_mod._should_reextract(HlsResult(converted=False, reason=R_NOT_HLS)))
+        self.assertTrue(
+            handler_mod._should_reextract(
+                HlsResult(converted=False, reason=R_DOWNLOAD_FAILED, detail="playlist: HTTP 410 for https://cdn/a.m3u8")
+            )
+        )
+        self.assertFalse(handler_mod._should_reextract(HlsResult(converted=False, reason=R_DRM)))
+
+    async def test_extract_dean_edwards_packed_js_and_title(self):
+        # Verify extractor's Dean Edwards p,a,c,k,e,d unpacker + title extraction end-to-end
+        packed_html = (
+            "<html><head><title>Awesome Anime Episode 5 - StreamWish</title></head><body><script>"
+            "eval(function(p,a,c,k,e,d){while(c--)if(k[c])p=p.replace(new RegExp('\\\\b'+c.toString(a)+'\\\\b','g'),k[c]);return p;}"
+            "('0.1({2:[{3:\"4://5.6/7/8.9?a=b\"}]});',12,12,"
+            "'jwplayer|setup|sources|file|https|cdn|example|hls|master|m3u8|t|tok1'.split('|'),0,{}))"
+            "</script></body></html>"
+        )
+        manifests = extract_mod.find_manifests(packed_html, "https://streamwish.example/e/abc", limit=5)
+        self.assertIn("https://cdn.example/hls/master.m3u8?t=tok1", manifests)
+        title = extract_mod.extract_title(packed_html)
+        self.assertIn("Awesome Anime Episode 5", title)
+
+    async def test_split_hls_external_audio_hls_and_direct(self):
+        if not _ffmpeg_ok():
+            return
+
+        # Build video-only TS, audio-only TS, and direct M4A fixtures
+        v_ts_path = os.path.join(self.work, "split_hls_v.ts")
+        a_ts_path = os.path.join(self.work, "split_hls_a.ts")
+        a_m4a_path = os.path.join(self.work, "split_hls_a.m4a")
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=160x120:rate=24",
+                "-t", "1.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", v_ts_path,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", "1.5", "-c:a", "aac", a_ts_path,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=660",
+                "-t", "1.5", "-c:a", "aac", a_m4a_path,
+            ],
+            check=True,
+        )
+        with open(v_ts_path, "rb") as fh:
+            v_ts_bytes = fh.read()
+        with open(a_ts_path, "rb") as fh:
+            a_ts_bytes = fh.read()
+        with open(a_m4a_path, "rb") as fh:
+            a_m4a_bytes = fh.read()
+
+        async def vid_m3u8(request: web.Request):
+            if request.headers.get("X-Video-Key") != "vid-ok":
+                return web.Response(status=403)
+            return web.Response(
+                text="#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXTINF:1.5,\nvseg0.ts\n#EXT-X-ENDLIST\n",
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def vid_seg(request: web.Request):
+            if request.headers.get("X-Video-Key") != "vid-ok":
+                return web.Response(status=403)
+            return web.Response(body=v_ts_bytes, content_type="video/mp2t")
+
+        async def aud_m3u8(request: web.Request):
+            if request.headers.get("X-Audio-Key") != "hls-secret":
+                return web.Response(status=403)
+            return web.Response(
+                text="#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXTINF:1.5,\naseg0.ts\n#EXT-X-ENDLIST\n",
+                content_type="application/vnd.apple.mpegurl",
+            )
+
+        async def aud_seg(request: web.Request):
+            if request.headers.get("X-Audio-Key") != "hls-secret":
+                return web.Response(status=403)
+            return web.Response(body=a_ts_bytes, content_type="video/mp2t")
+
+        async def aud_direct(request: web.Request):
+            if request.headers.get("X-Audio-Key") != "direct-secret":
+                return web.Response(status=403)
+            return web.Response(body=a_m4a_bytes, content_type="audio/mp4")
+
+        app = web.Application()
+        app.router.add_get("/v/index.m3u8", vid_m3u8)
+        app.router.add_get("/v/vseg0.ts", vid_seg)
+        app.router.add_get("/a/index.m3u8", aud_m3u8)
+        app.router.add_get("/a/aseg0.ts", aud_seg)
+        app.router.add_get("/a/track.m4a", aud_direct)
+
+        runner, base = await self._start_server(app)
+        try:
+            # 1. Video-only HLS + separate HLS audio_url with distinct audio_headers
+            res_hls_a = await dl_mod.download_stream_to_mp4(
+                f"{base}/v/index.m3u8", "split_hls_audio.m3u8",
+                stream_type="hls",
+                headers={"X-Video-Key": "vid-ok"},
+                audio_url=f"{base}/a/index.m3u8",
+                audio_headers={"X-Audio-Key": "hls-secret"},
+                out_dir=self.work, proxy_url=None,
+            )
+            self._assert_valid_mp4(res_hls_a, expect_audio=True)
+
+            # 2. Video-only HLS + separate direct .m4a audio_url with distinct audio_headers
+            res_dir_a = await dl_mod.download_stream_to_mp4(
+                f"{base}/v/index.m3u8", "split_hls_direct_audio.m3u8",
+                stream_type="hls",
+                headers={"X-Video-Key": "vid-ok"},
+                audio_url=f"{base}/a/track.m4a",
+                audio_headers={"X-Audio-Key": "direct-secret"},
+                out_dir=self.work, proxy_url=None,
+            )
+            self._assert_valid_mp4(res_dir_a, expect_audio=True)
+        finally:
+            await runner.cleanup()
+
+    async def test_encrypted_ext_x_map_local_playlist_key_before_map_without_aes_backend(self):
+        from app.hls.client import HlsClient
+
+        raw_key = b"0123456789abcdef"
+        fake_init = b"\x00\x00\x00\x18ftypmp42" + (b"\xaa" * 20)
+        fake_seg = b"\x00\x00\x00\x20moof" + (b"\xbb" * 24)
+        pl_text = (
+            "#EXTM3U\n"
+            "#EXT-X-VERSION:7\n"
+            "#EXT-X-TARGETDURATION:4\n"
+            '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000001\n'
+            '#EXT-X-MAP:URI="init.mp4"\n'
+            "#EXTINF:4.0,\n"
+            "seg0.m4s\n"
+            "#EXT-X-ENDLIST\n"
+        )
+
+        async def serve_key(request: web.Request):
+            return web.Response(body=raw_key, content_type="application/octet-stream")
+
+        async def serve_init(request: web.Request):
+            return web.Response(body=fake_init, content_type="video/mp4")
+
+        async def serve_seg(request: web.Request):
+            return web.Response(body=fake_seg, content_type="video/iso.segment")
+
+        app = web.Application()
+        app.router.add_get("/key.bin", serve_key)
+        app.router.add_get("/init.mp4", serve_init)
+        app.router.add_get("/seg0.m4s", serve_seg)
+
+        runner, base = await self._start_server(app)
+        client = HlsClient(proxy_url=None)
+        try:
+            pl = parse_media(pl_text, f"{base}/index.m3u8")
+            self.assertEqual(pl.init_key_index, pl.segments[0].key_index)
+            self.assertEqual(pl.keys[pl.init_key_index].method, "AES-128")
+            loc_dir = os.path.join(self.work, "loc_enc_map")
+            with patch.object(dl_mod, "_detect_aes_backend", return_value=None):
+                local_m3u8 = await dl_mod._localize_playlist(
+                    client, pl, loc_dir,
+                    parent_url=f"{base}/index.m3u8",
+                    base_headers={},
+                )
+            with open(local_m3u8, "r", encoding="utf-8") as fh:
+                rendered = fh.read()
+            key_pos = rendered.find("#EXT-X-KEY:METHOD=AES-128,")
+            map_pos = rendered.find("#EXT-X-MAP:URI=")
+            self.assertNotEqual(key_pos, -1, f"missing #EXT-X-KEY in:\n{rendered}")
+            self.assertNotEqual(map_pos, -1, f"missing #EXT-X-MAP in:\n{rendered}")
+            self.assertLess(
+                key_pos, map_pos,
+                f"#EXT-X-KEY must precede #EXT-X-MAP when already_decrypted=False:\n{rendered}",
+            )
+        finally:
+            await client.close()
+            await runner.cleanup()
+
+    async def test_strip_outer_image_wrapper_multiple_of_16_header(self):
+        # 64-byte PNG wrapper (multiple of 16) + 32-byte ciphertext (multiple of 16) -> total 96 bytes (% 16 == 0)
+        png_sig = b"\x89PNG\r\n\x1a\n"
+        iend = b"IEND\xae\x42\x60\x82"
+        png_pad = b"\x00" * (64 - len(png_sig) - len(iend))
+        png_wrapper = png_sig + png_pad + iend
+        self.assertEqual(len(png_wrapper), 64)
+        cipher = bytes(range(32))
+        wrapped_png = png_wrapper + cipher
+        self.assertEqual(len(wrapped_png) % 16, 0)
+        self.assertEqual(dl_mod._strip_outer_image_wrapper(wrapped_png), cipher)
+
+        # 32-byte JPEG wrapper (multiple of 16) + 32-byte ciphertext -> total 64 bytes (% 16 == 0)
+        jpg_wrapper = b"\xff\xd8\xff\xe0" + (b"\x11" * 26) + b"\xff\xd9"
+        self.assertEqual(len(jpg_wrapper), 32)
+        self.assertEqual(dl_mod._strip_outer_image_wrapper(jpg_wrapper + cipher), cipher)
+
+        # Raw non-image 32-byte ciphertext is returned untouched
+        self.assertEqual(dl_mod._strip_outer_image_wrapper(cipher), cipher)
+
+    async def test_browser_subtitle_m3u8_rejected_not_leaked_via_fallback_req(self):
+        sub_url = "https://cdn.example/subs.m3u8"
+        sub_body = b"#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5.0,\nseg0.vtt\n#EXT-X-ENDLIST\n"
+
+        class _FakeReq:
+            def __init__(self, url: str):
+                self.url = url
+                self.resource_type = "xhr"
+                self.headers = {"user-agent": "FakeUA"}
+                self.redirected_from = None
+
+            async def all_headers(self):
+                return dict(self.headers)
+
+        class _FakeResp:
+            def __init__(self, req: _FakeReq):
+                self.url = req.url
+                self.status = 200
+                self.headers = {"content-type": "application/vnd.apple.mpegurl"}
+                self.request = req
+
+            async def body(self):
+                return sub_body
+
+        class _FakePage:
+            def __init__(self):
+                self.url = "https://watch.example/v/1"
+                self._handlers: dict[str, list] = {}
+
+            def set_default_timeout(self, ms: int):
+                pass
+
+            def on(self, event: str, cb):
+                self._handlers.setdefault(event, []).append(cb)
+
+            async def route(self, pattern: str, cb):
+                pass
+
+            async def add_init_script(self, script: str):
+                pass
+
+            async def goto(self, url: str, **kwargs):
+                req = _FakeReq(sub_url)
+                resp = _FakeResp(req)
+                for cb in self._handlers.get("request", []):
+                    cb(req)
+                for cb in self._handlers.get("response", []):
+                    cb(resp)
+
+            async def evaluate(self, script: str):
+                return ""
+
+            async def close(self):
+                pass
+
+        class _FakeContext:
+            def __init__(self):
+                self.page = _FakePage()
+
+            async def new_page(self):
+                return self.page
+
+            async def cookies(self, urls=None):
+                return []
+
+            async def close(self):
+                pass
+
+        class _FakeBrowser:
+            version = "130.0.0.0"
+
+            async def new_context(self, **kwargs):
+                return _FakeContext()
+
+            async def close(self):
+                pass
+
+        with patch.object(browser_mod, "browser_available", return_value=True), \
+             patch.object(browser_mod, "_resolve_browser_proxy", new=AsyncMock(return_value=(None, ("direct", None), False))), \
+             patch.object(browser_mod, "_get_browser", new=AsyncMock(return_value=(_FakeBrowser(), False))):
+            scan = await browser_mod.resolve_stream_with_browser("https://watch.example/v/1", timeout=5)
+
+        self.assertIsNone(scan.url, f"subtitle playlist leaked as scan.url={scan.url!r}")
+        self.assertEqual(scan.reason, "no-manifest")
+
+
 if __name__ == "__main__":
     unittest.main()

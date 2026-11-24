@@ -139,9 +139,19 @@ HLS_PAGE_MAX_BYTES = int(os.getenv("HLS_PAGE_MAX_BYTES", str(4 * 1024 * 1024)))
 # verified with a real request before it is used, so this also caps that work.
 HLS_PAGE_MAX_CANDIDATES = int(os.getenv("HLS_PAGE_MAX_CANDIDATES", "5"))
 
-# Follow ONE embed/iframe hop when the submitted page has no manifest of its own
-# (players are often hidden behind /embed/…).
+# Follow embed/iframe hops when the submitted page has no manifest of its own
+# (players are often hidden behind /embed/… or nested 2-3 iframes deep).
 HLS_PAGE_FOLLOW_EMBED = os.getenv("HLS_PAGE_FOLLOW_EMBED", "true").lower() in ("1", "true", "yes", "on")
+HLS_PAGE_EMBED_DEPTH = int(os.getenv("HLS_PAGE_EMBED_DEPTH", "3"))
+
+# Optional yt-dlp extractor / fallback downloader tier (gracefully skipped if
+# yt-dlp is not installed).
+HLS_YTDLP_ENABLED = os.getenv("HLS_YTDLP_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+HLS_YTDLP_TIMEOUT = int(os.getenv("HLS_YTDLP_TIMEOUT", "25"))
+
+# Optional curl_cffi Chrome TLS impersonation fallback on HTTP 403/503 WAF blocks
+# (gracefully skipped if curl_cffi is not installed).
+HLS_CURL_CFFI_ENABLED = os.getenv("HLS_CURL_CFFI_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 # Reply with a short hint when a page clearly embeds a player but no readable
 # manifest was found, so the user knows to send the .m3u8 link instead.

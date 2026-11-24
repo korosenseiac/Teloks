@@ -46,9 +46,9 @@ import re
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 import app.config as _cfg
 import app.hls.client as _client_mod
@@ -72,13 +72,17 @@ from app.hls.client import (
     is_socks_proxy,
 )
 from app.hls.playlist import (
+    AudioTrack,
     MediaPlaylist,
     MediaSegment,
+    decode_data_key_uri,
+    fallback_audio_tracks,
     is_drm,
     is_hls_playlist,
     is_master_playlist,
     parse_master,
     parse_media,
+    rank_audio_tracks,
     rank_variants,
     select_audio_track,
 )
@@ -149,6 +153,8 @@ class _Prepared:
     audio_url: str = ""
     audio_text: str = ""
     audio_pl: Optional[MediaPlaylist] = None
+    fallback_audios: List[AudioTrack] = field(default_factory=list)
+    audios_base_url: str = ""
     duration: float = 0.0
     bandwidth: int = 0
     is_live: bool = True
@@ -280,6 +286,36 @@ def _inherit_query(child_url: str, parent_url: str) -> Optional[str]:
     ))
 
 
+def _merge_missing_query(child_url: str, parent_url: str) -> Optional[str]:
+    """Inherit parent query params into *child_url* without clobbering existing keys."""
+    direct = _inherit_query(child_url, parent_url)
+    if direct is not None:
+        return direct
+    if not child_url or not parent_url:
+        return None
+    try:
+        parent_parts = urlsplit(parent_url)
+        child_parts = urlsplit(child_url)
+    except ValueError:
+        return None
+    if not parent_parts.query or not child_parts.query:
+        return None
+    child_pairs = parse_qsl(child_parts.query, keep_blank_values=True)
+    parent_pairs = parse_qsl(parent_parts.query, keep_blank_values=True)
+    existing_keys = {k.lower() for k, _ in child_pairs}
+    additions = [(k, v) for k, v in parent_pairs if k.lower() not in existing_keys]
+    if not additions:
+        return None
+    merged_query = f"{child_parts.query}&{urlencode(additions)}"
+    return urlunsplit((
+        child_parts.scheme,
+        child_parts.netloc,
+        child_parts.path,
+        merged_query,
+        child_parts.fragment,
+    ))
+
+
 def _header_fallback_profiles(
     current_headers: Dict[str, str],
     target_url: str,
@@ -367,6 +403,8 @@ def _make_client(
     proxy_url: Any,
     cookies: Optional[Dict[str, str]],
     workers: int,
+    *,
+    cookie_entries: Optional[List[Dict[str, Any]]] = None,
 ) -> HlsClient:
     """Instantiate HlsClient cleanly across pre/post-upgrade client.py."""
     params = inspect.signature(HlsClient.__init__).parameters
@@ -377,6 +415,8 @@ def _make_client(
             kwargs["cookies"] = dict(cookies)
         else:
             _merge_cookie_header(hdrs, cookies)
+    if cookie_entries and "cookie_entries" in params:
+        kwargs["cookie_entries"] = list(cookie_entries)
     kwargs["headers"] = hdrs
     if "max_connections" in params:
         kwargs["max_connections"] = max(32, workers * 2)
@@ -386,7 +426,15 @@ def _make_client(
     seg_t = _cfg_segment_timeout()
     if seg_t is not None and "segment_timeout" in params:
         kwargs["segment_timeout"] = seg_t
-    return HlsClient(**kwargs)
+    client = HlsClient(**kwargs)
+    if cookie_entries and "cookie_entries" not in params:
+        upd = getattr(client, "update_cookies", None)
+        if callable(upd):
+            try:
+                upd(list(cookie_entries))
+            except Exception:
+                pass
+    return client
 
 
 def _client_ffmpeg_headers(
@@ -396,6 +444,20 @@ def _client_ffmpeg_headers(
     url: str,
 ) -> List[str]:
     """Build ffmpeg header args including session cookies when supported."""
+    cookie_hdr_fn = getattr(client, "cookie_header_for_url", None)
+    if callable(cookie_hdr_fn):
+        try:
+            cookie_str = cookie_hdr_fn(url)
+            if isinstance(cookie_str, str) and cookie_str.strip():
+                params = inspect.signature(ffmpeg_header_args).parameters
+                if "cookies" in params:
+                    return ffmpeg_header_args(base_headers, cookies=cookie_str)
+                hdrs = dict(base_headers)
+                hdrs["Cookie"] = cookie_str
+                return ffmpeg_header_args(hdrs)
+        except Exception:
+            pass
+
     merged_cookies: Dict[str, str] = dict(cookies or {})
     export_fn = getattr(client, "export_cookies", None)
     if callable(export_fn):
@@ -706,10 +768,12 @@ class _PlaylistAuthState:
         *,
         parent_url: str = "",
         base_headers: Optional[Dict[str, str]] = None,
+        promote_global: bool = True,
     ) -> None:
         self.client = client
         self.parent_url = parent_url
         self.base_headers = base_headers
+        self.promote_global = promote_global
         self.lock = asyncio.Lock()
         self.generation: int = 0
         self.inherit_query: bool = False
@@ -753,7 +817,7 @@ async def _fetch_media_bytes_resilient(
             client, url, byte_range=byte_range, on_chunk=on_chunk, label=label,
         )
 
-    eff_url = (_inherit_query(url, auth_state.parent_url) or url) if auth_state.inherit_query else url
+    eff_url = (_merge_missing_query(url, auth_state.parent_url) or url) if auth_state.inherit_query else url
     eff_headers = auth_state.winning_overrides
     start_gen = auth_state.generation
 
@@ -776,7 +840,7 @@ async def _fetch_media_bytes_resilient(
             if auth_state.generation != start_gen:
                 retry_after_unlock = True
                 retry_url = (
-                    (_inherit_query(url, auth_state.parent_url) or url)
+                    (_merge_missing_query(url, auth_state.parent_url) or url)
                     if auth_state.inherit_query else url
                 )
                 retry_headers = (
@@ -787,7 +851,7 @@ async def _fetch_media_bytes_resilient(
                 raise
             else:
                 inherited = (
-                    _inherit_query(url, auth_state.parent_url)
+                    _merge_missing_query(url, auth_state.parent_url)
                     if (auth_state.parent_url and not auth_state.inherit_query)
                     else None
                 )
@@ -827,7 +891,8 @@ async def _fetch_media_bytes_resilient(
                                 )
                                 if validator is not None and not validator(data):
                                     continue
-                                _promote_header_overrides(client, auth_state.base_headers, profile)
+                                if auth_state.promote_global:
+                                    _promote_header_overrides(client, auth_state.base_headers, profile)
                                 auth_state.winning_overrides = dict(profile)
                                 if idx_c == 1:
                                     auth_state.inherit_query = True
@@ -868,7 +933,7 @@ async def _fetch_playlist_with_fallback(
         if _is_proxy_error(exc) or _extract_http_status(exc) not in (401, 403):
             raise
 
-        inherited = _inherit_query(url, parent_url) if parent_url else None
+        inherited = _merge_missing_query(url, parent_url) if parent_url else None
         inherited_alive = inherited is not None
 
         if inherited is not None:
@@ -970,42 +1035,93 @@ def _decrypt_aes128_cbc(data: bytes, key: bytes, iv: bytes, backend: str) -> byt
     raise RuntimeError(f"Unsupported AES backend: {backend}")
 
 
-def _find_ts_sync_offset(data: bytes, max_scan: int = 8192) -> Optional[int]:
-    """Locate MPEG-TS 188-byte packet alignment (``0x47`` sync bytes)."""
+def _is_ts_aligned_at(data: bytes, pos: int) -> bool:
     n = len(data)
+    if pos < 0 or pos >= n or data[pos] != 0x47:
+        return False
+    if pos + 376 < n:
+        return data[pos + 188] == 0x47 and data[pos + 376] == 0x47
+    if pos + 188 < n:
+        return data[pos + 188] == 0x47
+    return n - pos == 188 and pos == 0
+
+
+def _find_ts_sync_offset(data: bytes, max_scan: int = 512 * 1024) -> Optional[int]:
+    """Locate MPEG-TS 188-byte packet alignment (``0x47`` sync bytes) at C speed."""
+    n = len(data)
+    if n < 188:
+        return None
+    if _is_ts_aligned_at(data, 0):
+        return 0
     limit = min(n, max_scan)
-    for pos in range(limit):
-        if data[pos] != 0x47:
-            continue
-        if pos + 376 < n:
-            if data[pos + 188] == 0x47 and data[pos + 376] == 0x47:
-                return pos
-        elif pos + 188 < n:
-            if data[pos + 188] == 0x47:
-                return pos
-        elif n - pos == 188 and pos == 0:
-            return 0
+
+    # Fast-skip valid PNG / JPEG preambles used by disguised-segment CDNs.
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        iend = data.find(b"IEND", 8, limit)
+        if iend != -1:
+            after_png = iend + 8
+            if _is_ts_aligned_at(data, after_png):
+                return after_png
+    elif data[:3] == b"\xff\xd8\xff":
+        eoi = data.find(b"\xff\xd9", 3, limit)
+        if eoi != -1:
+            after_jpg = eoi + 2
+            if _is_ts_aligned_at(data, after_jpg):
+                return after_jpg
+
+    pos = data.find(b"\x47", 0, limit)
+    while pos != -1:
+        if _is_ts_aligned_at(data, pos):
+            return pos
+        pos = data.find(b"\x47", pos + 1, limit)
     return None
 
 
-def _find_bmff_offset(data: bytes, max_scan: int = 1024) -> Optional[int]:
+def _find_bmff_offset(data: bytes, max_scan: int = 256 * 1024) -> Optional[int]:
     """Locate ISO-BMFF box start (``ftyp``/``styp``/``moof``/``sidx``)."""
     n = len(data)
     if n < 8:
         return None
     if data[4:8] in _ISO_BMFF_BOXES:
         return 0
-    head = data[:min(n, max_scan)]
+    limit = min(n, max_scan)
     best: Optional[int] = None
     for tag in (b"ftyp", b"styp", b"moof", b"sidx"):
-        idx = head.find(tag)
-        if idx >= 4:
+        search_from = 4
+        while search_from < limit:
+            idx = data.find(tag, search_from, limit)
+            if idx == -1:
+                break
             box_start = idx - 4
             box_size = int.from_bytes(data[box_start:idx], "big")
             if 8 <= box_size <= n - box_start:
                 if best is None or box_start < best:
                     best = box_start
+                break
+            search_from = idx + 4
     return best
+
+
+def _strip_outer_image_wrapper(data: bytes) -> bytes:
+    """Strip a fake PNG/JPEG wrapper prepended outside AES-128 ciphertext."""
+    if not data:
+        return data
+    limit = min(len(data), 512 * 1024)
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        iend = data.find(b"IEND", 8, limit)
+        if iend != -1:
+            after = data[iend + 8:]
+            if len(after) >= 16 and len(after) % 16 == 0:
+                return after
+    elif len(data) >= 4 and data[:3] == b"\xff\xd8\xff" and (
+        0xE0 <= data[3] <= 0xEF or data[3] in (0xDB, 0xFE, 0xC0, 0xC2)
+    ):
+        eoi = data.find(b"\xff\xd9", 3, limit)
+        if eoi != -1:
+            after = data[eoi + 2:]
+            if len(after) >= 16 and len(after) % 16 == 0:
+                return after
+    return data
 
 
 def _is_probably_error_page(data: bytes) -> bool:
@@ -1015,13 +1131,23 @@ def _is_probably_error_page(data: bytes) -> bool:
     head = data[:512].lstrip().lower()
     if not head.startswith((b"<!doctype", b"<html", b"<head", b"<?xml", b"{")):
         return False
-    # A disguised TS/fMP4 payload that happens to start with '<' would still
-    # reveal TS packet syncs or BMFF boxes nearby.
-    if _find_ts_sync_offset(data, max_scan=4096) is not None:
+    # A disguised TS/fMP4 payload that happens to start with '<' (e.g. fake SVG)
+    # would still reveal TS packet syncs or BMFF boxes nearby.
+    if _find_ts_sync_offset(data, max_scan=65536) is not None:
         return False
-    if _find_bmff_offset(data, max_scan=1024) is not None:
+    if _find_bmff_offset(data, max_scan=16384) is not None:
         return False
     return True
+
+
+def _align_ts_tail(data: bytes) -> bytes:
+    """Trim trailing incomplete junk bytes so concatenated MPEG-TS stays 188-byte aligned."""
+    n = len(data)
+    if n >= 188 and data[0] == 0x47:
+        rem = n % 188
+        if rem != 0 and (n < 376 or data[188] == 0x47):
+            return data[: n - rem]
+    return data
 
 
 def _sanitize_segment_bytes(
@@ -1042,7 +1168,7 @@ def _sanitize_segment_bytes(
 
     # 2. Clean MPEG-TS at byte 0.
     if data[0] == 0x47 and (len(data) < 189 or data[188] == 0x47):
-        return data, ".ts"
+        return _align_ts_tail(data), ".ts"
 
     # 3. Raw ADTS AAC / ID3 audio segment (used by audio-only HLS groups).
     if data[:3] == b"ID3":
@@ -1056,7 +1182,8 @@ def _sanitize_segment_bytes(
     # 4. Strip disguised prefix before MPEG-TS sync alignment.
     ts_pos = _find_ts_sync_offset(data)
     if ts_pos is not None:
-        return (data[ts_pos:] if ts_pos > 0 else data), ".ts"
+        cleaned = data[ts_pos:] if ts_pos > 0 else data
+        return _align_ts_tail(cleaned), ".ts"
 
     # 5. Strip disguised prefix before ISO-BMFF fMP4 boxes.
     bmff_pos = _find_bmff_offset(data)
@@ -1086,6 +1213,7 @@ def _build_remux_args(
     local: bool,
     mode: str = "copy",
     extra_input_args: Optional[List[str]] = None,
+    per_input_extra_args: Optional[List[Optional[List[str]]]] = None,
     limit_seconds: int = 0,
     with_progress: bool = False,
 ) -> List[str]:
@@ -1104,7 +1232,9 @@ def _build_remux_args(
     if with_progress:
         args += ["-progress", "pipe:1", "-nostats"]
 
-    for src in inputs:
+    for idx_in, src in enumerate(inputs):
+        if mode == "copy-lenient":
+            args += ["-err_detect", "ignore_err", "-probesize", "20M", "-analyzeduration", "20M"]
         if local:
             # -allowed_extensions is private to the hls demuxer: passing it for
             # a merged .ts/.mp4 input fails with "Option allowed_extensions not found".
@@ -1116,12 +1246,22 @@ def _build_remux_args(
         else:
             args += [
                 "-allowed_extensions", "ALL",
-                "-protocol_whitelist", "file,http,https,httpproxy,tcp,tls,crypto",
+                "-protocol_whitelist", "file,http,https,httpproxy,tcp,tls,crypto,data",
                 "-reconnect", "1", "-reconnect_streamed", "1",
                 "-reconnect_delay_max", "10",
+                "-rw_timeout", "30000000",
             ]
-            if extra_input_args:
-                args += list(extra_input_args)
+            in_extra = (
+                per_input_extra_args[idx_in]
+                if (
+                    per_input_extra_args
+                    and idx_in < len(per_input_extra_args)
+                    and per_input_extra_args[idx_in] is not None
+                )
+                else extra_input_args
+            )
+            if in_extra:
+                args += list(in_extra)
         args += ["-i", src]
 
     # Only the first video stream + audio stream: drops attachment/subtitle
@@ -1148,8 +1288,9 @@ def _build_remux_args(
     if limit_seconds and limit_seconds > 0:
         args += ["-t", str(int(limit_seconds))]
 
+    fflags = "+genpts+igndts+discardcorrupt" if mode == "copy-lenient" else "+genpts"
     args += [
-        "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+        "-fflags", fflags, "-avoid_negative_ts", "make_zero",
         "-max_muxing_queue_size", "1024",
         "-movflags", "+faststart",
         dst,
@@ -1303,6 +1444,7 @@ async def _remux_with_fallbacks(
     local: bool,
     timeout: int,
     extra_input_args: Optional[List[str]] = None,
+    per_input_extra_args: Optional[List[Optional[List[str]]]] = None,
     limit_seconds: int = 0,
     on_progress=None,
     modes: Optional[List[str]] = None,
@@ -1310,9 +1452,18 @@ async def _remux_with_fallbacks(
 ) -> bool:
     """Remux with ``-c copy``, then retry with progressively safer modes."""
     if not modes:
-        attempts = ["copy", "audio-aac"]
+        attempts = ["copy", "copy-lenient", "audio-aac"] if local else ["copy", "audio-aac"]
     else:
         attempts = list(modes)
+        if local and "copy-lenient" not in attempts and any(
+            m in attempts for m in ("copy", "copy-adtstoasc")
+        ):
+            insert_at = (
+                attempts.index("copy") + 1
+                if "copy" in attempts
+                else attempts.index("copy-adtstoasc") + 1
+            )
+            attempts.insert(insert_at, "copy-lenient")
     if HLS_REENCODE_FALLBACK and "reencode" not in attempts:
         attempts.append("reencode")
 
@@ -1320,7 +1471,9 @@ async def _remux_with_fallbacks(
     for mode in attempts:
         args = _build_remux_args(
             inputs, dst, local=local, mode=mode,
-            extra_input_args=extra_input_args, limit_seconds=limit_seconds,
+            extra_input_args=extra_input_args,
+            per_input_extra_args=per_input_extra_args,
+            limit_seconds=limit_seconds,
             with_progress=(on_progress is not None),
         )
         ok, err = await _run_ffmpeg_detailed(args, dst, timeout, on_progress=on_progress)
@@ -1451,6 +1604,7 @@ def _truncate(pl: MediaPlaylist, limit_seconds: int) -> MediaPlaylist:
         keys=pl.keys,
         init_url=pl.init_url,
         init_byte_range=pl.init_byte_range,
+        init_key_index=pl.init_key_index,
         media_sequence=pl.media_sequence,
         target_duration=pl.target_duration,
         version=pl.version,
@@ -1488,31 +1642,50 @@ def _write_local_playlist(
     if pl.media_sequence:
         lines.append(f"#EXT-X-MEDIA-SEQUENCE:{pl.media_sequence}")
     lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+    current_key: Optional[int] = None
+
+    def _emit_key_if_needed(key_idx: int) -> None:
+        nonlocal current_key
+        if already_decrypted or key_idx == current_key:
+            return
+        key = pl.keys[key_idx] if 0 <= key_idx < len(pl.keys) else None
+        if key is not None and key.is_aes128:
+            local_key = key_files.get(key.url)
+            if not local_key:
+                raise ValueError(f"No local key for {key.url}")
+            iv = f",IV={key.iv}" if key.iv else ""
+            lines.append(f'#EXT-X-KEY:METHOD=AES-128,URI="{local_key}"{iv}')
+        else:
+            lines.append("#EXT-X-KEY:METHOD=NONE")
+        current_key = key_idx
+
     if default_init:
+        if pl.init_key_index:
+            _emit_key_if_needed(pl.init_key_index)
         lines.append(f'#EXT-X-MAP:URI="{default_init}"')
 
-    current_key: Optional[int] = None
     current_init_name = default_init
+    pending_disc = False
     for seg, filename in zip(pl.segments, filenames):
         if seg.discontinuity:
+            pending_disc = True
+        if not filename:
+            continue
+        if pending_disc:
             lines.append("#EXT-X-DISCONTINUITY")
             current_init_name = ""
+            pending_disc = False
         if init_map and seg.init_url:
             mapped = init_map.get((seg.init_url, seg.init_byte_range), "")
             if mapped and mapped != current_init_name:
+                # Per RFC 8216 §4.3.2.5, emit #EXT-X-KEY before an encrypted #EXT-X-MAP.
+                if seg.init_key_index:
+                    _emit_key_if_needed(seg.init_key_index)
+                elif current_key not in (None, 0):
+                    _emit_key_if_needed(0)
                 lines.append(f'#EXT-X-MAP:URI="{mapped}"')
                 current_init_name = mapped
-        if not already_decrypted and seg.key_index != current_key:
-            key = pl.keys[seg.key_index] if seg.key_index < len(pl.keys) else None
-            if key is not None and key.is_aes128:
-                local_key = key_files.get(key.url)
-                if not local_key:
-                    raise ValueError(f"No local key for {key.url}")
-                iv = f",IV={key.iv}" if key.iv else ""
-                lines.append(f'#EXT-X-KEY:METHOD=AES-128,URI="{local_key}"{iv}')
-            else:
-                lines.append("#EXT-X-KEY:METHOD=NONE")
-            current_key = seg.key_index
+        _emit_key_if_needed(seg.key_index)
         lines.append(f"#EXTINF:{seg.duration:.3f},")
         lines.append(filename)
 
@@ -1553,6 +1726,14 @@ def _infer_merged_ext(
     return ext
 
 
+def _is_skippable_dead_segment_error(exc: BaseException) -> bool:
+    """True only for persistent non-auth HTTP 404/410/5xx on an individual segment."""
+    if _is_proxy_error(exc):
+        return False
+    status = _extract_http_status(exc)
+    return status in (404, 410, 500, 502, 503, 504)
+
+
 async def _fetch_keys_and_inits(
     client: HlsClient,
     pl: MediaPlaylist,
@@ -1562,8 +1743,9 @@ async def _fetch_keys_and_inits(
     parent_url: str = "",
     base_headers: Optional[Dict[str, str]] = None,
     auth_state: Optional[_PlaylistAuthState] = None,
+    aes_backend: Optional[str] = None,
 ) -> Tuple[Dict[str, bytes], Dict[Tuple[str, Optional[Tuple[int, int]]], bytes]]:
-    """Fetch all distinct AES-128 keys and #EXT-X-MAP init sections concurrently."""
+    """Fetch all distinct AES-128 keys (including inline ``data:`` URIs) and ``#EXT-X-MAP`` init sections."""
     for key in pl.keys:
         if key.method and key.method not in ("NONE", "AES-128"):
             raise _HlsError(R_DRM, f"Unsupported encryption method: {key.method}")
@@ -1574,6 +1756,21 @@ async def _fetch_keys_and_inits(
         auth_state = _PlaylistAuthState(
             client, parent_url=parent_url, base_headers=base_headers,
         )
+
+    parent_origin = _origin_of_url(parent_url)
+    host_auth_states: Dict[str, _PlaylistAuthState] = {}
+
+    def _auth_for(target_url: str) -> _PlaylistAuthState:
+        origin = _origin_of_url(target_url)
+        if not origin or not parent_origin or origin == parent_origin:
+            return auth_state
+        st = host_auth_states.get(origin)
+        if st is None:
+            st = _PlaylistAuthState(
+                client, parent_url=parent_url, base_headers=base_headers, promote_global=False,
+            )
+            host_auth_states[origin] = st
+        return st
 
     unique_key_urls: List[str] = []
     for key in pl.keys:
@@ -1587,44 +1784,74 @@ async def _fetch_keys_and_inits(
     if pl.init_url and (pl.init_url, pl.init_byte_range) not in unique_inits:
         unique_inits.append((pl.init_url, pl.init_byte_range))
 
+    init_keys = pl.init_section_keys
+    has_encrypted_init = any(
+        0 <= init_keys.get(spec, 0) < len(pl.keys)
+        and pl.keys[init_keys.get(spec, 0)].is_aes128
+        for spec in unique_inits
+    )
+
     raw_keys: Dict[str, bytes] = {}
     raw_inits: Dict[Tuple[str, Optional[Tuple[int, int]]], bytes] = {}
 
     async def _get_key(url: str) -> None:
+        if url.strip().lower().startswith("data:"):
+            inline = decode_data_key_uri(url)
+            if inline is None:
+                raise _HlsError(R_DRM, "Invalid inline data: AES-128 key URI")
+            raw_keys[url] = inline
+            return
         async with sem:
             data = await _fetch_media_bytes_resilient(
                 client, url, label="AES-128 key",
-                auth_state=auth_state, validator=lambda d: len(d) == 16,
+                auth_state=_auth_for(url), validator=lambda d: len(d) == 16,
             )
             raw_keys[url] = _validate_aes_key(data, url)
 
     async def _get_init(spec: Tuple[str, Optional[Tuple[int, int]]]) -> None:
         init_url, init_range = spec
+        key_idx = init_keys.get(spec, 0)
+        init_key = pl.keys[key_idx] if 0 <= key_idx < len(pl.keys) else None
+        is_init_enc = init_key is not None and init_key.is_aes128
         async with sem:
             data = await _fetch_media_bytes_resilient(
                 client, init_url, byte_range=init_range,
                 on_chunk=on_chunk, label="init segment",
-                auth_state=auth_state, validator=lambda d: not _is_probably_error_page(d),
+                auth_state=_auth_for(init_url), validator=lambda d: not _is_probably_error_page(d),
             )
             if _is_probably_error_page(data):
                 raise ValueError(f"Init segment returned HTML/error page for {init_url}")
-            bmff_pos = _find_bmff_offset(data)
-            if bmff_pos is not None and bmff_pos > 0:
-                data = data[bmff_pos:]
+            if is_init_enc:
+                data = _strip_outer_image_wrapper(data)
+                if aes_backend is not None and init_key is not None and init_key.url in raw_keys:
+                    iv = _compute_aes_iv(init_key.iv, 0)
+                    data = _decrypt_aes128_cbc(data, raw_keys[init_key.url], iv, aes_backend)
+            if not is_init_enc or aes_backend is not None:
+                bmff_pos = _find_bmff_offset(data)
+                if bmff_pos is not None and bmff_pos > 0:
+                    data = data[bmff_pos:]
             raw_inits[spec] = data
 
-    tasks = [asyncio.create_task(_get_key(u)) for u in unique_key_urls] + [
-        asyncio.create_task(_get_init(s)) for s in unique_inits
-    ]
-    if tasks:
+    async def _gather_cancel(task_list: List[asyncio.Task]) -> None:
+        if not task_list:
+            return
         try:
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*task_list)
         except BaseException:
-            for t in tasks:
+            for t in task_list:
                 if not t.done():
                     t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*task_list, return_exceptions=True)
             raise
+
+    if has_encrypted_init and unique_key_urls:
+        await _gather_cancel([asyncio.create_task(_get_key(u)) for u in unique_key_urls])
+        await _gather_cancel([asyncio.create_task(_get_init(s)) for s in unique_inits])
+    else:
+        tasks = [asyncio.create_task(_get_key(u)) for u in unique_key_urls] + [
+            asyncio.create_task(_get_init(s)) for s in unique_inits
+        ]
+        await _gather_cancel(tasks)
 
     return raw_keys, raw_inits
 
@@ -1662,13 +1889,15 @@ async def _localize_playlist(
         client, parent_url=parent_url, base_headers=base_headers,
     )
 
+    aes_backend = _detect_aes_backend() if pl.is_encrypted else None
+    can_python_decrypt = (not pl.is_encrypted) or (aes_backend is not None)
+
     raw_keys, raw_inits = await _fetch_keys_and_inits(
         client, pl, sem=sem, on_chunk=on_chunk,
         parent_url=parent_url, base_headers=base_headers, auth_state=auth_state,
+        aes_backend=aes_backend,
     )
 
-    aes_backend = _detect_aes_backend() if pl.is_encrypted else None
-    can_python_decrypt = (not pl.is_encrypted) or (aes_backend is not None)
     has_discontinuity = any(s.discontinuity for s in pl.segments)
     use_contiguous = (
         can_python_decrypt and not has_discontinuity and len(raw_inits) <= 1
@@ -1676,13 +1905,18 @@ async def _localize_playlist(
 
     loop = asyncio.get_running_loop()
     total = len(pl.segments)
+    max_skips = min(3, max(1, total // 50)) if (total >= 30 and not pl.is_live) else 0
+    skipped_count = 0
     cursor = 0
     first_error: Optional[BaseException] = None
 
     def _decrypt_and_clean(idx: int, seg: MediaSegment, data: bytes) -> Tuple[bytes, str]:
+        if _is_probably_error_page(data):
+            raise ValueError(f"Segment {idx} returned HTML/JSON error page for {seg.url}")
         key = pl.keys[seg.key_index] if seg.key_index < len(pl.keys) else None
         is_seg_enc = key is not None and key.is_aes128
         if is_seg_enc:
+            data = _strip_outer_image_wrapper(data)
             if not can_python_decrypt:
                 return data, (".m4s" if (pl.is_fmp4 or seg.init_url) else ".ts")
             iv = _compute_aes_iv(key.iv, seg.sequence)
@@ -1690,6 +1924,9 @@ async def _localize_playlist(
         if _is_probably_error_page(data):
             raise ValueError(f"Segment {idx} returned HTML/JSON error page for {seg.url}")
         return _sanitize_segment_bytes(data, is_fmp4=(pl.is_fmp4 or bool(seg.init_url)))
+
+    def _segment_validator(d: bytes) -> bool:
+        return not _is_probably_error_page(d)
 
     if use_contiguous:
         init_bytes = next(iter(raw_inits.values()), b"")
@@ -1711,8 +1948,34 @@ async def _localize_playlist(
                 if active_io is fut:
                     active_io = None
 
+        async def _drain_pending() -> None:
+            nonlocal pending_ram, next_write, out_path, out_fh
+            async with drain_lock:
+                while next_write in pending:
+                    item = pending.pop(next_write)
+                    if isinstance(item, bytes):
+                        pending_ram -= len(item)
+                        if not item:
+                            next_write += 1
+                            continue
+                    if out_fh is None:
+                        sample = (
+                            item if isinstance(item, bytes)
+                            else await _run_io(_read_head_sync, item, 8192)
+                        )
+                        ext = _infer_merged_ext(sample, init_bytes, pl.is_fmp4)
+                        out_path = os.path.join(work_dir, f"stream{ext}")
+                        out_fh = open(out_path, "wb", buffering=1024 * 1024)
+                        if init_bytes:
+                            await _run_io(out_fh.write, init_bytes)
+                    if isinstance(item, bytes):
+                        await _run_io(out_fh.write, item)
+                    else:
+                        await _run_io(_copy_and_unlink_sync, item, out_fh)
+                    next_write += 1
+
         async def _worker_contiguous() -> None:
-            nonlocal cursor, first_error, pending_ram, next_write, out_path, out_fh
+            nonlocal cursor, first_error, pending_ram, skipped_count
             while first_error is None:
                 if cursor >= total:
                     return
@@ -1727,10 +1990,7 @@ async def _localize_playlist(
                             client, seg.url, byte_range=seg.byte_range,
                             on_chunk=on_chunk, label=f"segment {idx}",
                             auth_state=auth_state,
-                            validator=(
-                                (lambda d: not _is_probably_error_page(d))
-                                if not pl.is_encrypted else None
-                            ),
+                            validator=_segment_validator,
                         )
                     if aes_backend is not None and pl.keys[seg.key_index].is_aes128:
                         data, _ = await loop.run_in_executor(
@@ -1750,29 +2010,24 @@ async def _localize_playlist(
                         pending[idx] = data
                         pending_ram += len(data)
 
-                    async with drain_lock:
-                        while next_write in pending:
-                            item = pending.pop(next_write)
-                            if isinstance(item, bytes):
-                                pending_ram -= len(item)
-                            if out_fh is None:
-                                sample = (
-                                    item if isinstance(item, bytes)
-                                    else await _run_io(_read_head_sync, item, 8192)
-                                )
-                                ext = _infer_merged_ext(sample, init_bytes, pl.is_fmp4)
-                                out_path = os.path.join(work_dir, f"stream{ext}")
-                                out_fh = open(out_path, "wb", buffering=1024 * 1024)
-                                if init_bytes:
-                                    await _run_io(out_fh.write, init_bytes)
-                            if isinstance(item, bytes):
-                                await _run_io(out_fh.write, item)
-                            else:
-                                await _run_io(_copy_and_unlink_sync, item, out_fh)
-                            next_write += 1
+                    await _drain_pending()
                 except asyncio.CancelledError:
                     raise
                 except BaseException as exc:
+                    if (
+                        idx > 0
+                        and max_skips > 0
+                        and skipped_count < max_skips
+                        and _is_skippable_dead_segment_error(exc)
+                    ):
+                        skipped_count += 1
+                        _log(
+                            f"[HLS] Skipping persistently failing segment {idx}/{total} "
+                            f"({skipped_count}/{max_skips}): {_sanitize_detail(str(exc))}"
+                        )
+                        pending[idx] = b""
+                        await _drain_pending()
+                        continue
                     if first_error is None:
                         first_error = exc
                     return
@@ -1826,7 +2081,7 @@ async def _localize_playlist(
     filenames: List[str] = [""] * total
 
     async def _worker_files() -> None:
-        nonlocal cursor, first_error
+        nonlocal cursor, first_error, skipped_count
         while first_error is None:
             if cursor >= total:
                 return
@@ -1841,11 +2096,10 @@ async def _localize_playlist(
                         client, seg.url, byte_range=seg.byte_range,
                         on_chunk=on_chunk, label=f"segment {idx}",
                         auth_state=auth_state,
-                        validator=(
-                            (lambda d: not _is_probably_error_page(d))
-                            if not pl.is_encrypted else None
-                        ),
+                        validator=_segment_validator,
                     )
+                if _is_probably_error_page(raw):
+                    raise ValueError(f"Segment {idx} returned HTML/JSON error page for {seg.url}")
                 if can_python_decrypt:
                     if aes_backend is not None and pl.keys[seg.key_index].is_aes128:
                         data, ext = await loop.run_in_executor(
@@ -1855,8 +2109,9 @@ async def _localize_playlist(
                         data, ext = _decrypt_and_clean(idx, seg, raw)
                     name = f"seg_{idx:05d}{ext}"
                 else:
-                    # Encrypted without Python C-AES: keep raw ciphertext for ffmpeg.
-                    data = raw
+                    # Encrypted without Python C-AES: strip any outer fake image header
+                    # and keep raw ciphertext for ffmpeg's C crypto demuxer.
+                    data = _strip_outer_image_wrapper(raw)
                     name = f"seg_{idx:05d}" + (".m4s" if (pl.is_fmp4 or seg.init_url) else ".ts")
                 await loop.run_in_executor(
                     None, _write_bytes_sync, os.path.join(work_dir, name), data,
@@ -1865,6 +2120,19 @@ async def _localize_playlist(
             except asyncio.CancelledError:
                 raise
             except BaseException as exc:
+                if (
+                    idx > 0
+                    and max_skips > 0
+                    and skipped_count < max_skips
+                    and _is_skippable_dead_segment_error(exc)
+                ):
+                    skipped_count += 1
+                    _log(
+                        f"[HLS] Skipping persistently failing segment {idx}/{total} "
+                        f"({skipped_count}/{max_skips}): {_sanitize_detail(str(exc))}"
+                    )
+                    filenames[idx] = ""
+                    continue
                 if first_error is None:
                     first_error = exc
                 return
@@ -1882,6 +2150,9 @@ async def _localize_playlist(
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
 
+    if not any(filenames):
+        raise ValueError("Downloaded stream is empty")
+
     playlist_path = os.path.join(work_dir, "index.m3u8")
     _write_local_playlist(
         pl, playlist_path, filenames, key_files, init_files,
@@ -1898,6 +2169,9 @@ async def _engine_segments(
     on_chunk=None,
     *,
     base_headers: Optional[Dict[str, str]] = None,
+    audio_client: Optional[HlsClient] = None,
+    audio_base_headers: Optional[Dict[str, str]] = None,
+    external_direct_audio_url: Optional[str] = None,
 ) -> List[str]:
     """Engine A: download video (and audio concurrently) and return ffmpeg inputs."""
     video_pl = _truncate(prep.video_pl, limit_seconds)
@@ -1913,21 +2187,74 @@ async def _engine_segments(
         if candidate_audio.segments:
             audio_pl = candidate_audio
 
-    if audio_pl is None:
+    eff_audio_client = audio_client or client
+    eff_audio_headers = audio_base_headers if audio_base_headers is not None else base_headers
+
+    if audio_pl is None and not external_direct_audio_url:
         video_input = await _localize_playlist(
             client, video_pl, video_dir, on_chunk=on_chunk, sem=shared_sem,
             parent_url=prep.video_url, base_headers=base_headers,
         )
+        # Silent-video recovery: if master had standalone #EXT-X-MEDIA:TYPE=AUDIO
+        # tracks but STREAM-INF omitted AUDIO="...", check if video is actually
+        # silent and recover audio from the first working audio rendition.
+        if prep.fallback_audios:
+            try:
+                probe = await _probe_streams([video_input], local=True)
+            except Exception:
+                probe = {"video": [], "audio": []}
+            if probe.get("video") and not probe.get("audio"):
+                audio_dir = os.path.join(temp_dir, "audio")
+                for track in prep.fallback_audios:
+                    try:
+                        a_text, a_final = await _fetch_playlist_with_fallback(
+                            client, track.url,
+                            parent_url=prep.audios_base_url or prep.video_url,
+                            base_headers=base_headers,
+                        )
+                        if not is_hls_playlist(a_text) or is_drm(a_text) or is_master_playlist(a_text):
+                            continue
+                        fb_pl = _truncate(parse_media(a_text, a_final), limit_seconds)
+                        if not fb_pl.segments:
+                            continue
+                        audio_input = await _localize_playlist(
+                            client, fb_pl, audio_dir, on_chunk=on_chunk, sem=shared_sem,
+                            parent_url=a_final, base_headers=base_headers,
+                        )
+                        _log(f"[HLS] Recovered audio track for silent video via {_sanitize_detail(a_final)}")
+                        return [video_input, audio_input]
+                    except (asyncio.CancelledError, WarpProxyError):
+                        raise
+                    except Exception as exc:
+                        if _is_proxy_error(exc):
+                            raise
+                        shutil.rmtree(audio_dir, ignore_errors=True)
+                        continue
         return [video_input]
 
     audio_dir = os.path.join(temp_dir, "audio")
 
     async def _download_audio_safe() -> Optional[str]:
         try:
-            return await _localize_playlist(
-                client, audio_pl, audio_dir, on_chunk=on_chunk, sem=shared_sem,
-                parent_url=prep.audio_url, base_headers=base_headers,
-            )
+            if audio_pl is not None:
+                return await _localize_playlist(
+                    eff_audio_client, audio_pl, audio_dir, on_chunk=on_chunk, sem=shared_sem,
+                    parent_url=prep.audio_url, base_headers=eff_audio_headers,
+                )
+            if external_direct_audio_url:
+                os.makedirs(audio_dir, exist_ok=True)
+                ext = _extension_of(external_direct_audio_url, default=".m4a")
+                dst_audio = os.path.join(audio_dir, f"ext_audio{ext}")
+                await _download_file_with_auth_fallback(
+                    eff_audio_client,
+                    external_direct_audio_url,
+                    dst_audio,
+                    base_headers=dict(eff_audio_headers or {}),
+                    on_chunk=on_chunk,
+                    on_meta=None,
+                )
+                return dst_audio if os.path.isfile(dst_audio) and _safe_size(dst_audio) > 0 else None
+            return None
         except (asyncio.CancelledError, WarpProxyError):
             raise
         except Exception as exc:
@@ -1993,13 +2320,17 @@ async def _prepare(
     max_height: int,
     *,
     base_headers: Optional[Dict[str, str]] = None,
+    initial_text: str = "",
 ) -> _Prepared:
-    """Resolve a master/media playlist (with variant fallback & redirect base URL)."""
+    """Resolve a master/media playlist (with variant & audio fallback + redirect base URL)."""
     prep = _Prepared(video_url=url)
 
-    text, current_url = await _fetch_playlist_with_fallback(
-        client, url, base_headers=base_headers,
-    )
+    if initial_text and is_hls_playlist(initial_text):
+        text, current_url = initial_text, url
+    else:
+        text, current_url = await _fetch_playlist_with_fallback(
+            client, url, base_headers=base_headers,
+        )
     prep.video_url = current_url
 
     if not is_hls_playlist(text):
@@ -2011,7 +2342,7 @@ async def _prepare(
     # lower-ranked variants if the top edge returns 403/404.
     media_text = text
     media_url = current_url
-    audios = []
+    audios: List[AudioTrack] = []
     audios_base_url = current_url
     chosen_audio_group = ""
 
@@ -2059,10 +2390,14 @@ async def _prepare(
                 raise last_exc
             break
 
+    audio_candidates: List[AudioTrack] = []
     if chosen_audio_group and audios:
-        track = select_audio_track(audios, chosen_audio_group)
-        if track is not None and track.url:
-            prep.audio_url = track.url
+        audio_candidates = rank_audio_tracks(audios, chosen_audio_group)
+        if audio_candidates:
+            prep.audio_url = audio_candidates[0].url
+    elif audios:
+        prep.fallback_audios = fallback_audio_tracks(audios)
+        prep.audios_base_url = audios_base_url
 
     if is_drm(media_text):
         raise _HlsError(R_DRM, "media playlist uses DRM")
@@ -2075,40 +2410,782 @@ async def _prepare(
     prep.duration = prep.video_pl.total_duration
     prep.is_live = prep.video_pl.is_live
 
-    if not prep.audio_url:
+    if not audio_candidates:
         return prep
 
-    try:
-        audio_text, audio_final_url = await _fetch_playlist_with_fallback(
-            client, prep.audio_url, parent_url=audios_base_url, base_headers=base_headers,
-        )
-        prep.audio_url = audio_final_url
-        if is_drm(audio_text):
-            raise _HlsError(R_DRM, "audio playlist uses DRM")
-        prep.audio_text = audio_text
-        if not is_master_playlist(audio_text):
-            prep.audio_pl = parse_media(audio_text, audio_final_url)
-    except (_HlsError, WarpProxyError):
-        raise
-    except Exception as e:
-        if _is_proxy_error(e):
+    # Try each ranked audio track in the selected group before falling back to video-only.
+    prep.audio_url = ""
+    for track in audio_candidates:
+        try:
+            audio_text, audio_final_url = await _fetch_playlist_with_fallback(
+                client, track.url, parent_url=audios_base_url, base_headers=base_headers,
+            )
+            if not is_hls_playlist(audio_text):
+                _log(f"[HLS] Audio track is not an m3u8 playlist: {_sanitize_detail(track.url)}")
+                continue
+            if is_drm(audio_text):
+                raise _HlsError(R_DRM, "audio playlist uses DRM")
+            prep.audio_url = audio_final_url
+            prep.audio_text = audio_text
+            if not is_master_playlist(audio_text):
+                prep.audio_pl = parse_media(audio_text, audio_final_url)
+            break
+        except (_HlsError, WarpProxyError):
             raise
-        _log(f"[HLS] Could not read audio playlist {_sanitize_detail(prep.audio_url)}: {_sanitize_detail(str(e))}")
-        prep.audio_url = ""
+        except Exception as e:
+            if _is_proxy_error(e):
+                raise
+            _log(f"[HLS] Could not read audio playlist {_sanitize_detail(track.url)}: {_sanitize_detail(str(e))}")
+            continue
 
     return prep
+
+
+# ---------------------------------------------------------------------------
+# Engine C (yt-dlp), Direct Progressive Video, and DASH downloaders
+# ---------------------------------------------------------------------------
+
+def _cfg_ytdlp_enabled() -> bool:
+    val = getattr(_cfg, "HLS_YTDLP_ENABLED", True)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
+def _is_faststart_mp4_sync(path: str) -> bool:
+    """True when *path* is an ISO-BMFF MP4 whose ``moov`` box precedes ``mdat``."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(512 * 1024)
+    except OSError:
+        return False
+    if len(head) < 12 or head[4:8] != b"ftyp":
+        return False
+    moov = head.find(b"moov")
+    mdat = head.find(b"mdat")
+    return moov != -1 and (mdat == -1 or moov < mdat)
+
+
+def _infer_stream_type_from_url(url: str, default: str = "hls") -> str:
+    low = (url or "").split("?", 1)[0].lower()
+    if low.endswith((".m3u8", ".m3u")) or ".m3u8" in (url or "").lower():
+        return "hls"
+    if low.endswith(".mpd") or ".mpd?" in (url or "").lower():
+        return "dash"
+    if low.endswith((".mp4", ".webm", ".mkv", ".mov", ".flv", ".m4v")):
+        return "direct"
+    return default
+
+
+async def _download_file_via_client(
+    client: HlsClient,
+    url: str,
+    dst_path: str,
+    *,
+    headers: Optional[Dict[str, Optional[str]]] = None,
+    on_chunk: Optional[Callable[[int], None]] = None,
+    on_meta: Optional[Callable[[int], None]] = None,
+) -> int:
+    """Stream *url* to *dst_path* via HlsClient (supporting post-upgrade streaming method)."""
+    stream_fn = getattr(client, "download_stream_to_file", None)
+    if callable(stream_fn):
+        meta_fired = False
+
+        def _on_total(total_size: int) -> None:
+            nonlocal meta_fired
+            if on_meta is not None and not meta_fired:
+                meta_fired = True
+                on_meta(total_size)
+
+        def _on_chunk_wrap(n: int) -> None:
+            nonlocal meta_fired
+            if on_meta is not None and not meta_fired:
+                meta_fired = True
+                try:
+                    on_meta(0)
+                except Exception as e:
+                    _log(f"[HLS] on_meta callback failed: {e}")
+            if on_chunk is not None:
+                on_chunk(n)
+
+        kwargs: Dict[str, Any] = {}
+        if _supports_kwarg(stream_fn, "on_chunk"):
+            kwargs["on_chunk"] = _on_chunk_wrap if (on_chunk is not None or on_meta is not None) else None
+        if _supports_kwarg(stream_fn, "on_total"):
+            kwargs["on_total"] = _on_total if on_meta is not None else None
+        elif _supports_kwarg(stream_fn, "on_meta"):
+            kwargs["on_meta"] = on_meta
+        if headers is not None and _supports_kwarg(stream_fn, "headers"):
+            kwargs["headers"] = headers
+        res = await stream_fn(url, dst_path, **kwargs)
+        if isinstance(res, tuple):
+            return int(res[0] or _safe_size(dst_path))
+        return int(res or _safe_size(dst_path))
+
+    if on_meta is not None:
+        try:
+            on_meta(0)
+        except Exception as e:
+            _log(f"[HLS] on_meta callback failed: {e}")
+    dl_kwargs: Dict[str, Any] = {"on_chunk": on_chunk}
+    if headers is not None and _supports_kwarg(client.download_to, "headers"):
+        dl_kwargs["headers"] = headers
+    return int(await client.download_to(url, dst_path, **dl_kwargs) or _safe_size(dst_path))
+
+
+async def _download_file_with_auth_fallback(
+    client: HlsClient,
+    url: str,
+    dst_path: str,
+    *,
+    base_headers: Dict[str, str],
+    on_chunk: Optional[Callable[[int], None]] = None,
+    on_meta: Optional[Callable[[int], None]] = None,
+) -> int:
+    """Download a direct media file with 401/403 header-profile fallback & HTML guard."""
+    async def _attempt(override_hdrs: Optional[Dict[str, Optional[str]]]) -> int:
+        if os.path.exists(dst_path):
+            try:
+                os.remove(dst_path)
+            except OSError:
+                pass
+        written = await _download_file_via_client(
+            client, url, dst_path, headers=override_hdrs, on_chunk=on_chunk, on_meta=on_meta,
+        )
+        head = _read_head_sync(dst_path, 4096) if os.path.exists(dst_path) else b""
+        if not head or _is_probably_error_page(head):
+            try:
+                os.remove(dst_path)
+            except OSError:
+                pass
+            raise ValueError(f"Direct video URL returned HTML/JSON error page for {url}")
+        return written
+
+    try:
+        return await _retry_call("direct-video", lambda: _attempt(None))
+    except (asyncio.CancelledError, WarpProxyError):
+        raise
+    except Exception as exc:
+        if _is_proxy_error(exc) or _extract_http_status(exc) not in (401, 403):
+            raise
+        profiles = _header_fallback_profiles(_current_headers(client, base_headers), url)
+        last_exc: Exception = exc
+        for profile in profiles:
+            try:
+                written = await _attempt(profile)
+                _promote_header_overrides(client, base_headers, profile)
+                return written
+            except (asyncio.CancelledError, WarpProxyError):
+                raise
+            except Exception as p_exc:
+                if _is_proxy_error(p_exc):
+                    raise
+                last_exc = p_exc
+                continue
+        raise last_exc
+
+
+async def _engine_ytdlp(
+    target_url: str,
+    dst_mp4: str,
+    temp_dir: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    cookies: Optional[Dict[str, str]] = None,
+    cookie_entries: Optional[List[Dict[str, Any]]] = None,
+    proxy_url: Optional[str] = None,
+    max_height: int = 0,
+    timeout: int = HLS_TIMEOUT,
+    on_chunk: Optional[Callable[[int], None]] = None,
+    on_meta: Optional[Callable[[int], None]] = None,
+) -> Tuple[bool, str]:
+    """Engine C: optional yt-dlp fallback (supports SOCKS5/WARP, DASH, complex sites)."""
+    if not _cfg_ytdlp_enabled():
+        return False, "yt-dlp disabled"
+
+    # Prefer extractor's app.hls.ytdlp.download_with_ytdlp when available.
+    try:
+        from app.hls import ytdlp as _ytdlp_mod
+    except Exception:
+        _ytdlp_mod = None
+
+    if _ytdlp_mod is not None:
+        avail_fn = getattr(_ytdlp_mod, "ytdlp_available", None)
+        if callable(avail_fn) and not avail_fn():
+            return False, "yt-dlp unavailable"
+        dl_fn = getattr(_ytdlp_mod, "download_with_ytdlp", None)
+        if callable(dl_fn):
+            last_bytes = 0
+            meta_sent = False
+
+            def _yt_progress(downloaded: int, total: int) -> None:
+                nonlocal last_bytes, meta_sent
+                if on_meta is not None and not meta_sent:
+                    meta_sent = True
+                    try:
+                        on_meta(max(0, int(total or 0)))
+                    except Exception:
+                        pass
+                if on_chunk is not None and downloaded > last_bytes:
+                    delta = downloaded - last_bytes
+                    last_bytes = downloaded
+                    try:
+                        on_chunk(delta)
+                    except Exception:
+                        pass
+
+            yt_sub = os.path.join(temp_dir, "ytdlp")
+            os.makedirs(yt_sub, exist_ok=True)
+            try:
+                ok_yt, out_path, detail_yt = await dl_fn(
+                    target_url,
+                    yt_sub,
+                    "ytdlp_out",
+                    proxy=proxy_url,
+                    headers=headers,
+                    cookies=cookies,
+                    cookie_entries=cookie_entries,
+                    max_height=max_height,
+                    timeout=float(timeout),
+                    on_progress=_yt_progress if (on_chunk is not None or on_meta is not None) else None,
+                )
+                if ok_yt and out_path and os.path.isfile(out_path) and _safe_size(out_path) >= 1024:
+                    # Ensure final container is MP4+faststart (yt-dlp may download webm/mkv if not merged).
+                    if _is_faststart_mp4_sync(out_path):
+                        os.replace(out_path, dst_mp4)
+                        return True, ""
+                    remux_errs: List[str] = []
+                    modes = await _choose_remux_modes([out_path], local=True)
+                    async with convert_semaphore():
+                        remux_ok = await _remux_with_fallbacks(
+                            [out_path], dst_mp4, local=True,
+                            timeout=timeout, modes=modes, error_out=remux_errs,
+                        )
+                    if remux_ok:
+                        return True, ""
+                    if out_path.lower().endswith(".mp4"):
+                        os.replace(out_path, dst_mp4)
+                        return True, ""
+                    return False, remux_errs[-1] if remux_errs else "yt-dlp output remux failed"
+                return False, str(detail_yt or "yt-dlp produced no output")
+            except (asyncio.CancelledError, WarpProxyError):
+                raise
+            except Exception as exc:
+                return False, str(exc)
+
+    # Graceful built-in fallback via yt-dlp CLI if installed on PATH.
+    ytdlp_bin = shutil.which("yt-dlp")
+    if not ytdlp_bin:
+        return False, "yt-dlp not installed"
+
+    out_tmpl = os.path.join(temp_dir, "ytdlp_out.%(ext)s")
+    fmt = (
+        f"bestvideo[height<={int(max_height)}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={int(max_height)}]+bestaudio/"
+        f"best[height<={int(max_height)}]/best"
+        if max_height and max_height > 0
+        else "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+    )
+    args = [
+        ytdlp_bin,
+        "--no-playlist",
+        "--no-part",
+        "--no-warnings",
+        "--newline",
+        "-f", fmt,
+        "--merge-output-format", "mp4",
+        "--postprocessor-args", "Merger+ffmpeg:-movflags +faststart",
+        "-o", out_tmpl,
+    ]
+    if proxy_url:
+        args += ["--proxy", proxy_url]
+    for k, v in (headers or {}).items():
+        if k and v:
+            low = k.lower()
+            if low == "user-agent":
+                args += ["--user-agent", v]
+            elif low == "referer":
+                args += ["--referer", v]
+            elif low != "cookie":
+                args += ["--add-header", f"{k}: {v}"]
+    if cookies:
+        cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if k and v is not None)
+        if cookie_str:
+            args += ["--add-header", f"Cookie: {cookie_str}"]
+    args.append(target_url)
+
+    proc = None
+    stderr_task = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stderr_task = asyncio.create_task(_read_stderr_capped(proc))
+        await asyncio.wait_for(proc.wait(), timeout=max(60, timeout))
+        stderr_text = ""
+        if stderr_task is not None:
+            try:
+                stderr_text = await asyncio.wait_for(stderr_task, timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                stderr_task.cancel()
+        if proc.returncode != 0:
+            err_line = stderr_text.splitlines()[-1] if stderr_text else f"yt-dlp exit {proc.returncode}"
+            return False, err_line
+        candidates = sorted(
+            glob.glob(os.path.join(temp_dir, "ytdlp_out.*")),
+            key=_safe_size,
+            reverse=True,
+        )
+        for cand in candidates:
+            if _safe_size(cand) >= 1024:
+                os.replace(cand, dst_mp4)
+                return True, ""
+        return False, "yt-dlp produced empty output"
+    except asyncio.TimeoutError:
+        return False, f"yt-dlp timed out after {timeout}s"
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if stderr_task is not None and not stderr_task.done():
+            stderr_task.cancel()
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except BaseException:
+                pass
+        if stderr_task is not None:
+            try:
+                await stderr_task
+            except BaseException:
+                pass
+
+
+async def _download_direct_to_mp4(
+    url: str,
+    file_name: str,
+    *,
+    audio_url: Optional[str],
+    audio_headers: Optional[Dict[str, str]],
+    headers: Optional[Dict[str, str]],
+    cookies: Optional[Dict[str, str]],
+    cookie_entries: Optional[List[Dict[str, Any]]],
+    status_cb: Optional[Callable[[str], object]],
+    on_chunk: Optional[Callable[[int], None]],
+    on_meta: Optional[Callable[[int], None]],
+    out_dir: Optional[str],
+    max_height: Optional[int],
+    max_duration: Optional[int],
+    proxy_url: Any,
+) -> HlsResult:
+    """Download a progressive direct video (and optional separate audio) to faststart MP4."""
+    result = HlsResult(name=_mp4_name(file_name))
+    if not HLS_ENABLED:
+        result.reason = R_DISABLED
+        return result
+    if not _ffmpeg_available():
+        result.reason = R_NO_FFMPEG
+        return result
+
+    workers = _cfg_workers()
+    base_headers = _normalize_headers(url, headers)
+    client = _make_client(
+        base_headers, proxy_url, cookies, workers, cookie_entries=cookie_entries,
+    )
+    audio_client: Optional[HlsClient] = None
+    if audio_url:
+        a_hdrs = _normalize_headers(audio_url, audio_headers or headers)
+        audio_client = _make_client(
+            a_hdrs, proxy_url, cookies, workers, cookie_entries=cookie_entries,
+        )
+
+    duration_cap = HLS_MAX_DURATION if max_duration is None else max_duration
+    limit_seconds = int(duration_cap) if (duration_cap and duration_cap > 0) else 0
+    dest_dir = out_dir or HLS_TEMP_DIR or tempfile.gettempdir()
+    temp_dir: Optional[str] = None
+    scratch: Optional[str] = None
+    published = False
+
+    try:
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except OSError as e:
+            result.reason = R_REMUX_FAILED
+            result.detail = _sanitize_detail(str(e))
+            return result
+
+        temp_dir = tempfile.mkdtemp(prefix="hls_", dir=dest_dir)
+        final_path = os.path.join(dest_dir, result.name)
+        scratch = os.path.join(
+            dest_dir, f".hls_{random.randint(10 ** 9, 10 ** 10)}.mp4"
+        )
+
+        v_ext = _extension_of(url, default=".mp4")
+        v_raw = os.path.join(temp_dir, f"direct_video{v_ext}")
+        a_raw = os.path.join(temp_dir, f"direct_audio{_extension_of(audio_url or '', default='.m4a')}")
+
+        await _notify(status_cb, "⬇️ Memuat turun video…")
+        downloaded = False
+        download_detail = ""
+        for proxy_try in (0, 1):
+            try:
+                if audio_url and audio_client is not None:
+                    v_task = asyncio.create_task(
+                        _download_file_with_auth_fallback(
+                            client, url, v_raw,
+                            base_headers=base_headers, on_chunk=on_chunk, on_meta=on_meta,
+                        )
+                    )
+                    a_task = asyncio.create_task(
+                        _download_file_with_auth_fallback(
+                            audio_client, audio_url, a_raw,
+                            base_headers=audio_client.headers, on_chunk=on_chunk, on_meta=None,
+                        )
+                    )
+                    try:
+                        await asyncio.gather(v_task, a_task)
+                    except BaseException:
+                        for t in (v_task, a_task):
+                            if not t.done():
+                                t.cancel()
+                        await asyncio.gather(v_task, a_task, return_exceptions=True)
+                        raise
+                else:
+                    await _download_file_with_auth_fallback(
+                        client, url, v_raw,
+                        base_headers=base_headers, on_chunk=on_chunk, on_meta=on_meta,
+                    )
+                downloaded = True
+                break
+            except (asyncio.CancelledError, WarpProxyError):
+                raise
+            except Exception as e:
+                if (
+                    proxy_try == 0
+                    and not getattr(client, "using_warp", False)
+                    and _is_proxy_error(e)
+                    and client.proxy_url is not None
+                    and _cfg_proxy_fallback_direct()
+                ):
+                    _log(
+                        f"[HLS] Proxy failed during direct video download ({_sanitize_detail(str(e))}) "
+                        "— switching to direct connection"
+                    )
+                    switcher = getattr(client, "switch_to_direct", None)
+                    if callable(switcher):
+                        await switcher()
+                    if audio_client is not None:
+                        a_sw = getattr(audio_client, "switch_to_direct", None)
+                        if callable(a_sw):
+                            await a_sw()
+                    continue
+                download_detail = _sanitize_detail(str(e))
+                _log(f"[HLS] Direct video download failed: {download_detail}")
+                break
+
+        if not downloaded:
+            result.reason = R_DOWNLOAD_FAILED
+            result.detail = download_detail
+            return result
+
+        # Fast-path: single MP4 already MP4-safe and faststart (no remux needed).
+        if not audio_url and not limit_seconds and _is_faststart_mp4_sync(v_raw):
+            probe = await _probe_streams([v_raw], local=True)
+            v_codecs, a_codecs = probe.get("video") or [], probe.get("audio") or []
+            if (
+                v_codecs
+                and v_codecs[0] in MP4_SAFE_VIDEO
+                and all(c in MP4_SAFE_AUDIO for c in a_codecs)
+            ):
+                os.replace(v_raw, final_path)
+                published = True
+                result.path = final_path
+                result.size = _safe_size(final_path)
+                result.converted = True
+                result.engine = "direct"
+                _log(f"[HLS] OK {result.name} ({result.size} bytes) via direct (faststart pass-through)")
+                return result
+
+        local_inputs = [v_raw, a_raw] if (audio_url and os.path.exists(a_raw)) else [v_raw]
+        await _notify(status_cb, "🔄 Menukar ke MP4 (stream copy)…")
+        modes = await _choose_remux_modes(local_inputs, local=True)
+        remux_errors: List[str] = []
+        async with convert_semaphore():
+            ok = await _remux_with_fallbacks(
+                local_inputs, scratch, local=True,
+                timeout=HLS_TIMEOUT, limit_seconds=limit_seconds,
+                modes=modes, error_out=remux_errors,
+            )
+        if ok:
+            os.replace(scratch, final_path)
+            published = True
+            result.path = final_path
+            result.size = _safe_size(final_path)
+            result.converted = True
+            result.engine = "direct"
+            _log(f"[HLS] OK {result.name} ({result.size} bytes) via direct+remux")
+            return result
+
+        result.reason = R_REMUX_FAILED
+        result.detail = _sanitize_detail(remux_errors[-1] if remux_errors else "")
+        return result
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+        if audio_client is not None:
+            try:
+                await audio_client.close()
+            except Exception:
+                pass
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        if not published and scratch and os.path.exists(scratch):
+            try:
+                os.remove(scratch)
+            except OSError:
+                pass
+
+
+async def _download_dash_to_mp4(
+    url: str,
+    file_name: str,
+    *,
+    headers: Optional[Dict[str, str]],
+    cookies: Optional[Dict[str, str]],
+    cookie_entries: Optional[List[Dict[str, Any]]],
+    page_url: str,
+    status_cb: Optional[Callable[[str], object]],
+    on_chunk: Optional[Callable[[int], None]],
+    on_meta: Optional[Callable[[int], None]],
+    out_dir: Optional[str],
+    max_height: Optional[int],
+    max_duration: Optional[int],
+    proxy_url: Any,
+) -> HlsResult:
+    """Download a DASH (.mpd) manifest via yt-dlp (SOCKS5/WARP-aware) or ffmpeg."""
+    result = HlsResult(name=_mp4_name(file_name))
+    if not HLS_ENABLED:
+        result.reason = R_DISABLED
+        return result
+    if not _ffmpeg_available():
+        result.reason = R_NO_FFMPEG
+        return result
+
+    base_headers = _normalize_headers(url, headers)
+    height_cap = HLS_MAX_HEIGHT if max_height is None else max_height
+    duration_cap = HLS_MAX_DURATION if max_duration is None else max_duration
+    limit_seconds = int(duration_cap) if (duration_cap and duration_cap > 0) else 0
+    dest_dir = out_dir or HLS_TEMP_DIR or tempfile.gettempdir()
+    temp_dir: Optional[str] = None
+    scratch: Optional[str] = None
+    published = False
+    client = _make_client(
+        base_headers, proxy_url, cookies, _cfg_workers(), cookie_entries=cookie_entries,
+    )
+
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix="hls_", dir=dest_dir)
+        final_path = os.path.join(dest_dir, result.name)
+        scratch = os.path.join(
+            dest_dir, f".hls_{random.randint(10 ** 9, 10 ** 10)}.mp4"
+        )
+
+        # Resolve effective proxy (honoring WARP).
+        eff_proxy: Optional[str] = client.proxy_url
+        ffmpeg_proxy_url: Optional[str] = client.proxy_url
+        ffmpeg_using_warp = False
+        if proxy_url is AUTO_PROXY:
+            warp_cfg = await ensure_proxy_ready(
+                require_http=True, require_socks5=True, feature="HLS",
+            )
+            if warp_cfg is not None:
+                eff_proxy = warp_cfg.socks5_url
+                ffmpeg_proxy_url = warp_cfg.http_url
+                ffmpeg_using_warp = True
+
+        errors: List[str] = []
+        # 1. Try Engine C (yt-dlp) first for DASH (supports SOCKS5 + best adaptive mux).
+        if not limit_seconds and _cfg_ytdlp_enabled():
+            await _notify(status_cb, "⬇️ Memuat turun strim DASH…")
+            ok_yt, err_yt = await _engine_ytdlp(
+                url, scratch, temp_dir,
+                headers=base_headers, cookies=cookies, cookie_entries=cookie_entries,
+                proxy_url=eff_proxy, max_height=height_cap, timeout=HLS_TIMEOUT,
+                on_chunk=on_chunk, on_meta=on_meta,
+            )
+            if ok_yt and os.path.exists(scratch) and _safe_size(scratch) >= 1024:
+                os.replace(scratch, final_path)
+                published = True
+                result.path = final_path
+                result.size = _safe_size(final_path)
+                result.converted = True
+                result.engine = "yt-dlp"
+                _log(f"[HLS] OK {result.name} ({result.size} bytes) via yt-dlp (DASH)")
+                return result
+            if err_yt:
+                errors.append(err_yt)
+
+        # 2. Fallback to ffmpeg if route is HTTP/WARP-HTTP/direct.
+        if ffmpeg_using_warp or not is_socks_proxy(ffmpeg_proxy_url):
+            await _notify(status_cb, "⬇️ Memuat turun & menukar DASH ke MP4 (ffmpeg)…")
+            extra = (
+                _client_ffmpeg_headers(client, base_headers, cookies, url)
+                + ffmpeg_proxy_args(ffmpeg_proxy_url)
+            )
+            async with convert_semaphore():
+                ok = await _remux_with_fallbacks(
+                    [url], scratch, local=False, timeout=HLS_TIMEOUT,
+                    extra_input_args=extra, limit_seconds=limit_seconds,
+                    on_progress=on_chunk, error_out=errors,
+                )
+            if ok:
+                os.replace(scratch, final_path)
+                published = True
+                result.path = final_path
+                result.size = _safe_size(final_path)
+                result.converted = True
+                result.engine = "ffmpeg"
+                _log(f"[HLS] OK {result.name} ({result.size} bytes) via ffmpeg (DASH)")
+                return result
+            if ffmpeg_using_warp:
+                last_err = errors[-1] if errors else ""
+                if not await check_proxy_reachable(require_http=True, require_socks5=False, timeout=1.5) or _looks_like_ffmpeg_warp_proxy_error(last_err, ffmpeg_proxy_url):
+                    raise WarpProxyError(
+                        format_warp_proxy_error(
+                            RuntimeError(last_err or "wireproxy HTTP listener unreachable"),
+                            feature="HLS",
+                        )
+                    )
+
+        result.reason = R_DOWNLOAD_FAILED
+        result.detail = _sanitize_detail(errors[-1] if errors else "DASH download failed")
+        return result
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        if not published and scratch and os.path.exists(scratch):
+            try:
+                os.remove(scratch)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-async def download_hls_to_mp4(
+_DIRECT_AUDIO_EXTS = (
+    ".m4a", ".aac", ".mp3", ".opus", ".ogg", ".wav", ".flac",
+    ".weba", ".mka", ".mp4", ".webm", ".mkv", ".mov",
+)
+
+
+async def _attach_external_audio(
+    audio_client: HlsClient,
+    prep: _Prepared,
+    audio_url: str,
+    audio_base_headers: Dict[str, str],
+) -> Optional[str]:
+    """Attach an external audio track (HLS playlist or direct file) to *prep*.
+
+    If *audio_url* resolves to an HLS media playlist, populates ``prep.audio_url``
+    / ``prep.audio_pl`` and returns ``None``. If it is a direct audio file
+    (e.g. ``.m4a`` / ``.aac`` / extensionless binary audio), returns *audio_url*
+    so Engine A downloads it via ``_download_file_with_auth_fallback``.
+    """
+    if not audio_url or prep.audio_pl is not None:
+        return None
+    low_path = audio_url.split("?", 1)[0].lower()
+    if low_path.endswith(_DIRECT_AUDIO_EXTS):
+        return audio_url
+
+    try:
+        a_text, a_final = await _fetch_playlist_with_fallback(
+            audio_client, audio_url, base_headers=audio_base_headers,
+        )
+    except (_HlsError, asyncio.CancelledError, WarpProxyError):
+        raise
+    except Exception as e:
+        if _is_proxy_error(e):
+            raise
+        _log(
+            f"[HLS] Could not fetch external audio {_sanitize_detail(audio_url)} "
+            f"(continuing video-only): {_sanitize_detail(str(e))}"
+        )
+        return None
+
+    if not is_hls_playlist(a_text):
+        head_bytes = a_text.encode("utf-8", "ignore")[:4096]
+        if _is_probably_error_page(head_bytes):
+            _log(f"[HLS] External audio URL returned HTML/JSON error page: {_sanitize_detail(audio_url)}")
+            return None
+        return audio_url
+
+    if is_drm(a_text):
+        raise _HlsError(R_DRM, "audio playlist uses DRM")
+
+    if is_master_playlist(a_text):
+        a_variants, a_tracks = parse_master(a_text, a_final)
+        sub_urls: List[str] = [t.url for t in fallback_audio_tracks(a_tracks)]
+        for v in sorted(a_variants, key=lambda x: x.rank_bandwidth, reverse=True):
+            if v.url not in sub_urls:
+                sub_urls.append(v.url)
+        for sub_u in sub_urls:
+            try:
+                sub_text, sub_final = await _fetch_playlist_with_fallback(
+                    audio_client, sub_u, parent_url=a_final, base_headers=audio_base_headers,
+                )
+                if not is_hls_playlist(sub_text) or is_master_playlist(sub_text):
+                    continue
+                if is_drm(sub_text):
+                    raise _HlsError(R_DRM, "audio playlist uses DRM")
+                sub_pl = parse_media(sub_text, sub_final)
+                if sub_pl.segments:
+                    prep.audio_url = sub_final
+                    prep.audio_text = sub_text
+                    prep.audio_pl = sub_pl
+                    return None
+            except (_HlsError, asyncio.CancelledError, WarpProxyError):
+                raise
+            except Exception as e:
+                if _is_proxy_error(e):
+                    raise
+                continue
+        return None
+
+    a_pl = parse_media(a_text, a_final)
+    if a_pl.segments:
+        prep.audio_url = a_final
+        prep.audio_text = a_text
+        prep.audio_pl = a_pl
+    return None
+
+
+async def _download_hls_single(
     url: str,
     file_name: str,
     *,
+    audio_url: Optional[str] = None,
+    audio_headers: Optional[Dict[str, str]] = None,
     headers: Optional[Dict[str, str]] = None,
     cookies: Optional[Dict[str, str]] = None,
+    cookie_entries: Optional[List[Dict[str, Any]]] = None,
+    initial_playlist_text: str = "",
+    page_url: str = "",
     status_cb: Optional[Callable[[str], object]] = None,
     on_chunk: Optional[Callable[[int], None]] = None,
     on_meta: Optional[Callable[[int], None]] = None,
@@ -2117,7 +3194,7 @@ async def download_hls_to_mp4(
     max_duration: Optional[int] = None,
     proxy_url: Any = AUTO_PROXY,
 ) -> HlsResult:
-    """Download an HLS stream and remux it into a local MP4."""
+    """Download a single HLS stream URL and remux it into a local MP4."""
     result = HlsResult(name=_mp4_name(file_name))
 
     if not HLS_ENABLED:
@@ -2129,7 +3206,27 @@ async def download_hls_to_mp4(
 
     workers = _cfg_workers()
     base_headers = _normalize_headers(url, headers)
-    client = _make_client(base_headers, proxy_url, cookies, workers)
+    if cookie_entries:
+        client = _make_client(
+            base_headers, proxy_url, cookies, workers, cookie_entries=cookie_entries,
+        )
+    else:
+        client = _make_client(base_headers, proxy_url, cookies, workers)
+
+    audio_base_headers: Optional[Dict[str, str]] = None
+    audio_client: Optional[HlsClient] = None
+    if audio_url:
+        if audio_headers:
+            audio_base_headers = _normalize_headers(audio_url, audio_headers)
+            if cookie_entries:
+                audio_client = _make_client(
+                    audio_base_headers, proxy_url, cookies, workers, cookie_entries=cookie_entries,
+                )
+            else:
+                audio_client = _make_client(audio_base_headers, proxy_url, cookies, workers)
+        else:
+            audio_base_headers = base_headers
+            audio_client = client
 
     height_cap = HLS_MAX_HEIGHT if max_height is None else max_height
     duration_cap = HLS_MAX_DURATION if max_duration is None else max_duration
@@ -2138,15 +3235,38 @@ async def download_hls_to_mp4(
     temp_dir: Optional[str] = None
     scratch: Optional[str] = None
     published = False
+    external_direct_audio_url: Optional[str] = None
 
     async def _switch_client_direct() -> None:
-        nonlocal client
+        nonlocal client, audio_client
+        audio_was_shared = (audio_client is client)
         switcher = getattr(client, "switch_to_direct", None)
         if callable(switcher):
             await switcher()
         else:
             await client.close()
-            client = _make_client(base_headers, None, cookies, workers)
+            if cookie_entries:
+                client = _make_client(
+                    base_headers, None, cookies, workers, cookie_entries=cookie_entries,
+                )
+            else:
+                client = _make_client(base_headers, None, cookies, workers)
+        if audio_url:
+            if audio_was_shared:
+                audio_client = client
+            elif audio_client is not None:
+                a_switcher = getattr(audio_client, "switch_to_direct", None)
+                if callable(a_switcher):
+                    await a_switcher()
+                else:
+                    await audio_client.close()
+                    eff_a_hdrs = audio_base_headers or base_headers
+                    if cookie_entries:
+                        audio_client = _make_client(
+                            eff_a_hdrs, None, cookies, workers, cookie_entries=cookie_entries,
+                        )
+                    else:
+                        audio_client = _make_client(eff_a_hdrs, None, cookies, workers)
 
     try:
         # ---- 1. Parse the playlists --------------------------------------
@@ -2157,7 +3277,20 @@ async def download_hls_to_mp4(
             await _notify(status_cb, "🔍 Membaca playlist HLS…")
             for proxy_try in (0, 1):
                 try:
-                    prep = await _prepare(client, url, height_cap, base_headers=base_headers)
+                    if initial_playlist_text:
+                        prep = await _prepare(
+                            client, url, height_cap,
+                            base_headers=base_headers, initial_text=initial_playlist_text,
+                        )
+                    else:
+                        prep = await _prepare(client, url, height_cap, base_headers=base_headers)
+                    if prep is not None and audio_url and prep.audio_pl is None:
+                        external_direct_audio_url = await _attach_external_audio(
+                            audio_client or client,
+                            prep,
+                            audio_url,
+                            audio_base_headers if audio_base_headers is not None else base_headers,
+                        )
                     prep_error = ""
                     prep_detail = ""
                     break
@@ -2259,6 +3392,9 @@ async def download_hls_to_mp4(
                     local_inputs = await _engine_segments(
                         client, prep, temp_dir, limit_seconds, on_chunk=on_chunk,
                         base_headers=base_headers,
+                        audio_client=audio_client,
+                        audio_base_headers=audio_base_headers,
+                        external_direct_audio_url=external_direct_audio_url,
                     )
                     segments_downloaded = bool(local_inputs)
                     break
@@ -2342,16 +3478,33 @@ async def download_hls_to_mp4(
             await _notify(status_cb, "⬇️ Memuat turun & menukar ke MP4 (ffmpeg)…")
             target_url = prep.video_url if prep and prep.video_url else url
             inputs: List[str] = [target_url]
+            audio_target = ""
             if prep is not None and prep.audio_url:
-                inputs.append(prep.audio_url)
+                audio_target = prep.audio_url
+            elif audio_url:
+                audio_target = audio_url
+            if audio_target:
+                inputs.append(audio_target)
+            proxy_extra = ffmpeg_proxy_args(ffmpeg_proxy_url)
             extra = (
                 _client_ffmpeg_headers(client, base_headers, cookies, target_url)
-                + ffmpeg_proxy_args(ffmpeg_proxy_url)
+                + proxy_extra
             )
+            per_input_extra: Optional[List[Optional[List[str]]]] = None
+            if audio_target and audio_headers:
+                eff_a_client = audio_client or client
+                eff_a_hdrs = audio_base_headers if audio_base_headers is not None else base_headers
+                audio_extra = (
+                    _client_ffmpeg_headers(eff_a_client, eff_a_hdrs, cookies, audio_target)
+                    + proxy_extra
+                )
+                per_input_extra = [extra, audio_extra]
             async with convert_semaphore():
                 ok = await _remux_with_fallbacks(
                     inputs, scratch, local=False, timeout=HLS_TIMEOUT,
-                    extra_input_args=extra, limit_seconds=limit_seconds,
+                    extra_input_args=extra,
+                    per_input_extra_args=per_input_extra,
+                    limit_seconds=limit_seconds,
                     on_progress=on_chunk, error_out=remux_errors,
                 )
             if ok:
@@ -2380,7 +3533,37 @@ async def download_hls_to_mp4(
                         )
                     )
 
-        # ---- 5. Accurate failure classification --------------------------
+        # ---- 5. Engine C: yt-dlp fallback (for page-resolved streams) ----
+        if (
+            engine == "auto"
+            and not segments_downloaded
+            and page_url
+            and not limit_seconds
+            and _cfg_ytdlp_enabled()
+        ):
+            yt_proxy = client.proxy_url
+            if proxy_url is AUTO_PROXY and getattr(client, "using_warp", False):
+                yt_proxy = client.proxy_url
+            await _notify(status_cb, "⬇️ Mencuba muat turun alternatif (yt-dlp)…")
+            ok_yt, err_yt = await _engine_ytdlp(
+                page_url, scratch, temp_dir,
+                headers=base_headers, cookies=cookies, cookie_entries=cookie_entries,
+                proxy_url=yt_proxy, max_height=height_cap, timeout=HLS_TIMEOUT,
+                on_chunk=on_chunk, on_meta=None,
+            )
+            if ok_yt and os.path.exists(scratch) and _safe_size(scratch) >= 1024:
+                os.replace(scratch, final_path)
+                published = True
+                result.path = final_path
+                result.size = _safe_size(final_path)
+                result.converted = True
+                result.engine = "yt-dlp"
+                _log(f"[HLS] OK {result.name} ({result.size} bytes) via yt-dlp")
+                return result
+            if err_yt:
+                _log(f"[HLS] Engine C (yt-dlp) failed: {_sanitize_detail(err_yt)}")
+
+        # ---- 6. Accurate failure classification --------------------------
         if segments_downloaded:
             result.reason = R_REMUX_FAILED
             result.detail = _sanitize_detail(remux_errors[-1] if remux_errors else "")
@@ -2397,6 +3580,11 @@ async def download_hls_to_mp4(
             result.detail = _sanitize_detail(remux_errors[-1] if remux_errors else "")
         return result
     finally:
+        if audio_client is not None and audio_client is not client:
+            try:
+                await audio_client.close()
+            except Exception:
+                pass
         try:
             await client.close()
         except Exception:
@@ -2408,6 +3596,159 @@ async def download_hls_to_mp4(
                 os.remove(scratch)
             except OSError:
                 pass
+
+
+async def download_stream_to_mp4(
+    url: str,
+    file_name: str,
+    *,
+    stream_type: str = "hls",
+    audio_url: Optional[str] = None,
+    audio_headers: Optional[Dict[str, str]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    cookies: Optional[Dict[str, str]] = None,
+    cookie_entries: Optional[List[Dict[str, Any]]] = None,
+    fallback_urls: Optional[Sequence[str]] = None,
+    initial_playlist_text: str = "",
+    page_url: str = "",
+    status_cb: Optional[Callable[[str], object]] = None,
+    on_chunk: Optional[Callable[[int], None]] = None,
+    on_meta: Optional[Callable[[int], None]] = None,
+    out_dir: Optional[str] = None,
+    max_height: Optional[int] = None,
+    max_duration: Optional[int] = None,
+    proxy_url: Any = AUTO_PROXY,
+) -> HlsResult:
+    """Universal downloader for HLS, progressive direct video, and DASH -> faststart MP4.
+
+    Walks ``[url, *fallback_urls]`` when the primary stream fails with a
+    recoverable error (never swallowing DRM, disk-space, cancellation, or WARP errors).
+    """
+    candidates: List[Tuple[str, str, bool]] = []
+    seen_urls: set[str] = set()
+    norm_type = (stream_type or "hls").strip().lower()
+    if norm_type not in ("hls", "direct", "dash"):
+        norm_type = _infer_stream_type_from_url(url, default="hls")
+
+    if url:
+        candidates.append((url, norm_type, True))
+        seen_urls.add(url)
+    for fb in (fallback_urls or ()):
+        if fb and fb not in seen_urls:
+            seen_urls.add(fb)
+            candidates.append((fb, _infer_stream_type_from_url(fb, default="hls"), False))
+
+    last_result = HlsResult(name=_mp4_name(file_name), reason=R_DOWNLOAD_FAILED)
+    for idx_cand, (cand_url, cand_type, is_primary) in enumerate(candidates):
+        if idx_cand > 0:
+            _log(
+                f"[HLS] Trying fallback candidate {idx_cand}/{len(candidates) - 1} "
+                f"({cand_type}): {_sanitize_detail(cand_url)}"
+            )
+        if cand_type == "direct":
+            res = await _download_direct_to_mp4(
+                cand_url,
+                file_name,
+                audio_url=audio_url if is_primary else None,
+                audio_headers=audio_headers if is_primary else None,
+                headers=headers,
+                cookies=cookies,
+                cookie_entries=cookie_entries,
+                status_cb=status_cb,
+                on_chunk=on_chunk,
+                on_meta=on_meta,
+                out_dir=out_dir,
+                max_height=max_height,
+                max_duration=max_duration,
+                proxy_url=proxy_url,
+            )
+        elif cand_type == "dash":
+            res = await _download_dash_to_mp4(
+                cand_url,
+                file_name,
+                headers=headers,
+                cookies=cookies,
+                cookie_entries=cookie_entries,
+                page_url=page_url,
+                status_cb=status_cb,
+                on_chunk=on_chunk,
+                on_meta=on_meta,
+                out_dir=out_dir,
+                max_height=max_height,
+                max_duration=max_duration,
+                proxy_url=proxy_url,
+            )
+        else:
+            res = await _download_hls_single(
+                cand_url,
+                file_name,
+                audio_url=audio_url if is_primary else None,
+                audio_headers=audio_headers if is_primary else None,
+                headers=headers,
+                cookies=cookies,
+                cookie_entries=cookie_entries,
+                initial_playlist_text=initial_playlist_text if is_primary else "",
+                page_url=page_url if (idx_cand == len(candidates) - 1) else "",
+                status_cb=status_cb,
+                on_chunk=on_chunk,
+                on_meta=on_meta,
+                out_dir=out_dir,
+                max_height=max_height,
+                max_duration=max_duration,
+                proxy_url=proxy_url,
+            )
+
+        if res.converted:
+            return res
+        last_result = res
+        if res.reason in (R_DISABLED, R_NO_FFMPEG, R_LOW_DISK, R_DRM):
+            return res
+
+    return last_result
+
+
+async def download_hls_to_mp4(
+    url: str,
+    file_name: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    cookies: Optional[Dict[str, str]] = None,
+    cookie_entries: Optional[List[Dict[str, Any]]] = None,
+    stream_type: str = "hls",
+    audio_url: Optional[str] = None,
+    audio_headers: Optional[Dict[str, str]] = None,
+    fallback_urls: Optional[Sequence[str]] = None,
+    initial_playlist_text: str = "",
+    page_url: str = "",
+    status_cb: Optional[Callable[[str], object]] = None,
+    on_chunk: Optional[Callable[[int], None]] = None,
+    on_meta: Optional[Callable[[int], None]] = None,
+    out_dir: Optional[str] = None,
+    max_height: Optional[int] = None,
+    max_duration: Optional[int] = None,
+    proxy_url: Any = AUTO_PROXY,
+) -> HlsResult:
+    """Download an HLS (or direct/DASH) stream and remux it into a local MP4."""
+    return await download_stream_to_mp4(
+        url,
+        file_name,
+        stream_type=stream_type,
+        audio_url=audio_url,
+        audio_headers=audio_headers,
+        headers=headers,
+        cookies=cookies,
+        cookie_entries=cookie_entries,
+        fallback_urls=fallback_urls,
+        initial_playlist_text=initial_playlist_text,
+        page_url=page_url,
+        status_cb=status_cb,
+        on_chunk=on_chunk,
+        on_meta=on_meta,
+        out_dir=out_dir,
+        max_height=max_height,
+        max_duration=max_duration,
+        proxy_url=proxy_url,
+    )
 
 
 # ---------------------------------------------------------------------------

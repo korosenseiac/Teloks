@@ -65,7 +65,24 @@ _PLAYLIST_EXPORTS = {
     "select_variant",
 }
 
-__all__ = sorted(_DOWNLOADER_EXPORTS | _PLAYLIST_EXPORTS)
+_EXTRACT_EXPORTS = {
+    "ExtractedStream",
+    "PageScan",
+    "extract_title",
+    "find_embed_urls",
+    "find_manifests",
+    "resolve_stream_from_page",
+    "unpack_packer",
+}
+
+_YTDLP_EXPORTS = {
+    "build_ytdlp_opts",
+    "download_with_ytdlp",
+    "extract_with_ytdlp",
+    "ytdlp_available",
+}
+
+__all__ = sorted(_DOWNLOADER_EXPORTS | _PLAYLIST_EXPORTS | _EXTRACT_EXPORTS | _YTDLP_EXPORTS)
 
 
 def __getattr__(name: str) -> Any:
@@ -76,4 +93,10 @@ def __getattr__(name: str) -> Any:
     if name in _PLAYLIST_EXPORTS:
         from app.hls import playlist
         return getattr(playlist, name)
+    if name in _EXTRACT_EXPORTS:
+        from app.hls import extract
+        return getattr(extract, name)
+    if name in _YTDLP_EXPORTS:
+        from app.hls import ytdlp
+        return getattr(ytdlp, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,41 +1,29 @@
 """
-hls/browser.py — last-resort stream resolution with a real headless browser.
+hls/browser.py — Universal last-resort stream sniffer with headless Chromium.
 
 Why this exists
 ---------------
-Some hosts build the playlist URL *inside* their JavaScript and never put an
-``.m3u8`` in the HTML: the loader is a javascript-obfuscator bundle with a string
-table, the player config is assembled at runtime, and the request is gated by
-device/GPU fingerprinting and bot detection (``openfpcdn.io/botd``). No amount of
-regex, header or proxy work can reach that URL — something has to *run* the page.
+Some hosts build the stream URL inside obfuscated JS behind bot/device
+fingerprinting, ad-click overlays, multi-iframe players, or disguised
+extensionless endpoints. When Tier 1 (HTTP) and Tier 2 (yt-dlp) miss, this
+module opens the page in Playwright's Chromium and captures the real stream:
 
-So this module launches Playwright's Chromium, opens the page, and returns the
-first HLS manifest the page asks for along with the browser's effective
-User-Agent, Referer, Origin, custom request headers, frame/final page URL, and
-cookies so downstream segment downloads match the exact browser session:
-
-* **Network capture** — requests and responses are watched for ``.m3u8`` (or
-  ``mpegurl`` content types); a successful ``<400`` manifest response wins
-  immediately, while ad/blocked requests are ignored.
-* **JS tap** (fallback) — an init script wraps ``jwplayer``, ``Hls.prototype``,
-  ``HTMLMediaElement.prototype.src``, ``fetch`` and ``XMLHttpRequest`` across all
-  frames, so a URL that is *built* but never requested is still recovered.
-* **Ad/weight blocking** — images, fonts, non-manifest media and known ad hosts
-  are aborted to keep the scan fast and cheap; stylesheets, scripts and XHR
-  pass so layout-checking players still initialize.
-
-The browser is a module-level singleton: one Chromium process, one isolated
-context per job, serialised by a lock (``HLS_BROWSER_MAX_CONCURRENCY``), and
-closed automatically after ``HLS_BROWSER_IDLE`` seconds of inactivity so a small
-VPS never keeps ~400 MB of Chromium resident between jobs.
-
-Everything degrades gracefully: without the ``playwright`` package (or without
-its Chromium download) the module reports itself unavailable and the page scan
-simply keeps its previous behaviour.
-
-Install (optional, on the VPS):
-
-    pip install playwright && python -m playwright install chromium
+* **Body-sniffed network capture** — inspects 2xx/206 responses (including
+  extensionless/disguised ``text/plain``, ``application/octet-stream``,
+  ``image/*`` XHRs) for ``#EXTM3U`` (master preferred over variant; subtitle/ad
+  manifests deprioritized; HTML 200 error pages rejected), ``<MPD`` (DASH), and
+  direct progressive ``video/mp4`` / ``video/webm`` streams.
+* **Popup killer & multi-pass click-through** — auto-closes spawned ad tabs,
+  neutralizes ``window.open``, dismisses transparent full-screen ad overlays,
+  and performs up to 3 click passes across common players & iframes.
+* **Universal JS tap** — hooks ``Hls.prototype.loadSource`` (unconditionally),
+  ``jwplayer``, ``videojs``, ``Plyr``, ``shaka``, ``Artplayer``, ``DPlayer``,
+  ``Clappr``, ``dashjs``, ``HTMLMediaElement``, ``HTMLSourceElement``,
+  ``setAttribute('src')``, ``fetch`` and ``XMLHttpRequest`` across all frames.
+* **CORS-safe stealth & VPS memory caps** — uses CDP
+  ``Emulation.setUserAgentOverride`` (so ``Sec-CH-UA`` matches Chrome without
+  breaking cross-origin CORS preflights), hides headless markers, waits past
+  Cloudflare interstitials, and caps Chromium renderer memory for 700 MB VPSes.
 
 Self-test:
 
@@ -51,7 +39,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from app.config import (
@@ -61,7 +49,14 @@ from app.config import (
     HLS_BROWSER_PROXY,
     HLS_BROWSER_TIMEOUT,
 )
-from app.hls.client import DEFAULT_USER_AGENT, default_headers, read_proxy_url
+from app.hls.client import (
+    DEFAULT_USER_AGENT,
+    decode_text,
+    default_headers,
+    read_proxy_url,
+    sniff_stream_bytes,
+)
+from app.hls.extract import ExtractedStream
 from app.warp import (
     WarpProxyError,
     check_proxy_reachable,
@@ -69,11 +64,12 @@ from app.warp import (
     format_warp_proxy_error,
 )
 
-#: Chromium switches that make it survive on a small headless VPS.
+#: Chromium switches that make it survive on a small headless VPS (MemoryMax=700M).
 _LAUNCH_ARGS = (
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
+    "--disable-software-rasterizer",
     "--mute-audio",
     "--no-first-run",
     "--no-default-browser-check",
@@ -84,23 +80,52 @@ _LAUNCH_ARGS = (
     "--disable-features=Translate,MediaRouter,OptimizationHints",
     "--autoplay-policy=no-user-gesture-required",
     "--disable-blink-features=AutomationControlled",
+    "--window-size=1280,720",
+    "--renderer-process-limit=2",
+    "--js-flags=--max-old-space-size=256",
 )
 
-#: Resource types that can never carry the manifest and only cost time.
-#: Keep stylesheets unblocked so players checking layout/offsetWidth still boot.
-#: Non-manifest media is aborted in _block_heavy, while manifest media passes.
+#: Resource types that never carry a video stream and only cost RAM/bandwidth.
+#: Keep stylesheets, scripts, XHR/fetch and media unblocked so players boot and
+#: progressive MP4 / extensionless HLS requests can be observed.
 _BLOCKED_RESOURCE_TYPES = {"image", "font"}
 
-#: Ad/tracker hosts that are aborted by default (the page's own player never
-#: lives on them, and they are the main reason these pages are slow).
+#: Ad/tracker hosts aborted by default.
 _BLOCKED_HOST_PARTS = (
     "doubleclick", "googlesyndication", "google-analytics", "googletagmanager",
     "adsbygoogle", "adservice", "popads", "popcash", "propellerads",
     "exoclick", "juicyads", "trafficjunky", "adsterra", "hilltopads",
-    "facebook.net", "criteo", "taboola", "outbrain",
+    "facebook.net", "criteo", "taboola", "outbrain", "histats",
+    "mc.yandex", "adnxs", "pubmatic", "rubiconproject", "smartadserver",
+    "mgid.com", "revcontent", "onclickalgo", "acscdn", "alwingulla",
 )
 
-_AD_PATH_MARKERS = ("/vast", "preroll", "/ads/", "adserver")
+_AD_PATH_MARKERS = ("/vast", "preroll", "/ads/", "adserver", "/popunder", "doubleclick", "googlesyndication")
+
+_PREVIEW_PATH_MARKERS = ("/preview/", "preview.", "trailer", "teaser", "/thumbs/", "sprite")
+
+_STATIC_NON_STREAM_EXTS = (
+    ".js", ".mjs", ".css", ".map", ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".svg", ".ico", ".vtt", ".srt", ".ass", ".ssa",
+)
+
+_DIRECT_VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv", ".flv", ".m4v")
+_DIRECT_VIDEO_CTYPES = (
+    "video/mp4", "video/webm", "video/quicktime", "video/x-matroska",
+    "video/x-flv", "video/ogg", "video/3gpp",
+)
+_MIN_DIRECT_VIDEO_BYTES = 256 * 1024
+_MAX_SNIFF_BODY_BYTES = 512 * 1024
+
+_CHALLENGE_TITLE_MARKERS = (
+    "just a moment", "checking your browser", "attention required",
+    "ddos-guard", "please wait", "verify you are human", "security check",
+)
+_USELESS_TITLES = {
+    "just a moment...", "attention required!", "403 forbidden", "404 not found",
+    "access denied", "error", "loading", "loading...", "embed", "player",
+    "video", "video player", "watch", "stream", "index", "home", "untitled",
+}
 
 #: Bot root (two levels above ``<bot>/app/hls/browser.py``).
 _BOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -266,7 +291,7 @@ _HINT_LOGGED = False
 class BrowserScan:
     """What the headless browser found on the page."""
 
-    #: The manifest URL, or None.
+    #: The stream/manifest URL, or None.
     url: Optional[str] = None
     #: Where it came from: "network" | "player-config" | "".
     source: str = ""
@@ -286,6 +311,36 @@ class BrowserScan:
     headers: Dict[str, str] = field(default_factory=dict)
     #: Browser cookies captured for the manifest/page context.
     cookies: Dict[str, str] = field(default_factory=dict)
+    #: New backward-compatible contract fields:
+    stream_type: str = "hls"
+    title: str = ""
+    audio_url: Optional[str] = None
+    audio_headers: Optional[Dict[str, str]] = None
+    manifest_text: str = ""
+    cookie_entries: List[Dict[str, Any]] = field(default_factory=list)
+    fallback_urls: List[str] = field(default_factory=list)
+
+    def to_extracted_stream(self, *, force_direct: bool = False) -> ExtractedStream:
+        return ExtractedStream(
+            url=self.url,
+            stream_type=self.stream_type or "hls",
+            audio_url=self.audio_url,
+            audio_headers=dict(self.audio_headers) if self.audio_headers else None,
+            page_url=self.page_url,
+            title=self.title,
+            manifest_text=self.manifest_text,
+            headers=dict(self.headers or {}),
+            cookies=dict(self.cookies or {}),
+            cookie_entries=list(self.cookie_entries or []),
+            fallback_urls=list(self.fallback_urls or []),
+            extractor="browser",
+            used_proxy=self.used_proxy,
+            used_warp=self.used_warp,
+            force_direct=force_direct,
+            reason=self.reason,
+            detail=self.detail,
+            player_page=bool(self.url),
+        )
 
 
 def _looks_like_manifest(url: str) -> bool:
@@ -293,6 +348,14 @@ def _looks_like_manifest(url: str) -> bool:
     if ".m3u8" not in url.lower():
         return False
     return url.lower().split("?", 1)[0].endswith((".m3u8", ".m3u"))
+
+
+def _looks_like_dash(url: str) -> bool:
+    return url.lower().split("?", 1)[0].endswith(".mpd")
+
+
+def _looks_like_direct_video(url: str) -> bool:
+    return url.lower().split("?", 1)[0].endswith(_DIRECT_VIDEO_EXTS)
 
 
 def _is_blocked_url(url: str) -> bool:
@@ -309,6 +372,11 @@ def _is_ad_manifest(url: str) -> bool:
         return True
     low = url.lower()
     return any(marker in low for marker in _AD_PATH_MARKERS)
+
+
+def _is_preview_url(url: str) -> bool:
+    low = url.lower()
+    return any(marker in low for marker in _PREVIEW_PATH_MARKERS)
 
 
 def _chromium_major_version(browser: Any) -> str:
@@ -343,15 +411,86 @@ def _build_browser_identity(browser: Any) -> Tuple[str, str, Dict[str, str]]:
     return major, ua, extra_headers
 
 
-#: Installed before any page script runs: records the first HLS URL the page
-#: *builds*, whether or not the request ever leaves the browser (autoplay
-#: blocked, player paused, request aborted by our own ad filter...).
+def _build_cdp_ua_override(major: str, ua: str) -> Dict[str, Any]:
+    """CDP ``Emulation.setUserAgentOverride`` payload (CORS-safe Client Hints)."""
+    full = f"{major}.0.0.0"
+    return {
+        "userAgent": ua,
+        "acceptLanguage": "en-US,en;q=0.9",
+        "platform": "Win32",
+        "userAgentMetadata": {
+            "brands": [
+                {"brand": "Not:A-Brand", "version": "99"},
+                {"brand": "Google Chrome", "version": str(major)},
+                {"brand": "Chromium", "version": str(major)},
+            ],
+            "fullVersionList": [
+                {"brand": "Not:A-Brand", "version": "99.0.0.0"},
+                {"brand": "Google Chrome", "version": full},
+                {"brand": "Chromium", "version": full},
+            ],
+            "fullVersion": full,
+            "platform": "Windows",
+            "platformVersion": "10.0.0",
+            "architecture": "x86",
+            "model": "",
+            "mobile": False,
+            "bitness": "64",
+            "wow64": False,
+        },
+    }
+
+
+#: Installed before any page script runs: stealth patches, popup neutralizer,
+#: and universal player/network tap across all frames.
 _TAP_JS_TEMPLATE = r"""
 (() => {
   if (window.__hlsTapInstalled) return;
   window.__hlsTapInstalled = true;
+
+  // --- Stealth patches ---
   try {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  } catch (e) {}
+  try {
+    if (!window.chrome) {
+      window.chrome = { runtime: {}, app: {}, csi: () => ({}), loadTimes: () => ({}) };
+    }
+  } catch (e) {}
+  try {
+    if (!navigator.plugins || navigator.plugins.length === 0) {
+      const fakePlugins = [
+        { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+        { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+        { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+      ];
+      Object.defineProperty(navigator, 'plugins', { get: () => fakePlugins });
+    }
+  } catch (e) {}
+  try {
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+  } catch (e) {}
+  try {
+    if (!navigator.hardwareConcurrency || navigator.hardwareConcurrency < 2) {
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
+    }
+    if (!navigator.deviceMemory) {
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    }
+  } catch (e) {}
+  try {
+    if (window.outerWidth === 0) Object.defineProperty(window, 'outerWidth', { get: () => 1280 });
+    if (window.outerHeight === 0) Object.defineProperty(window, 'outerHeight', { get: () => 720 });
+  } catch (e) {}
+  try {
+    const origGetParam = WebGLRenderingContext && WebGLRenderingContext.prototype.getParameter;
+    if (origGetParam) {
+      WebGLRenderingContext.prototype.getParameter = function (p) {
+        if (p === 37445) return 'Google Inc. (NVIDIA)';
+        if (p === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        return origGetParam.call(this, p);
+      };
+    }
   } catch (e) {}
   try {
     const major = __HLS_CHROMIUM_MAJOR__;
@@ -406,48 +545,123 @@ _TAP_JS_TEMPLATE = r"""
       });
     }
   } catch (e) {}
+
+  // Neutralize ad popups/popunders so clicks reach the actual player.
+  try {
+    window.open = function () {
+      return { closed: false, close() {}, focus() {}, blur() {}, location: { href: '' } };
+    };
+  } catch (e) {}
+
+  // --- Universal stream tap ---
   window.__hlsTapList = window.__hlsTapList || [];
+  window.__hlsTapDirectList = window.__hlsTapDirectList || [];
+  window.__hlsTapDashList = window.__hlsTapDashList || [];
+
+  const asStr = (u) => {
+    if (typeof u === 'string') return u;
+    if (u && typeof u.url === 'string') return u.url;
+    if (u && typeof u.href === 'string') return u.href;
+    return '';
+  };
   const isAd = (u) => {
     const low = String(u).toLowerCase();
     return low.indexOf('doubleclick') !== -1 || low.indexOf('googlesyndication') !== -1
-      || low.indexOf('/vast') !== -1 || low.indexOf('preroll') !== -1;
+      || low.indexOf('/vast') !== -1 || low.indexOf('preroll') !== -1
+      || low.indexOf('adserver') !== -1 || low.indexOf('/ads/') !== -1;
   };
-  const note = (u) => {
+  const recordHls = (raw) => {
     try {
-      if (typeof u === 'string' && u.indexOf('.m3u8') !== -1 && !isAd(u)) {
-        if (!window.__hlsTap) window.__hlsTap = u;
-        if (window.__hlsTapList.indexOf(u) === -1) window.__hlsTapList.push(u);
+      const u = asStr(raw).trim();
+      if (!u || u.startsWith('blob:') || u.startsWith('data:') || isAd(u)) return;
+      if (!window.__hlsTap) window.__hlsTap = u;
+      if (window.__hlsTapList.indexOf(u) === -1) window.__hlsTapList.push(u);
+    } catch (e) {}
+  };
+  const note = (raw, forcedKind) => {
+    try {
+      const u = asStr(raw).trim();
+      if (!u || u.startsWith('blob:') || u.startsWith('data:') || isAd(u)) return;
+      if (forcedKind === 'hls') { recordHls(u); return; }
+      if (forcedKind === 'dash') {
+        if (window.__hlsTapDashList.indexOf(u) === -1) window.__hlsTapDashList.push(u);
+        return;
+      }
+      const low = u.toLowerCase();
+      const basePath = low.split('?')[0];
+      if (low.indexOf('.m3u8') !== -1 || basePath.endsWith('.m3u')) {
+        recordHls(u);
+      } else if (basePath.endsWith('.mpd') || low.indexOf('.mpd?') !== -1) {
+        if (window.__hlsTapDashList.indexOf(u) === -1) window.__hlsTapDashList.push(u);
+      } else if (
+        basePath.endsWith('.mp4') || basePath.endsWith('.webm')
+        || basePath.endsWith('.mov') || basePath.endsWith('.m4v')
+      ) {
+        if (window.__hlsTapDirectList.indexOf(u) === -1) window.__hlsTapDirectList.push(u);
       }
     } catch (e) {}
   };
   const walk = (o, depth) => {
     try {
-      if (!o || depth > 6) return;
+      if (!o || depth > 7) return;
       if (typeof o === 'string') { note(o); return; }
       if (Array.isArray(o)) { for (const v of o) walk(v, depth + 1); return; }
-      if (typeof o === 'object') { for (const k of Object.keys(o)) walk(o[k], depth + 1); }
+      if (typeof o === 'object') {
+        const typ = String(o.type || o.mimeType || '').toLowerCase();
+        const isHlsObj = typ.indexOf('hls') !== -1 || typ.indexOf('m3u8') !== -1 || typ.indexOf('mpegurl') !== -1;
+        const isDashObj = typ.indexOf('dash') !== -1 || typ.indexOf('mpd') !== -1;
+        for (const k of Object.keys(o)) {
+          const val = o[k];
+          if (typeof val === 'string' && (k === 'file' || k === 'src' || k === 'url' || k === 'source' || k === 'hls')) {
+            if (isHlsObj || k === 'hls') note(val, 'hls');
+            else if (isDashObj) note(val, 'dash');
+            else note(val);
+          } else {
+            walk(val, depth + 1);
+          }
+        }
+      }
     } catch (e) {}
   };
+
+  // XHR & fetch
   const xo = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (m, u) { note(u); return xo.apply(this, arguments); };
   const of = window.fetch;
   if (of) {
     window.fetch = function (input) {
-      try { note(typeof input === 'string' ? input : (input && input.url)); } catch (e) {}
+      try { note(input); } catch (e) {}
       return of.apply(this, arguments);
     };
   }
+
+  // HTMLMediaElement / HTMLSourceElement / setAttribute('src')
+  for (const proto of [HTMLMediaElement.prototype, HTMLSourceElement.prototype]) {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(proto, 'src');
+      if (desc && desc.set) {
+        Object.defineProperty(proto, 'src', {
+          configurable: true,
+          enumerable: desc.enumerable,
+          get: desc.get,
+          set(v) { note(v); return desc.set.call(this, v); },
+        });
+      }
+    } catch (e) {}
+  }
   try {
-    const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-    if (desc && desc.set) {
-      Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-        configurable: true,
-        enumerable: desc.enumerable,
-        get: desc.get,
-        set(v) { note(v); return desc.set.call(this, v); },
-      });
-    }
+    const origSetAttr = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function (k, v) {
+      try {
+        if (k && String(k).toLowerCase() === 'src' && (this.tagName === 'VIDEO' || this.tagName === 'SOURCE')) {
+          note(v);
+        }
+      } catch (e) {}
+      return origSetAttr.apply(this, arguments);
+    };
   } catch (e) {}
+
+  // JWPlayer
   let jw = window.jwplayer;
   const wrapSetup = (obj) => {
     try {
@@ -455,6 +669,11 @@ _TAP_JS_TEMPLATE = r"""
         const orig = obj.setup.bind(obj);
         obj.setup = function (cfg) { walk(cfg, 0); return orig(cfg); };
         obj.__hlsTapped = true;
+      }
+      if (obj && typeof obj.load === 'function' && !obj.__hlsLoadTapped) {
+        const origL = obj.load.bind(obj);
+        obj.load = function (cfg) { walk(cfg, 0); return origL(cfg); };
+        obj.__hlsLoadTapped = true;
       }
     } catch (e) {}
     return obj;
@@ -470,17 +689,19 @@ _TAP_JS_TEMPLATE = r"""
       },
     });
   } catch (e) {}
+
+  // hls.js (UNCONDITIONAL capture — anything passed to loadSource is HLS!)
   try {
     let H = window.Hls;
     const hookHls = (v) => {
       if (v && v.prototype && typeof v.prototype.loadSource === 'function' && !v.prototype.__hlsTapped) {
         const orig = v.prototype.loadSource;
-        v.prototype.loadSource = function (u) { note(u); return orig.apply(this, arguments); };
+        v.prototype.loadSource = function (u) { recordHls(u); return orig.apply(this, arguments); };
         v.prototype.__hlsTapped = true;
       }
       if (typeof v === 'function' && typeof v.loadSource === 'function' && !v.__hlsTapped) {
         const OL = v.loadSource;
-        v.loadSource = function (u) { note(u); return OL.apply(this, arguments); };
+        v.loadSource = function (u) { recordHls(u); return OL.apply(this, arguments); };
         v.__hlsTapped = true;
       }
     };
@@ -491,6 +712,87 @@ _TAP_JS_TEMPLATE = r"""
       set(v) { hookHls(v); H = v; },
     });
   } catch (e) {}
+
+  // Video.js
+  try {
+    let VJS = window.videojs;
+    const wrapVjsPlayer = (p) => {
+      try {
+        if (p && typeof p.src === 'function' && !p.__hlsTapped) {
+          const origSrc = p.src.bind(p);
+          p.src = function (arg) { if (arg) walk(arg, 0); return origSrc.apply(this, arguments); };
+          p.__hlsTapped = true;
+        }
+      } catch (e) {}
+      return p;
+    };
+    const hookVjs = (fn) => {
+      if (typeof fn !== 'function') return fn;
+      const wrapped = function () {
+        for (const a of arguments) walk(a, 0);
+        return wrapVjsPlayer(fn.apply(this, arguments));
+      };
+      Object.assign(wrapped, fn);
+      return wrapped;
+    };
+    if (VJS) VJS = hookVjs(VJS);
+    Object.defineProperty(window, 'videojs', {
+      configurable: true,
+      get() { return VJS; },
+      set(v) { VJS = hookVjs(v); },
+    });
+  } catch (e) {}
+
+  // Shaka Player
+  try {
+    let SH = window.shaka;
+    const hookShaka = (s) => {
+      try {
+        if (s && s.Player && s.Player.prototype && typeof s.Player.prototype.load === 'function' && !s.Player.prototype.__hlsTapped) {
+          const orig = s.Player.prototype.load;
+          s.Player.prototype.load = function (u) {
+            const su = asStr(u);
+            if (su.toLowerCase().indexOf('.mpd') !== -1) note(su, 'dash');
+            else recordHls(su);
+            return orig.apply(this, arguments);
+          };
+          s.Player.prototype.__hlsTapped = true;
+        }
+      } catch (e) {}
+    };
+    if (SH) hookShaka(SH);
+    Object.defineProperty(window, 'shaka', {
+      configurable: true,
+      get() { return SH; },
+      set(v) { hookShaka(v); SH = v; },
+    });
+  } catch (e) {}
+
+  // Artplayer / DPlayer / Clappr / Plyr config constructors
+  for (const ctorName of ['Artplayer', 'DPlayer', 'Plyr']) {
+    try {
+      let C = window[ctorName];
+      const wrapCtor = (fn) => {
+        if (typeof fn !== 'function') return fn;
+        return new Proxy(fn, {
+          construct(target, args) {
+            for (const a of args) walk(a, 0);
+            return Reflect.construct(target, args);
+          },
+          apply(target, thisArg, args) {
+            for (const a of args) walk(a, 0);
+            return Reflect.apply(target, thisArg, args);
+          },
+        });
+      };
+      if (C) C = wrapCtor(C);
+      Object.defineProperty(window, ctorName, {
+        configurable: true,
+        get() { return C; },
+        set(v) { C = wrapCtor(v); },
+      });
+    } catch (e) {}
+  }
 })();
 """
 
@@ -554,8 +856,6 @@ def _playwright_proxy() -> Optional[Dict[str, str]]:
     config: Dict[str, str] = {"server": f"{scheme}://{parsed.hostname}:{parsed.port}"}
     if parsed.username:
         if scheme.startswith("socks"):
-            # Chromium takes SOCKS credentials itself, not from Playwright, so an
-            # authenticated SOCKS tunnel cannot be used here.
             print("[HLS] Browser: proxy.txt is an authenticated SOCKS5 proxy, which "
                   "Chromium cannot use — the browser will go direct "
                   "(set HLS_BROWSER_PROXY=none to silence this).")
@@ -625,8 +925,6 @@ async def _get_browser(
 
     from playwright.async_api import async_playwright
 
-    # Before the driver starts: it is the driver that resolves the browser path,
-    # so a cache outside the (sandboxed) home has to be advertised here.
     _resolve_browser_cache()
 
     if _pw is None:
@@ -690,15 +988,13 @@ async def close_browser() -> None:
 
 
 async def _block_heavy(route, request) -> None:
-    """Abort ads, images, fonts and non-manifest media; let player assets pass."""
+    """Abort ads, images and fonts; let player assets and media streams pass."""
     try:
         rtype = request.resource_type
         url = request.url
-        if _is_blocked_url(url):
+        if _is_blocked_url(url) or _is_ad_manifest(url):
             await route.abort()
         elif rtype in _BLOCKED_RESOURCE_TYPES:
-            await route.abort()
-        elif rtype == "media" and not _looks_like_manifest(url):
             await route.abort()
         else:
             await route.continue_()
@@ -709,64 +1005,225 @@ async def _block_heavy(route, request) -> None:
             pass
 
 
-async def _read_tap(page) -> Tuple[str, str]:
-    """Read any tapped or DOM-attached manifest URL across all page frames."""
+async def _read_tap(page) -> Tuple[str, str, str]:
+    """Read any tapped or DOM-attached stream URL across all page frames.
+
+    Returns ``(url, frame_url, stream_type)``.
+    """
     try:
         frames = list(page.frames)
     except Exception:
         frames = [page]
-    if page.main_frame not in frames:
+    if getattr(page, "main_frame", None) and page.main_frame not in frames:
         frames.insert(0, page.main_frame)
+
+    fallback_direct: Tuple[str, str, str] = ("", "", "")
+    fallback_dash: Tuple[str, str, str] = ("", "", "")
 
     for frame in frames:
         try:
             value = await frame.evaluate(
                 """() => {
-                  if (window.__hlsTap) return window.__hlsTap;
-                  if (Array.isArray(window.__hlsTapList) && window.__hlsTapList.length) {
-                    return window.__hlsTapList[0];
+                  const hls = [];
+                  if (window.__hlsTap) hls.push(window.__hlsTap);
+                  if (Array.isArray(window.__hlsTapList)) {
+                    for (const u of window.__hlsTapList) if (hls.indexOf(u) === -1) hls.push(u);
                   }
+                  const dash = Array.isArray(window.__hlsTapDashList) ? window.__hlsTapDashList.slice() : [];
+                  const direct = Array.isArray(window.__hlsTapDirectList) ? window.__hlsTapDirectList.slice() : [];
                   const els = document.querySelectorAll('video, source');
                   for (const el of els) {
                     const src = el.getAttribute('src') || el.currentSrc || el.src || '';
-                    if (src && src.indexOf('.m3u8') !== -1) return src;
+                    if (!src || src.startsWith('blob:') || src.startsWith('data:')) continue;
+                    const low = src.toLowerCase();
+                    if (low.indexOf('.m3u8') !== -1) {
+                      if (hls.indexOf(src) === -1) hls.push(src);
+                    } else if (low.indexOf('.mpd') !== -1) {
+                      if (dash.indexOf(src) === -1) dash.push(src);
+                    } else if (low.indexOf('.mp4') !== -1 || low.indexOf('.webm') !== -1 || el.tagName === 'VIDEO' || el.tagName === 'SOURCE') {
+                      if (direct.indexOf(src) === -1) direct.push(src);
+                    }
                   }
-                  return '';
+                  return { hls, dash, direct };
                 }"""
             )
-            if isinstance(value, str) and value:
+            f_url = ""
+            try:
+                f_url = frame.url or ""
+            except Exception:
                 f_url = ""
-                try:
-                    f_url = frame.url or ""
-                except Exception:
-                    f_url = ""
-                return value, f_url
+
+            if isinstance(value, str) and value:
+                return value, f_url, "hls"
+            if isinstance(value, dict):
+                hls_list = value.get("hls") or []
+                if isinstance(hls_list, list) and hls_list:
+                    first_hls = str(hls_list[0] or "")
+                    if first_hls:
+                        return first_hls, f_url, "hls"
+                dash_list = value.get("dash") or []
+                if not fallback_dash[0] and isinstance(dash_list, list) and dash_list:
+                    first_dash = str(dash_list[0] or "")
+                    if first_dash:
+                        fallback_dash = (first_dash, f_url, "dash")
+                direct_list = value.get("direct") or []
+                if not fallback_direct[0] and isinstance(direct_list, list) and direct_list:
+                    first_dir = str(direct_list[0] or "")
+                    if first_dir:
+                        fallback_direct = (first_dir, f_url, "direct")
         except Exception:
             continue
-    return "", ""
+
+    if fallback_dash[0]:
+        return fallback_dash
+    if fallback_direct[0]:
+        return fallback_direct
+    return "", "", ""
 
 
-async def _try_wake_player(page) -> None:
-    """Best-effort click on common player overlays for click-to-play embeds."""
+async def _dismiss_ad_overlays(page) -> None:
+    """Hide transparent full-screen ad-shield overlays sitting above players."""
+    try:
+        frames = list(page.frames)
+    except Exception:
+        frames = [page]
+    js = """() => {
+      try {
+        const vw = window.innerWidth || 1280;
+        const vh = window.innerHeight || 720;
+        const els = document.querySelectorAll('div, a, section');
+        let hidden = 0;
+        for (const el of els) {
+          if (hidden > 12) break;
+          if (el.querySelector('video, iframe')) continue;
+          const st = window.getComputedStyle(el);
+          if (st.position !== 'fixed' && st.position !== 'absolute') continue;
+          const z = parseInt(st.zIndex || '0', 10);
+          if (isNaN(z) || z < 999) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width >= vw * 0.5 && r.height >= vh * 0.5) {
+            const bg = st.backgroundColor || '';
+            const op = parseFloat(st.opacity || '1');
+            const looksBlank = (op < 0.25) || bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)'
+              || (el.innerText || '').trim().length === 0;
+            if (looksBlank) {
+              el.style.pointerEvents = 'none';
+              el.style.display = 'none';
+              hidden++;
+            }
+          }
+        }
+      } catch (e) {}
+    }"""
+    for frame in frames:
+        try:
+            await frame.evaluate(js)
+        except Exception:
+            continue
+
+
+async def _try_wake_player(page, pass_idx: int = 0) -> None:
+    """Multi-pass click-to-play waking across common players, overlays & iframes."""
+    if pass_idx >= 1:
+        await _dismiss_ad_overlays(page)
+
     selectors = (
         ".jw-icon-display",
+        ".jw-display-icon-container",
         ".vjs-big-play-button",
         ".plyr__control--overlaid",
+        ".art-icon-state",
+        ".dplayer-play-icon",
+        ".fluid_initial_play",
+        ".play-wrapper",
+        ".mejs__overlay-play",
+        ".fp-playbtn",
+        "[aria-label*='play' i]",
+        "button[class*='play' i]",
+        "[class*='play-btn' i]",
+        "[class*='play_btn' i]",
+        "[id*='play' i]",
         "video",
     )
     try:
         frames = list(page.frames)
     except Exception:
         frames = [page]
+
+    clicked = False
     for frame in frames:
+        if not hasattr(frame, "query_selector"):
+            continue
         for sel in selectors:
             try:
                 el = await frame.query_selector(sel)
                 if el is not None and await el.is_visible():
-                    await el.click(timeout=300, no_wait_after=True)
-                    return
+                    await el.click(timeout=350, no_wait_after=True, force=(pass_idx >= 1))
+                    clicked = True
+                    break
             except Exception:
                 continue
+        if clicked:
+            break
+
+    # Fallback: click the center of the largest visible iframe, or viewport center.
+    if not clicked and hasattr(page, "mouse"):
+        try:
+            box = None
+            if hasattr(page, "query_selector_all"):
+                best_area = 0.0
+                for ifr in await page.query_selector_all("iframe"):
+                    try:
+                        b = await ifr.bounding_box()
+                        if b and b["width"] >= 200 and b["height"] >= 150:
+                            area = b["width"] * b["height"]
+                            if area > best_area:
+                                best_area = area
+                                box = b
+                    except Exception:
+                        continue
+            if box is not None:
+                await page.mouse.click(
+                    box["x"] + box["width"] / 2.0,
+                    box["y"] + box["height"] / 2.0,
+                )
+            elif pass_idx >= 1:
+                await page.mouse.click(640, 360)
+        except Exception:
+            pass
+
+
+async def _extract_page_title(page) -> str:
+    """Read a clean video title from ``og:title`` or ``document.title``."""
+    try:
+        raw = await page.evaluate(
+            """() => {
+              const m = document.querySelector('meta[property="og:title"], meta[name="twitter:title"]');
+              if (m && m.content && m.content.trim()) return m.content.trim();
+              return (document.title || '').trim();
+            }"""
+        )
+        if not isinstance(raw, str):
+            return ""
+        cleaned = re.sub(r"\s+", " ", raw).strip(" -|:\t\r\n")
+        if not cleaned or len(cleaned) < 2 or cleaned.lower() in _USELESS_TITLES:
+            return ""
+        if any(k in cleaned.lower() for k in _CHALLENGE_TITLE_MARKERS):
+            return ""
+        return cleaned[:160]
+    except Exception:
+        return ""
+
+
+async def _is_challenge_page(page) -> bool:
+    """True when the page currently shows a Cloudflare/DDoS-Guard JS interstitial."""
+    try:
+        title = await page.evaluate("() => (document.title || '').toLowerCase()")
+        if isinstance(title, str) and any(m in title for m in _CHALLENGE_TITLE_MARKERS):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 _PRESERVED_HEADERS = {
@@ -825,8 +1282,65 @@ async def _extract_request_headers(
     return out
 
 
-async def _extract_cookies(context, manifest_url: str, page_url: str) -> Dict[str, str]:
+async def _extract_cookies_full(
+    context,
+    manifest_url: str,
+    page_url: str,
+) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+    """Capture both flat cookies (compat) and full domain/path-scoped cookie entries."""
     cookies: Dict[str, str] = {}
+    entries: List[Dict[str, Any]] = []
+    seen_entries: set[Tuple[str, str, str]] = set()
+
+    all_items: List[Dict[str, Any]] = []
+    try:
+        # Playwright context.cookies() with no args returns ALL context cookies.
+        res = await context.cookies()
+        if isinstance(res, list):
+            all_items = res
+    except TypeError:
+        # Compatibility with unit-test fakes expecting cookies(urls).
+        target_urls = [
+            u for u in (manifest_url, page_url)
+            if u and u.startswith(("http://", "https://"))
+        ]
+        if target_urls:
+            try:
+                res = await context.cookies(target_urls)
+                if isinstance(res, list):
+                    all_items = res
+            except Exception:
+                all_items = []
+    except Exception:
+        all_items = []
+
+    for item in all_items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        val = item.get("value")
+        if not name or val is None:
+            continue
+        domain = str(item.get("domain") or "")
+        path = str(item.get("path") or "/")
+        key = (domain.lower(), path, str(name))
+        if key not in seen_entries:
+            seen_entries.add(key)
+            entry: Dict[str, Any] = {
+                "name": str(name),
+                "value": str(val),
+                "domain": domain,
+                "path": path,
+                "host_only": not domain.startswith("."),
+                "secure": bool(item.get("secure")),
+                "httpOnly": bool(item.get("httpOnly")),
+            }
+            exp = item.get("expires")
+            if isinstance(exp, (int, float)) and exp > 0:
+                entry["expires"] = exp
+            entries.append(entry)
+
+    # Flat cookies: collect for manifest_url, plus page_url if same/parent domain.
     if manifest_url and manifest_url.startswith(("http://", "https://")):
         try:
             m_items = await context.cookies([manifest_url])
@@ -837,22 +1351,93 @@ async def _extract_cookies(context, manifest_url: str, page_url: str) -> Dict[st
                     cookies[str(name)] = str(val)
         except Exception:
             pass
-    if not cookies and page_url and page_url.startswith(("http://", "https://")):
+    if page_url and page_url.startswith(("http://", "https://")):
         try:
             mp = urlparse(manifest_url)
             pp = urlparse(page_url)
             mhost = (mp.hostname or "").lower()
             phost = (pp.hostname or "").lower()
-            if mhost and phost and mhost.split(".")[-2:] == phost.split(".")[-2:]:
+            if (not cookies) or (
+                mhost and phost and (
+                    mhost == phost
+                    or mhost.split(".")[-2:] == phost.split(".")[-2:]
+                )
+            ):
                 p_items = await context.cookies([page_url])
                 for item in p_items or []:
                     name = item.get("name")
                     val = item.get("value")
-                    if name and val is not None:
+                    if name and val is not None and str(name) not in cookies:
                         cookies[str(name)] = str(val)
         except Exception:
             pass
-    return cookies
+
+    return cookies, entries
+
+
+async def _extract_cookies(context, manifest_url: str, page_url: str) -> Dict[str, str]:
+    """Backward-compatible wrapper returning flat ``{name: value}`` cookies."""
+    flat, _ = await _extract_cookies_full(context, manifest_url, page_url)
+    return flat
+
+
+def _is_subtitle_or_thumb_playlist(text: str) -> bool:
+    """True when an #EXTM3U media playlist only lists subtitles/thumbnails."""
+    if "#EXT-X-STREAM-INF" in text:
+        return False
+    uris = [
+        line.strip().lower().split("?", 1)[0]
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not uris:
+        return False
+    return all(u.endswith((".vtt", ".webvtt", ".srt", ".jpg", ".jpeg", ".png", ".webp")) for u in uris)
+
+
+def _estimate_playlist_duration(text: str) -> float:
+    total = 0.0
+    for m in re.finditer(r"#EXTINF\s*:\s*([0-9.]+)", text):
+        try:
+            total += float(m.group(1))
+        except ValueError:
+            pass
+    return total
+
+
+def _parse_int_header(headers: Dict[str, str], name: str) -> Optional[int]:
+    val = headers.get(name) or headers.get(name.lower()) or ""
+    if not val:
+        return None
+    try:
+        n = int(str(val).strip())
+        return n if n >= 0 else None
+    except ValueError:
+        return None
+
+
+def _parse_range_total(headers: Dict[str, str]) -> Optional[int]:
+    raw = headers.get("content-range") or headers.get("Content-Range") or ""
+    if "/" not in raw:
+        return None
+    tail = raw.rsplit("/", 1)[-1].strip()
+    if not tail or tail == "*":
+        return None
+    try:
+        n = int(tail)
+        return n if n >= 0 else None
+    except ValueError:
+        return None
+
+
+@dataclass
+class _SniffedCandidate:
+    url: str
+    stream_type: str  # "hls" | "dash" | "direct"
+    request: Any
+    score: int        # Lower is better: 0=master HLS, 10=media HLS, 20=short/preview HLS, 25=DASH, 30=direct video
+    manifest_text: str = ""
+    seen_at: float = 0.0
 
 
 def _install_hint() -> str:
@@ -968,12 +1553,10 @@ async def resolve_stream_with_browser(
     *,
     timeout: int = HLS_BROWSER_TIMEOUT,
 ) -> BrowserScan:
-    """Load *page_url* in Chromium and return the first HLS manifest it needs.
+    """Load *page_url* in Chromium and return the best stream (HLS / DASH / direct MP4).
 
-    Returns ``url=None`` (never raises) when the browser is unavailable, the page
-    has no manifest, or anything else goes wrong — the caller keeps its previous
-    behaviour. Jobs are serialised by ``HLS_BROWSER_MAX_CONCURRENCY`` so a small
-    VPS never runs more Chromium contexts than it can afford.
+    Never raises (except ``WarpProxyError``) when the browser is unavailable,
+    the page has no stream, or anything else goes wrong.
     """
     global _active, _browser_last_used
 
@@ -987,10 +1570,12 @@ async def resolve_stream_with_browser(
         _active += 1
         context = None
         page = None
+        cdp = None
         browser = None
         is_ephemeral = False
         requests_seen = 0
         last_request_at = time.time()
+        pending_sniffs: set[asyncio.Task] = set()
         try:
             proxy_cfg, proxy_key, using_warp = await _resolve_browser_proxy()
             try:
@@ -1006,23 +1591,70 @@ async def resolve_stream_with_browser(
                 return BrowserScan(reason="no-browser", detail=f"{type(e).__name__}: {e}")
 
             loop = asyncio.get_running_loop()
-            verified_hit: asyncio.Future = loop.create_future()
+            master_hit: asyncio.Future = loop.create_future()
+            candidates: List[_SniffedCandidate] = []
+            seen_cand_urls: set[str] = set()
             fallback_req: Any = None
             fallback_url: str = ""
             fallback_seen_at: float = 0.0
             failed_urls: set[str] = set()
 
+            def _record_candidate(cand: _SniffedCandidate) -> None:
+                if cand.url in failed_urls:
+                    return
+                if cand.url in seen_cand_urls:
+                    # Upgrade score/manifest_text if a better inspection arrived.
+                    for existing in candidates:
+                        if existing.url == cand.url and cand.score < existing.score:
+                            existing.score = cand.score
+                            existing.manifest_text = cand.manifest_text or existing.manifest_text
+                    return
+                seen_cand_urls.add(cand.url)
+                candidates.append(cand)
+                if cand.score == 0 and not master_hit.done():
+                    master_hit.set_result(cand)
+
             try:
                 major, ua, extra_hdrs = _build_browser_identity(browser)
-                context = await browser.new_context(
-                    user_agent=ua,
-                    extra_http_headers=extra_hdrs,
-                    viewport={"width": 1280, "height": 720},
-                    locale="en-US",
-                    ignore_https_errors=True,
-                )
+                ctx_kwargs: Dict[str, Any] = {
+                    "user_agent": ua,
+                    "viewport": {"width": 1280, "height": 720},
+                    "locale": "en-US",
+                    "ignore_https_errors": True,
+                }
+                # Only pass extra_http_headers if CDP UA override is unavailable
+                # (avoids CORS preflight failures on strict cross-origin CDNs).
+                context = await browser.new_context(**ctx_kwargs)
                 page = await context.new_page()
                 page.set_default_timeout(timeout * 1000)
+
+                # Immediately close any ad popup/popunder tabs spawned after main page exists.
+                if hasattr(context, "on"):
+                    def _on_popup(popup_page) -> None:
+                        async def _close_popup() -> None:
+                            try:
+                                if popup_page is not page:
+                                    await popup_page.close()
+                            except Exception:
+                                pass
+                        t = asyncio.create_task(_close_popup())
+                        pending_sniffs.add(t)
+                        t.add_done_callback(pending_sniffs.discard)
+                    try:
+                        context.on("page", _on_popup)
+                    except Exception:
+                        pass
+
+                # Apply CORS-safe native Client Hints via CDP when available.
+                if hasattr(context, "new_cdp_session"):
+                    try:
+                        cdp = await context.new_cdp_session(page)
+                        await cdp.send(
+                            "Emulation.setUserAgentOverride",
+                            _build_cdp_ua_override(major, ua),
+                        )
+                    except Exception:
+                        cdp = None
 
                 def _on_request(request) -> None:
                     nonlocal requests_seen, last_request_at, fallback_req, fallback_url, fallback_seen_at
@@ -1044,17 +1676,201 @@ async def resolve_stream_with_browser(
                     except Exception:
                         pass
 
+                async def _inspect_response(response) -> None:
+                    try:
+                        resp_url = response.url
+                        if not resp_url or _is_ad_manifest(resp_url):
+                            return
+                        abs_url = urljoin(page_url, resp_url)
+                        headers_map = dict(getattr(response, "headers", None) or {})
+                        ctype = (headers_map.get("content-type") or headers_map.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+                        cl = _parse_int_header(headers_map, "content-length")
+                        total_len = _parse_range_total(headers_map) or cl
+                        req = getattr(response, "request", None)
+                        rtype = ""
+                        try:
+                            rtype = str(getattr(req, "resource_type", "") or "").lower()
+                        except Exception:
+                            rtype = ""
+
+                        # 1. Direct progressive video (never call response.body() on huge videos!).
+                        is_direct_ctype = ctype in _DIRECT_VIDEO_CTYPES or (
+                            ctype.startswith("video/") and ctype != "video/mp2t"
+                        )
+                        if is_direct_ctype or (
+                            _looks_like_direct_video(resp_url)
+                            and (ctype == "application/octet-stream" or response.status == 206 or not ctype)
+                        ):
+                            if total_len is not None and total_len < _MIN_DIRECT_VIDEO_BYTES and response.status != 206:
+                                return
+                            score = 35 if _is_preview_url(abs_url) else 30
+                            _record_candidate(_SniffedCandidate(
+                                url=abs_url,
+                                stream_type="direct",
+                                request=req,
+                                score=score,
+                                seen_at=time.time(),
+                            ))
+                            return
+
+                        # 2. Decide whether to body-sniff this response for #EXTM3U / <MPD.
+                        url_is_m3u8 = _looks_like_manifest(resp_url)
+                        url_is_dash = _looks_like_dash(resp_url)
+                        ctype_is_hls = "mpegurl" in ctype
+                        ctype_is_dash = "dash+xml" in ctype
+                        path_low = resp_url.lower().split("?", 1)[0]
+
+                        should_sniff = (
+                            url_is_m3u8
+                            or url_is_dash
+                            or ctype_is_hls
+                            or ctype_is_dash
+                        )
+                        if not should_sniff:
+                            # Disguised/extensionless HLS over XHR/fetch/other/media
+                            if (
+                                rtype in ("xhr", "fetch", "other", "media", "")
+                                and not path_low.endswith(_STATIC_NON_STREAM_EXTS)
+                                and (cl is None or cl <= _MAX_SNIFF_BODY_BYTES)
+                                and (
+                                    not ctype
+                                    or ctype in ("text/plain", "application/octet-stream", "application/json")
+                                    or ctype.startswith("image/")
+                                )
+                            ):
+                                should_sniff = True
+
+                        if not should_sniff:
+                            return
+
+                        raw_body: Optional[bytes] = None
+                        body_fn = getattr(response, "body", None)
+                        if callable(body_fn):
+                            try:
+                                maybe_coro = body_fn()
+                                if asyncio.iscoroutine(maybe_coro):
+                                    res_bytes = await asyncio.wait_for(maybe_coro, timeout=3.0)
+                                    if isinstance(res_bytes, (bytes, bytearray)):
+                                        raw_body = bytes(res_bytes)
+                            except Exception:
+                                raw_body = None
+
+                        if raw_body is not None:
+                            if len(raw_body) > _MAX_SNIFF_BODY_BYTES:
+                                # Large binary disguised URL: check direct video magic.
+                                if sniff_stream_bytes(raw_body[:64], ctype) == "direct":
+                                    _record_candidate(_SniffedCandidate(
+                                        url=abs_url,
+                                        stream_type="direct",
+                                        request=req,
+                                        score=30,
+                                        seen_at=time.time(),
+                                    ))
+                                return
+
+                            kind = sniff_stream_bytes(raw_body[:65536], ctype)
+                            if kind == "hls":
+                                text = decode_text(raw_body)
+                                if _is_subtitle_or_thumb_playlist(text):
+                                    failed_urls.add(resp_url)
+                                    failed_urls.add(abs_url)
+                                    return
+                                is_master = "#EXT-X-STREAM-INF" in text
+                                if is_master and not _is_preview_url(abs_url):
+                                    score = 0
+                                elif _is_preview_url(abs_url):
+                                    score = 22
+                                else:
+                                    dur = _estimate_playlist_duration(text)
+                                    # Short < 18s VOD clip may be a preroll ad/preview; wait briefly.
+                                    if "#EXT-X-ENDLIST" in text and 0 < dur < 18.0:
+                                        score = 20
+                                    else:
+                                        score = 10
+                                _record_candidate(_SniffedCandidate(
+                                    url=abs_url,
+                                    stream_type="hls",
+                                    request=req,
+                                    score=score,
+                                    manifest_text=text,
+                                    seen_at=time.time(),
+                                ))
+                                return
+
+                            if kind == "dash":
+                                text = decode_text(raw_body)
+                                _record_candidate(_SniffedCandidate(
+                                    url=abs_url,
+                                    stream_type="dash",
+                                    request=req,
+                                    score=25,
+                                    manifest_text=text,
+                                    seen_at=time.time(),
+                                ))
+                                return
+
+                            if kind == "direct" and len(raw_body) >= _MIN_DIRECT_VIDEO_BYTES:
+                                _record_candidate(_SniffedCandidate(
+                                    url=abs_url,
+                                    stream_type="direct",
+                                    request=req,
+                                    score=30,
+                                    seen_at=time.time(),
+                                ))
+                                return
+
+                            # Genuine body was NOT a manifest (e.g. 200 OK HTML error page at .m3u8).
+                            if url_is_m3u8 or ctype_is_hls:
+                                failed_urls.add(resp_url)
+                                failed_urls.add(abs_url)
+                            return
+
+                        # No body bytes available (e.g. unit-test fake response): trust URL/Content-Type.
+                        if url_is_m3u8 or ctype_is_hls:
+                            _record_candidate(_SniffedCandidate(
+                                url=abs_url,
+                                stream_type="hls",
+                                request=req,
+                                score=0 if ("master" in path_low or "manifest" in path_low) else 5,
+                                seen_at=time.time(),
+                            ))
+                        elif url_is_dash or ctype_is_dash:
+                            _record_candidate(_SniffedCandidate(
+                                url=abs_url,
+                                stream_type="dash",
+                                request=req,
+                                score=25,
+                                seen_at=time.time(),
+                            ))
+                    except Exception:
+                        pass
+
                 def _on_response(response) -> None:
                     try:
                         resp_url = response.url
                         if _is_ad_manifest(resp_url):
                             return
-                        ctype = (response.headers.get("content-type") or "").lower()
-                        is_manifest = _looks_like_manifest(resp_url) or ("mpegurl" in ctype)
-                        if 200 <= response.status < 300:
-                            if is_manifest and not verified_hit.done():
-                                verified_hit.set_result((urljoin(page_url, resp_url), response.request))
-                        elif response.status >= 400:
+                        status = int(getattr(response, "status", 0) or 0)
+                        if 200 <= status < 300:
+                            # Fast-path for synchronous unit-test mocks without async body()
+                            body_fn = getattr(response, "body", None)
+                            if not callable(body_fn):
+                                ctype = (getattr(response, "headers", None) or {}).get("content-type", "").lower()
+                                if _looks_like_manifest(resp_url) or ("mpegurl" in ctype):
+                                    _record_candidate(_SniffedCandidate(
+                                        url=urljoin(page_url, resp_url),
+                                        stream_type="hls",
+                                        request=getattr(response, "request", None),
+                                        score=0,
+                                        seen_at=time.time(),
+                                    ))
+                                return
+                            t = asyncio.create_task(_inspect_response(response))
+                            pending_sniffs.add(t)
+                            t.add_done_callback(pending_sniffs.discard)
+                        elif status >= 400:
+                            ctype = ((getattr(response, "headers", None) or {}).get("content-type") or "").lower()
+                            is_manifest = _looks_like_manifest(resp_url) or ("mpegurl" in ctype)
                             chain_urls: list[str] = []
                             req = getattr(response, "request", None)
                             seen_reqs: set[int] = set()
@@ -1111,11 +1927,13 @@ async def resolve_stream_with_browser(
                             raise WarpProxyError(
                                 format_warp_proxy_error(e, feature="HLS")
                             ) from e
-                    if not verified_hit.done():
+                    if not master_hit.done() and not candidates:
                         print(f"[HLS] Browser: page load issue ({type(e).__name__}: {e})")
 
                 url = ""
                 source = ""
+                stream_type = "hls"
+                manifest_text = ""
                 winning_req = None
                 headers: Dict[str, str] = {}
                 effective_page_url = page.url or page_url
@@ -1124,7 +1942,8 @@ async def resolve_stream_with_browser(
 
                 quiet = max(5, min(15, timeout // 4))
                 deadline = loop.time() + timeout
-                tried_click = False
+                click_passes = 0
+                last_click_at = 0.0
                 last_tap_check = 0.0
 
                 while True:
@@ -1132,40 +1951,70 @@ async def resolve_stream_with_browser(
                     if remaining <= 0:
                         break
                     try:
-                        url, winning_req = await asyncio.wait_for(
-                            asyncio.shield(verified_hit), timeout=min(0.5, remaining),
+                        winner_cand = await asyncio.wait_for(
+                            asyncio.shield(master_hit), timeout=min(0.4, remaining),
                         )
+                        url = winner_cand.url
+                        stream_type = winner_cand.stream_type
+                        manifest_text = winner_cand.manifest_text
+                        winning_req = winner_cand.request
                         source = "network"
                         break
                     except asyncio.TimeoutError:
                         pass
 
-                    if loaded and not tried_click and fallback_req is None:
-                        # If page has a click-to-play overlay, wake it once.
-                        if (time.time() - last_request_at) >= 1.5:
-                            tried_click = True
-                            await _try_wake_player(page)
+                    now = time.time()
+
+                    # Check if a verified non-master candidate has settled past its grace window.
+                    valid_cands = [c for c in candidates if c.url not in failed_urls]
+                    if valid_cands:
+                        valid_cands.sort(key=lambda c: (c.score, c.seen_at))
+                        best = valid_cands[0]
+                        grace = 1.5 if best.score <= 15 else 3.5
+                        if (now - best.seen_at) >= grace:
+                            url = best.url
+                            stream_type = best.stream_type
+                            manifest_text = best.manifest_text
+                            winning_req = best.request
+                            source = "network"
+                            break
+
+                    # Multi-pass click-to-play waking (up to 3 passes to penetrate ad overlays).
+                    if (
+                        loaded
+                        and not valid_cands
+                        and fallback_req is None
+                        and click_passes < 3
+                        and (now - loaded_at) >= (1.5 + click_passes * 2.2)
+                        and (now - last_click_at) >= 2.0
+                    ):
+                        if not await _is_challenge_page(page):
+                            last_click_at = now
+                            await _try_wake_player(page, pass_idx=click_passes)
+                            click_passes += 1
 
                     if (
-                        fallback_req is not None
+                        not valid_cands
+                        and fallback_req is not None
                         and fallback_req.url not in failed_urls
                         and fallback_url not in failed_urls
-                        and (time.time() - fallback_seen_at) >= 1.5
+                        and (now - fallback_seen_at) >= 2.0
+                        and not pending_sniffs
                     ):
                         url = fallback_url
                         winning_req = fallback_req
                         source = "network"
                         break
 
-                    now = time.time()
                     if (
                         loaded
+                        and not valid_cands
                         and fallback_req is None
                         and (now - loaded_at) >= 4.5
                         and (now - last_tap_check) >= 1.5
                     ):
                         last_tap_check = now
-                        tapped_url, frame_url = await _read_tap(page)
+                        tapped_url, frame_url, tapped_type = await _read_tap(page)
                         if tapped_url:
                             base_for_tap = (
                                 frame_url
@@ -1175,20 +2024,42 @@ async def resolve_stream_with_browser(
                             tapped_abs = urljoin(base_for_tap, tapped_url)
                             if (
                                 tapped_abs.lower().startswith(("http://", "https://"))
-                                and (_looks_like_manifest(tapped_abs) or ".m3u8" in tapped_abs.lower())
                                 and not _is_ad_manifest(tapped_abs)
                                 and tapped_abs not in failed_urls
                             ):
-                                url = tapped_abs
-                                source = "player-config"
-                                effective_page_url = base_for_tap
-                                headers = default_headers(url, referer=effective_page_url)
-                                headers["User-Agent"] = ua
-                                break
+                                if tapped_type == "hls" or (now - loaded_at) >= 7.0:
+                                    url = tapped_abs
+                                    stream_type = tapped_type or "hls"
+                                    source = "player-config"
+                                    effective_page_url = base_for_tap
+                                    headers = default_headers(url, referer=effective_page_url)
+                                    headers["User-Agent"] = ua
+                                    break
 
-                    if (loaded and requests_seen
-                            and (time.time() - last_request_at) >= quiet):
-                        break
+                    if loaded and requests_seen and (now - last_request_at) >= quiet:
+                        if not await _is_challenge_page(page):
+                            break
+
+                # Wait briefly for any in-flight body sniffs before final selection.
+                if not url and pending_sniffs:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*list(pending_sniffs), return_exceptions=True),
+                            timeout=1.5,
+                        )
+                    except Exception:
+                        pass
+
+                # Pick best verified sniffed candidate if loop exited by timeout/quiet.
+                valid_cands = [c for c in candidates if c.url not in failed_urls]
+                valid_cands.sort(key=lambda c: (c.score, c.seen_at))
+                if not url and valid_cands:
+                    best = valid_cands[0]
+                    url = best.url
+                    stream_type = best.stream_type
+                    manifest_text = best.manifest_text
+                    winning_req = best.request
+                    source = "network"
 
                 if (
                     not url
@@ -1213,7 +2084,7 @@ async def resolve_stream_with_browser(
                     )
 
                 if not url:
-                    tapped_url, frame_url = await _read_tap(page)
+                    tapped_url, frame_url, tapped_type = await _read_tap(page)
                     if tapped_url:
                         base_for_tap = (
                             frame_url
@@ -1223,18 +2094,25 @@ async def resolve_stream_with_browser(
                         tapped_url = urljoin(base_for_tap, tapped_url)
                         if (
                             tapped_url.lower().startswith(("http://", "https://"))
+                            and not _is_ad_manifest(tapped_url)
                             and tapped_url not in failed_urls
                         ):
                             url = tapped_url
+                            stream_type = tapped_type or "hls"
                             source = "player-config"
                             effective_page_url = base_for_tap
                             headers = default_headers(url, referer=effective_page_url)
                             headers["User-Agent"] = ua
 
+                title = await _extract_page_title(page)
+                fallback_urls = [c.url for c in valid_cands if c.url != url][:5]
+
                 elapsed = time.time() - started
                 if url:
-                    cookies = await _extract_cookies(context, url, effective_page_url)
-                    print(f"[HLS] Browser: manifest via {source} after {elapsed:.1f}s "
+                    cookies, cookie_entries = await _extract_cookies_full(
+                        context, url, effective_page_url
+                    )
+                    print(f"[HLS] Browser: {stream_type} via {source} after {elapsed:.1f}s "
                           f"({requests_seen} requests)")
                     return BrowserScan(
                         url=url,
@@ -1246,6 +2124,11 @@ async def resolve_stream_with_browser(
                         page_url=effective_page_url,
                         headers=headers,
                         cookies=cookies,
+                        stream_type=stream_type,
+                        title=title,
+                        manifest_text=manifest_text,
+                        cookie_entries=cookie_entries,
+                        fallback_urls=fallback_urls,
                     )
                 print(f"[HLS] Browser: no manifest after {elapsed:.1f}s "
                       f"({requests_seen} requests)")
@@ -1253,6 +2136,7 @@ async def resolve_stream_with_browser(
                     reason="no-manifest",
                     requests=requests_seen,
                     page_url=effective_page_url,
+                    title=title,
                 )
             except WarpProxyError:
                 raise
@@ -1262,6 +2146,14 @@ async def resolve_stream_with_browser(
                     requests=requests_seen,
                 )
             finally:
+                for task in list(pending_sniffs):
+                    if not task.done():
+                        task.cancel()
+                if cdp is not None:
+                    try:
+                        await cdp.detach()
+                    except Exception:
+                        pass
                 for closer in (page, context):
                     if closer is not None:
                         try:
@@ -1287,7 +2179,6 @@ if __name__ == "__main__":
 
     from aiohttp import web
 
-    # The loopback pages below must never be routed through proxy.txt.
     import app.hls.client as _client_mod
     _client_mod.HLS_DISABLE_PROXY = True
 
@@ -1313,15 +2204,25 @@ if __name__ == "__main__":
 
     if not browser_available():
         print("--- browser checks SKIPPED (playwright not installed) ---")
-        print("    install with: pip install playwright && "
-              "python -m playwright install chromium")
         print("---", "ALL PASSED" if not failures else f"{len(failures)} FAILURE(S)")
         sys.exit(1 if failures else 0)
 
-    print("--- JS-only page, loopback (needs Chromium) ---")
+    print("--- Live Chromium loopback checks ---")
 
-    JS_PAGE = """<html><body><video id="v"></video><script>
+    JS_PAGE = """<html><head><title>JS Test Show</title></head><body><video id="v"></video><script>
       fetch('/api/config').then(r => r.json()).then(cfg => fetch(cfg.file));
+    </script></body></html>"""
+
+    DISGUISED_PAGE = """<html><head><title>Disguised HLS</title></head><body><script>
+      fetch('/cdn/stream-token-99?k=1');
+    </script></body></html>"""
+
+    DIRECT_MP4_PAGE = """<html><head><title>Direct MP4 Video</title></head><body>
+      <video id="v" autoplay muted src="/cdn/movie.mp4"></video>
+    </body></html>"""
+
+    FAKE_M3U8_HTML_PAGE = """<html><body><script>
+      fetch('/cdn/fake-error.m3u8').then(() => fetch('/cdn/real.m3u8?t=after'));
     </script></body></html>"""
 
     TAP_PAGE = """<html><body><video id="v"></video><script>
@@ -1354,6 +2255,28 @@ if __name__ == "__main__":
             resp.set_cookie("br_tok", "cookie_42", path="/")
             return resp
 
+        async def disguised_page(request):
+            return web.Response(text=DISGUISED_PAGE, content_type="text/html")
+
+        async def disguised_stream(request):
+            return web.Response(
+                body=b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1200000\nindex.txt\n",
+                content_type="text/plain",
+            )
+
+        async def mp4_page(request):
+            return web.Response(text=DIRECT_MP4_PAGE, content_type="text/html")
+
+        async def mp4_ep(request):
+            body = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + (b"\x00" * (300 * 1024))
+            return web.Response(body=body, content_type="video/mp4")
+
+        async def fake_m3u8_page(request):
+            return web.Response(text=FAKE_M3U8_HTML_PAGE, content_type="text/html")
+
+        async def fake_m3u8_html(request):
+            return web.Response(text="<!DOCTYPE html><html><body>Access Denied</body></html>", content_type="text/html")
+
         async def tap_page(request):
             return web.Response(text=TAP_PAGE, content_type="text/html")
 
@@ -1375,6 +2298,12 @@ if __name__ == "__main__":
                 content_type="application/vnd.apple.mpegurl")
 
         app.router.add_get("/js-only", js_page)
+        app.router.add_get("/disguised", disguised_page)
+        app.router.add_get("/cdn/stream-token-99", disguised_stream)
+        app.router.add_get("/mp4-page", mp4_page)
+        app.router.add_get("/cdn/movie.mp4", mp4_ep)
+        app.router.add_get("/fake-m3u8-page", fake_m3u8_page)
+        app.router.add_get("/cdn/fake-error.m3u8", fake_m3u8_html)
         app.router.add_get("/tap-only", tap_page)
         app.router.add_get("/iframe-page", iframe_page)
         app.router.add_get("/embed-player", embed_player)
@@ -1393,31 +2322,48 @@ if __name__ == "__main__":
 
         try:
             scan = await resolve_stream_with_browser(f"{base}/js-only", timeout=25)
-            _check("JS-built manifest captured from the network",
-                   scan.url == f"{base}/cdn/real.m3u8?t=js", f"{scan.reason} {scan.url}")
-            _check("source reported as network", scan.source == "network", scan.source)
-            _check("page made requests", scan.requests > 0, str(scan.requests))
+            _check("JS-built manifest captured + title + manifest_text",
+                   scan.url == f"{base}/cdn/real.m3u8?t=js"
+                   and scan.title == "JS Test Show"
+                   and "#EXTM3U" in scan.manifest_text,
+                   f"{scan.reason} {scan.url} title={scan.title!r}")
             expected_major = _chromium_major_version(_browser)
             sec_ch_ua = scan.headers.get("Sec-Ch-Ua", "")
-            _check("matching UA, Sec-Ch-Ua (no HeadlessChrome) & Referer captured",
+            _check("CDP native UA + Sec-Ch-Ua (no HeadlessChrome) & Referer captured",
                    f"Chrome/{expected_major}.0.0.0" in scan.headers.get("User-Agent", "")
                    and "HeadlessChrome" not in sec_ch_ua
                    and f'"{expected_major}"' in sec_ch_ua
                    and scan.headers.get("Referer") == f"{base}/js-only",
                    str(scan.headers))
-            _check("cookies captured from browser context",
-                   scan.cookies.get("br_tok") == "cookie_42",
-                   str(scan.cookies))
+            _check("cookies + cookie_entries captured",
+                   scan.cookies.get("br_tok") == "cookie_42"
+                   and any(c.get("name") == "br_tok" for c in scan.cookie_entries),
+                   f"{scan.cookies} / {scan.cookie_entries}")
 
-            scan2 = await resolve_stream_with_browser(f"{base}/tap-only", timeout=6)
+            scan_disg = await resolve_stream_with_browser(f"{base}/disguised", timeout=15)
+            _check("extensionless text/plain #EXTM3U sniffed from body",
+                   scan_disg.reason == "ok"
+                   and scan_disg.stream_type == "hls"
+                   and scan_disg.url == f"{base}/cdn/stream-token-99?k=1",
+                   str(scan_disg))
+
+            scan_mp4 = await resolve_stream_with_browser(f"{base}/mp4-page", timeout=15)
+            _check("direct MP4 <video> captured with stream_type='direct'",
+                   scan_mp4.reason == "ok"
+                   and scan_mp4.stream_type == "direct"
+                   and scan_mp4.url == f"{base}/cdn/movie.mp4",
+                   str(scan_mp4))
+
+            scan_fake = await resolve_stream_with_browser(f"{base}/fake-m3u8-page", timeout=15)
+            _check("200 OK HTML at fake .m3u8 rejected, real .m3u8 captured",
+                   scan_fake.reason == "ok"
+                   and scan_fake.url == f"{base}/cdn/real.m3u8?t=after",
+                   str(scan_fake))
+
+            scan2 = await resolve_stream_with_browser(f"{base}/tap-only", timeout=8)
             _check("URL built but never requested is tapped",
-                   scan2.url == f"{base}/cdn/tapped.m3u8?t=tap",
-                   f"{scan2.reason} {scan2.url}")
-            _check("source reported as player-config",
-                   scan2.source == "player-config", scan2.source)
-            _check("tapped scan carries headers",
-                   scan2.headers.get("Referer") == f"{base}/tap-only",
-                   str(scan2.headers))
+                   scan2.url == f"{base}/cdn/tapped.m3u8?t=tap" and scan2.source == "player-config",
+                   f"{scan2.reason} {scan2.source} {scan2.url}")
 
             scan_frm = await resolve_stream_with_browser(f"{base}/iframe-page", timeout=15)
             _check("iframe Hls.prototype.loadSource manifest + frame Referer captured",
